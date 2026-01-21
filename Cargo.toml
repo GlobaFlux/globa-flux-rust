@@ -1,0 +1,82 @@
+[package]
+name = "globa-flux-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.138"
+tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread"] }
+vercel_runtime = "2.1.0"
+hyper = "1.8.1"
+hyper-util = { version = "0.1.17", features = ["client", "client-legacy", "tokio"] }
+http-body-util = "0.1.3"
+hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "ring"] }
+sqlx = { version = "0.8.3", features = ["runtime-tokio-rustls", "mysql", "macros", "chrono"] }
+chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
+tokio-stream = "0.1.18"
+bytes = "1.11.0"
+async-openai = { version = "0.32.3", features = ["chat-completion"] }
+oauth2 = "5.0.0"
+google-youtube3 = "7.0.0"
+yup-oauth2 = "12.1.2"
+
+[lib]
+name = "globa_flux_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chat_risk_check"
+path = "api/chat/risk_check.rs"
+
+[[bin]]
+name = "oauth_youtube_exchange"
+path = "api/oauth/youtube/exchange.rs"
+
+[[bin]]
+name = "oauth_youtube_start"
+path = "api/oauth/youtube/start.rs"
+
+[[bin]]
+name = "tenants_ensure_trial"
+path = "api/tenants/ensure_trial.rs"
+
+[[bin]]
+name = "oauth_youtube_status"
+path = "api/oauth/youtube/status.rs"
+
+[[bin]]
+name = "usage_chat_risk_check_consume"
+path = "api/usage/chat_risk_check/consume.rs"
+
+[[bin]]
+name = "usage_chat_risk_check_today"
+path = "api/usage/chat_risk_check/today.rs"
+
+[[bin]]
+name = "jobs_daily_dispatch"
+path = "api/jobs/daily/dispatch.rs"
+
+[[bin]]
+name = "jobs_weekly_dispatch"
+path = "api/jobs/weekly/dispatch.rs"
+
+[[bin]]
+name = "jobs_worker_tick"
+path = "api/jobs/worker/tick.rs"
+
+[[bin]]
+name = "decision_today"
+path = "api/decision/today.rs"
+
+[[bin]]
+name = "webhooks_billing"
+path = "api/webhooks/billing.rs"
+
+[[bin]]
+name = "billing_subscription_status"
+path = "api/billing/subscription/status.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1

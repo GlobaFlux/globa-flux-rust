@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "builds": [{ "src": "api/**/*.rs", "use": "@vercel/rust" }],
+  "functions": {
+    "api/**/*.rs": {
+      "maxDuration": 30
+    }
+  }
+}
