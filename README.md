@@ -25,11 +25,14 @@ Deploy:
 
 ### Vercel build notes (rustup / cargo)
 
-This repo pins Rust install locations in `vercel.json` via:
-- `CARGO_HOME=/vercel/.cargo`
-- `RUSTUP_HOME=/vercel/.rustup`
+If the Vercel build logs show `spawn cargo ENOENT`, it usually means `rustup` installed Cargo under `/root/.cargo/bin` but the build process used `HOME=/vercel` and couldn't find it.
 
-If the Vercel build logs still show `spawn cargo ENOENT`, make sure the Vercel project does not override these, then redeploy with “Clear cache & redeploy”.
+This repo sets build-time env vars in `vercel.json` to align them:
+- `HOME=/root`
+- `CARGO_HOME=/root/.cargo`
+- `RUSTUP_HOME=/root/.rustup`
+
+If you still see the error, check that the Vercel project does not override these vars, then “Clear cache & redeploy”.
 
 ## Env Vars
 
