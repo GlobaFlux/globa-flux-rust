@@ -1,11 +1,11 @@
 # globa-flux-rust (LLM Gateway)
 
 Internal backend for YouTube Revenue Agent:
-- Calls OpenAI/Anthropic (provider keys never reach the browser)
+- Calls OpenAI or Gemini (provider keys never reach the browser)
 - Streams responses via SSE
 - Persists LLM usage + `cost_usd` into TiDB with idempotency
 
-Implementation note: OpenAI integration uses the `async-openai` SDK.
+Implementation note: OpenAI integration uses the `async-openai` SDK. Gemini integration uses direct HTTP calls to `generativelanguage.googleapis.com`.
 
 ## Endpoints
 
@@ -37,6 +37,13 @@ Then “Clear cache & redeploy”.
 
 - `RUST_INTERNAL_TOKEN` (shared secret; required)
 - `TIDB_DATABASE_URL` (required for TiDB writes)
+- `GEMINI_API_KEY` (optional; if set, Gemini is preferred)
+- `GEMINI_MODEL` (default: `gemini-1.5-flash`)
+- `GEMINI_API_BASE_URL` (default: `https://generativelanguage.googleapis.com/v1beta`)
+- `GEMINI_MAX_OUTPUT_TOKENS` (default: `600`)
+- `GEMINI_PROMPT_TOKEN_RESERVE` (default: `2000`, used for budget reserve precheck)
+- `GEMINI_PRICE_PROMPT_USD_PER_M_TOKEN` (optional override; enables cost accounting/budget reserve for Gemini)
+- `GEMINI_PRICE_COMPLETION_USD_PER_M_TOKEN` (optional override)
 - `OPENAI_API_KEY` (required for OpenAI)
 - `OPENAI_MODEL` (default: `gpt-4o-mini`)
 - `OPENAI_MAX_COMPLETION_TOKENS` (default: `600`)
