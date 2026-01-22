@@ -4,3 +4,5 @@ pub mod db;
 pub mod providers;
 pub mod decision_engine;
 pub mod outcome_engine;
+pub mod backfill;
+pub mod replay_gate;
