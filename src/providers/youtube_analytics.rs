@@ -36,7 +36,10 @@ impl std::error::Error for YoutubeAnalyticsError {}
 pub fn build_reports_url(base_url: &str, start_dt: NaiveDate, end_dt: NaiveDate) -> String {
   let base = base_url.trim_end_matches('/');
   format!(
-    "{base}/v2/reports?ids=channel==MINE&startDate={}&endDate={}&metrics=estimatedRevenue,impressions,views&dimensions=day,video&sort=day&maxResults=200",
+    // Note: YouTube Analytics API v2 does not support an `impressions` metric for this report on all projects,
+    // and will return `Unknown identifier (impressions) given in field parameters.metrics.`.
+    // Keep the schema column but request only stable metrics here.
+    "{base}/v2/reports?ids=channel==MINE&startDate={}&endDate={}&metrics=estimatedRevenue,views&dimensions=day,video&sort=day&maxResults=200",
     start_dt,
     end_dt
   )
@@ -234,7 +237,7 @@ mod tests {
     assert!(url.contains("ids=channel==MINE"));
     assert!(url.contains("startDate=2026-01-01"));
     assert!(url.contains("endDate=2026-01-07"));
-    assert!(url.contains("metrics=estimatedRevenue,impressions,views"));
+    assert!(url.contains("metrics=estimatedRevenue,views"));
     assert!(url.contains("dimensions=day,video"));
   }
 
@@ -267,4 +270,3 @@ mod tests {
     assert_eq!(rows[0].views, 200);
   }
 }
-
