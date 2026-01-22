@@ -46,12 +46,8 @@ name = "oauth_youtube_status"
 path = "api/oauth/youtube/status.rs"
 
 [[bin]]
-name = "usage_chat_risk_check_consume"
-path = "api/usage/chat_risk_check/consume.rs"
-
-[[bin]]
-name = "usage_chat_risk_check_today"
-path = "api/usage/chat_risk_check/today.rs"
+name = "usage_chat_risk_check"
+path = "api/usage/chat_risk_check.rs"
 
 [[bin]]
 name = "jobs_daily_dispatch"

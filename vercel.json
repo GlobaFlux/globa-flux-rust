@@ -1,3 +1,13 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json"
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/api/usage/chat_risk_check/consume",
+      "destination": "/api/usage/chat_risk_check"
+    },
+    {
+      "source": "/api/usage/chat_risk_check/today",
+      "destination": "/api/usage/chat_risk_check"
+    }
+  ]
 }
