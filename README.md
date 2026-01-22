@@ -28,9 +28,8 @@ Deploy:
 If the Vercel build logs show `spawn cargo ENOENT`, it usually means `rustup` installed Cargo under `/root/.cargo/bin` but the build process used `HOME=/vercel` and couldn't find it.
 
 This repo sets build-time env vars in `vercel.json` to align them:
-- `HOME=/root`
-- `CARGO_HOME=/root/.cargo`
-- `RUSTUP_HOME=/root/.rustup`
+- `CARGO_HOME=/vercel/.cargo`
+- `RUSTUP_HOME=/vercel/.rustup`
 
 If you still see the error, check that the Vercel project does not override these vars, then “Clear cache & redeploy”.
 

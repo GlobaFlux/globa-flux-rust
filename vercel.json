@@ -3,9 +3,8 @@
   "version": 2,
   "build": {
     "env": {
-      "HOME": "/root",
-      "CARGO_HOME": "/root/.cargo",
-      "RUSTUP_HOME": "/root/.rustup"
+      "CARGO_HOME": "/vercel/.cargo",
+      "RUSTUP_HOME": "/vercel/.rustup"
     }
   },
   "functions": {
