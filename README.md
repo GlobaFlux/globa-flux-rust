@@ -23,6 +23,14 @@ Deploy:
 - Connect the repo in Vercel, or run `vercel deploy`.
 - Set the env vars below in the Vercel project settings.
 
+### Vercel build notes (rustup / cargo)
+
+If the Vercel build logs show `spawn cargo ENOENT` (or rustup complaining that `$HOME` differs), set these **in the Vercel project** (Preview + Production):
+- `CARGO_HOME=/vercel/.cargo`
+- `RUSTUP_HOME=/vercel/.rustup`
+
+Then redeploy with “Clear cache & redeploy”.
+
 ## Env Vars
 
 - `RUST_INTERNAL_TOKEN` (shared secret; required)
