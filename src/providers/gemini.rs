@@ -37,12 +37,12 @@ impl GeminiConfig {
         let model = std::env::var("GEMINI_MODEL")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "gemini-1.5-flash".to_string());
+            .unwrap_or_else(|| "gemini-1.5-flash-latest".to_string());
 
         let api_base_url = std::env::var("GEMINI_API_BASE_URL")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".to_string());
+            .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1".to_string());
 
         Ok(Some(Self {
             api_key: api_key.trim().to_string(),
