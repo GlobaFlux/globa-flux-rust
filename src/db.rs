@@ -339,6 +339,21 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS tenant_llm_settings (
+        tenant_id VARCHAR(128) PRIMARY KEY,
+        gemini_model VARCHAR(128) NOT NULL,
+        updated_by VARCHAR(64) NOT NULL DEFAULT 'system',
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
   // Best-effort schema upgrades for existing tables (TiDB supports IF NOT EXISTS).
   sqlx::query(
     r#"
@@ -1032,6 +1047,51 @@ pub async fn upsert_policy_eval_report(
   .bind(candidate_version)
   .bind(replay_metrics_json)
   .bind(if approved { 1 } else { 0 })
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(())
+}
+
+pub async fn fetch_tenant_gemini_model(pool: &MySqlPool, tenant_id: &str) -> Result<Option<String>, Error> {
+  let row = sqlx::query_as::<_, (String,)>(
+    r#"
+      SELECT gemini_model
+      FROM tenant_llm_settings
+      WHERE tenant_id = ?
+      LIMIT 1;
+    "#,
+  )
+  .bind(tenant_id)
+  .fetch_optional(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(row.map(|(model,)| model))
+}
+
+pub async fn upsert_tenant_gemini_model(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  model: &str,
+  updated_by: &str,
+) -> Result<(), Error> {
+  sqlx::query(
+    r#"
+      INSERT INTO tenant_llm_settings
+        (tenant_id, gemini_model, updated_by)
+      VALUES
+        (?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        gemini_model = VALUES(gemini_model),
+        updated_by = VALUES(updated_by),
+        updated_at = CURRENT_TIMESTAMP(3);
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(model)
+  .bind(updated_by)
   .execute(pool)
   .await
   .map_err(|e| -> Error { Box::new(e) })?;

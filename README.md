@@ -38,7 +38,8 @@ Then “Clear cache & redeploy”.
 - `RUST_INTERNAL_TOKEN` (shared secret; required)
 - `TIDB_DATABASE_URL` (required for TiDB writes)
 - `GEMINI_API_KEY` (optional; if set, Gemini is preferred)
-- `GEMINI_MODEL` (default: `gemini-1.5-flash-latest`)
+- `GEMINI_MODEL` (default: `gemini-1.5-flash`)
+- `GEMINI_ALLOWED_MODELS` (optional; comma-separated allowlist used by `/api/tenants/llm_settings`, e.g. `gemini-1.5-flash,gemini-1.5-pro`)
 - `GEMINI_API_BASE_URL` (default: `https://generativelanguage.googleapis.com/v1`)
 - `GEMINI_MAX_OUTPUT_TOKENS` (default: `600`)
 - `GEMINI_PROMPT_TOKEN_RESERVE` (default: `2000`, used for budget reserve precheck)
@@ -62,3 +63,8 @@ Run: `cargo test`
 ## Notes
 
 This repo currently contains a stub handler that matches the contract and returns SSE/JSON. Provider streaming + TiDB persistence are the next steps.
+
+## Admin-controlled Gemini model (DB-backed)
+
+- Table: `tenant_llm_settings` (`tenant_id` → `gemini_model`)
+- Endpoint (internal auth): `GET/PUT /api/tenants/llm_settings?tenant_id=...`

@@ -42,6 +42,10 @@ name = "tenants_ensure_trial"
 path = "api/tenants/ensure_trial.rs"
 
 [[bin]]
+name = "tenants_llm_settings"
+path = "api/tenants/llm_settings.rs"
+
+[[bin]]
 name = "oauth_youtube_status"
 path = "api/oauth/youtube/status.rs"
 

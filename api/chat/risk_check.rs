@@ -7,7 +7,9 @@ use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 
 use bytes::Bytes;
 use globa_flux_rust::cost::{compute_cost_usd, ModelPricingUsdPerMToken};
-use globa_flux_rust::db::{fetch_usage_event, get_pool, insert_usage_event, sum_spent_usd_today};
+use globa_flux_rust::db::{
+    fetch_tenant_gemini_model, fetch_usage_event, get_pool, insert_usage_event, sum_spent_usd_today,
+};
 use globa_flux_rust::providers::gemini::{
     generate_text as gemini_generate_text, pricing_for_model as gemini_pricing_for_model,
     stream_generate as gemini_stream_generate, GeminiConfig, GeminiStreamEvent,
@@ -176,7 +178,15 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
     let spent_usd_today = sum_spent_usd_today(pool, &parsed.tenant_id, chrono::Utc::now()).await?;
     let temperature: f64 = 0.2;
 
-    let gemini_cfg = GeminiConfig::from_env_optional()?;
+    let mut gemini_cfg = GeminiConfig::from_env_optional()?;
+    if let Some(cfg) = gemini_cfg.as_mut() {
+        if let Some(model) = fetch_tenant_gemini_model(pool, &parsed.tenant_id).await? {
+            let model = model.trim();
+            if !model.is_empty() {
+                cfg.model = model.to_string();
+            }
+        }
+    }
     let use_gemini = gemini_cfg.is_some();
 
     let (provider, model, max_output_tokens, prompt_reserve_tokens, pricing) = if use_gemini {

@@ -37,7 +37,10 @@ impl GeminiConfig {
         let model = std::env::var("GEMINI_MODEL")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "gemini-1.5-flash-latest".to_string());
+            // Note: `*-latest` aliases are not consistently supported across API versions.
+            // Default to a stable model id to avoid 404s like:
+            // "models/gemini-1.5-flash-latest is not found for API version v1".
+            .unwrap_or_else(|| "gemini-1.5-flash".to_string());
 
         let api_base_url = std::env::var("GEMINI_API_BASE_URL")
             .ok()
