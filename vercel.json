@@ -1,16 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
-  "env": {
-    "CARGO_HOME": "/vercel/.cargo",
-    "RUSTUP_HOME": "/vercel/.rustup"
-  },
-  "build": {
-    "env": {
-      "CARGO_HOME": "/vercel/.cargo",
-      "RUSTUP_HOME": "/vercel/.rustup"
-    }
-  },
   "functions": {
     "api/**/*.rs": {
       "maxDuration": 30

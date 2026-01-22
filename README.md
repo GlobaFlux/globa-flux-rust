@@ -25,13 +25,13 @@ Deploy:
 
 ### Vercel build notes (rustup / cargo)
 
-If the Vercel build logs show `spawn cargo ENOENT`, it usually means `rustup` installed Cargo under `/root/.cargo/bin` but the build process used `HOME=/vercel` and couldn't find it.
+If the Vercel build logs show `spawn cargo ENOENT`, it usually means the Rust installer put `cargo` somewhere not on `PATH`.
 
-This repo sets build-time env vars in `vercel.json` to align them:
+Use Vercel’s built-in environment variables (Project → Settings → Environment Variables, Preview + Production):
 - `CARGO_HOME=/vercel/.cargo`
 - `RUSTUP_HOME=/vercel/.rustup`
 
-If you still see the error, check that the Vercel project does not override these vars, then “Clear cache & redeploy”.
+Then “Clear cache & redeploy”.
 
 ## Env Vars
 
