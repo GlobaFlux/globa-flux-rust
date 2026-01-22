@@ -92,9 +92,12 @@ fn build_url(cfg: &GeminiConfig, method: &str, streaming: bool) -> String {
 }
 
 fn build_request_json(system: &str, user: &str, temperature: f64, max_output_tokens: u32) -> Value {
+    // Note: The Generative Language API's supported request fields differ across versions/models.
+    // Some deployments reject `systemInstruction` with:
+    //   Unknown name "systemInstruction": Cannot find field.
+    // To stay compatible, we embed the "system" prompt as part of the user content.
     serde_json::json!({
-      "systemInstruction": {"parts":[{"text": system}]},
-      "contents":[{"role":"user","parts":[{"text": user}]}],
+      "contents":[{"role":"user","parts":[{"text": system},{"text": user}]}],
       "generationConfig": {
         "temperature": temperature,
         "maxOutputTokens": max_output_tokens
