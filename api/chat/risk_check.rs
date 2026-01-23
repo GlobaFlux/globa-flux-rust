@@ -95,6 +95,113 @@ fn config_error_response(stream: bool, message: &str) -> Result<Response<Respons
     )
 }
 
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn normalize_model_json_text(raw: &str) -> String {
+    let mut text = raw.trim().to_string();
+    if !text.starts_with("```") {
+        return text;
+    }
+
+    if let Some(first_nl) = text.find('\n') {
+        text = text[(first_nl + 1)..].to_string();
+    }
+    if let Some(end_fence) = text.rfind("```") {
+        text = text[..end_fence].to_string();
+    }
+    text.trim().to_string()
+}
+
+fn parse_model_json(raw: &str) -> Option<serde_json::Value> {
+    let normalized = normalize_model_json_text(raw);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&normalized) {
+        return Some(v);
+    }
+
+    let start = normalized.find('{')?;
+    let end = normalized.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&normalized[start..=end]).ok()
+}
+
+fn coerce_risk_check_result(raw_output: &str) -> serde_json::Value {
+    let raw_output = raw_output.trim();
+
+    let parsed = parse_model_json(raw_output);
+    let mut v = match parsed {
+        Some(v) => v,
+        None => {
+            let snippet = truncate_chars(raw_output, 600);
+            let reason = if snippet.is_empty() {
+                "Cannot assess risk: empty model output.".to_string()
+            } else {
+                format!("Cannot assess risk: model returned non-JSON output. Output: {snippet}")
+            };
+            return serde_json::json!({"risk_level":"medium","allowed":false,"reason":reason});
+        }
+    };
+
+    let obj = match v.as_object_mut() {
+        Some(obj) => obj,
+        None => {
+            let snippet = truncate_chars(raw_output, 600);
+            let reason = if snippet.is_empty() {
+                "Cannot assess risk: empty model output.".to_string()
+            } else {
+                format!("Cannot assess risk: model returned non-object JSON. Output: {snippet}")
+            };
+            return serde_json::json!({"risk_level":"medium","allowed":false,"reason":reason});
+        }
+    };
+
+    match obj.get("risk_level") {
+        Some(serde_json::Value::String(_)) => {}
+        _ => {
+            obj.insert(
+                "risk_level".to_string(),
+                serde_json::Value::String("medium".to_string()),
+            );
+        }
+    }
+
+    match obj.get("allowed") {
+        Some(serde_json::Value::Bool(_)) => {}
+        _ => {
+            obj.insert("allowed".to_string(), serde_json::Value::Bool(false));
+        }
+    }
+
+    match obj.get("reason") {
+        Some(serde_json::Value::String(_)) => {}
+        _ => {
+            obj.insert(
+                "reason".to_string(),
+                serde_json::Value::String("No reason provided.".to_string()),
+            );
+        }
+    }
+
+    v
+}
+
 async fn handle_risk_check(
     method: &Method,
     headers: &HeaderMap,
@@ -374,14 +481,7 @@ async fn handle_risk_check(
                 })
                 .unwrap_or(0.0);
 
-            let result_json = serde_json::from_str::<serde_json::Value>(output_text.trim())
-                .unwrap_or_else(|_| {
-                    serde_json::json!({
-                      "risk_level": "medium",
-                      "allowed": true,
-                      "reason": output_text.trim()
-                    })
-                });
+            let result_json = coerce_risk_check_result(&output_text);
 
             let insert_result = insert_usage_event(
                 pool,
@@ -473,9 +573,7 @@ async fn handle_risk_check(
 
     let content = content.trim().to_string();
 
-    let result_json = serde_json::from_str::<serde_json::Value>(&content).unwrap_or_else(
-        |_| serde_json::json!({"risk_level":"medium","allowed":true,"reason":content}),
-    );
+    let result_json = coerce_risk_check_result(&content);
 
     let insert_result = insert_usage_event(
         pool,
@@ -521,6 +619,25 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coerce_risk_check_result_parses_fenced_json() {
+        let raw = r#"```json
+{"risk_level":"low","allowed":true,"reason":"ok"}
+```"#;
+        let v = coerce_risk_check_result(raw);
+        assert_eq!(v["risk_level"], "low");
+        assert_eq!(v["allowed"], true);
+        assert_eq!(v["reason"], "ok");
+    }
+
+    #[test]
+    fn coerce_risk_check_result_defaults_to_disallow_on_invalid_output() {
+        let raw = r#"{"risk_level":"medium","allowed":false,"reason":"Cannot assess"#;
+        let v = coerce_risk_check_result(raw);
+        assert_eq!(v["risk_level"], "medium");
+        assert_eq!(v["allowed"], false);
+    }
 
     #[tokio::test]
     async fn returns_config_error_when_gemini_key_missing() {
