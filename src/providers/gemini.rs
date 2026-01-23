@@ -34,13 +34,8 @@ impl GeminiConfig {
             return Ok(None);
         }
 
-        let model = std::env::var("GEMINI_MODEL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            // Note: `*-latest` aliases are not consistently supported across API versions.
-            // Default to a stable model id to avoid 404s like:
-            // "models/gemini-1.5-flash-latest is not found for API version v1".
-            .unwrap_or_else(|| "gemini-1.5-flash".to_string());
+        // Model is provided by DB-only configuration at call time.
+        let model = String::new();
 
         let api_base_url = std::env::var("GEMINI_API_BASE_URL")
             .ok()
@@ -49,7 +44,7 @@ impl GeminiConfig {
 
         Ok(Some(Self {
             api_key: api_key.trim().to_string(),
-            model: model.trim().to_string(),
+            model,
             api_base_url: api_base_url.trim().to_string(),
         }))
     }
@@ -338,5 +333,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(extract_text_from_response_json(&json), "ab");
+    }
+
+    #[test]
+    fn from_env_optional_ignores_gemini_model_env() {
+        std::env::set_var("GEMINI_API_KEY", "k");
+        std::env::set_var("GEMINI_MODEL", "gemini-2.5-flash");
+
+        let cfg = GeminiConfig::from_env_optional().unwrap().unwrap();
+        assert_eq!(cfg.model, "");
+
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::remove_var("GEMINI_MODEL");
     }
 }
