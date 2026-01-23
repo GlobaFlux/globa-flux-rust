@@ -58,10 +58,6 @@ name = "jobs_daily_dispatch"
 path = "api/jobs/daily/dispatch.rs"
 
 [[bin]]
-name = "jobs_weekly_dispatch"
-path = "api/jobs/weekly/dispatch.rs"
-
-[[bin]]
 name = "jobs_worker_tick"
 path = "api/jobs/worker/tick.rs"
 

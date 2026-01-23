@@ -2,6 +2,10 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     {
+      "source": "/api/jobs/weekly/dispatch",
+      "destination": "/api/jobs/daily/dispatch?schedule=weekly"
+    },
+    {
       "source": "/api/usage/chat_risk_check/consume",
       "destination": "/api/usage/chat_risk_check"
     },

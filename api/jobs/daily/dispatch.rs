@@ -28,12 +28,51 @@ fn has_tidb_url() -> bool {
     .unwrap_or(false)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchSchedule {
+  Daily,
+  Weekly,
+}
+
+impl DispatchSchedule {
+  fn from_query(query: Option<&str>) -> Self {
+    let value = query_value(query, "schedule").unwrap_or("");
+    match value {
+      "weekly" | "Weekly" | "WEEKLY" => DispatchSchedule::Weekly,
+      _ => DispatchSchedule::Daily,
+    }
+  }
+
+  fn job_type(&self) -> &'static str {
+    match self {
+      DispatchSchedule::Daily => "daily_channel",
+      DispatchSchedule::Weekly => "weekly_channel",
+    }
+  }
+}
+
+fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+  let query = query?;
+  for part in query.split('&') {
+    let (k, v) = part.split_once('=')?;
+    if k == key {
+      return Some(v);
+    }
+  }
+  None
+}
+
 #[derive(Deserialize)]
 struct DispatchRequest {
   now_ms: i64,
 }
 
-async fn handle_dispatch(method: &Method, headers: &HeaderMap, body: Bytes) -> Result<Response<ResponseBody>, Error> {
+async fn handle_dispatch(
+  schedule: DispatchSchedule,
+  method: &Method,
+  headers: &HeaderMap,
+  body: Bytes,
+) -> Result<Response<ResponseBody>, Error> {
   if method != Method::POST {
     return json_response(
       StatusCode::METHOD_NOT_ALLOWED,
@@ -90,16 +129,19 @@ async fn handle_dispatch(method: &Method, headers: &HeaderMap, body: Bytes) -> R
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
+  let job_type = schedule.job_type();
+
   for (tenant_id, channel_id) in channels.iter() {
-    let dedupe_key = format!("{tenant_id}:daily_channel:{channel_id}:{run_for_dt}");
+    let dedupe_key = format!("{tenant_id}:{job_type}:{channel_id}:{run_for_dt}");
     sqlx::query(
       r#"
         INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status)
-        VALUES (?, 'daily_channel', ?, ?, ?, 'pending')
+        VALUES (?, ?, ?, ?, ?, 'pending')
         ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP(3);
       "#,
     )
     .bind(tenant_id)
+    .bind(job_type)
     .bind(channel_id)
     .bind(run_for_dt)
     .bind(dedupe_key)
@@ -112,7 +154,7 @@ async fn handle_dispatch(method: &Method, headers: &HeaderMap, body: Bytes) -> R
     StatusCode::OK,
     serde_json::json!({
       "ok": true,
-      "job_type": "daily_channel",
+      "job_type": job_type,
       "run_for_dt": run_for_dt.to_string(),
       "candidates": channels.len()
     }),
@@ -120,10 +162,11 @@ async fn handle_dispatch(method: &Method, headers: &HeaderMap, body: Bytes) -> R
 }
 
 async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
+  let schedule = DispatchSchedule::from_query(req.uri().query());
   let method = req.method().clone();
   let headers = req.headers().clone();
   let bytes = req.into_body().collect().await?.to_bytes();
-  handle_dispatch(&method, &headers, bytes).await
+  handle_dispatch(schedule, &method, &headers, bytes).await
 }
 
 #[tokio::main]
@@ -140,7 +183,7 @@ mod tests {
     std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
 
     let headers = HeaderMap::new();
-    let response = handle_dispatch(&Method::POST, &headers, Bytes::new())
+    let response = handle_dispatch(DispatchSchedule::Daily, &Method::POST, &headers, Bytes::new())
       .await
       .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -157,9 +200,49 @@ mod tests {
     headers.insert("content-type", "application/json".parse().unwrap());
 
     let body = Bytes::from(r#"{"now_ms":1700000000000}"#);
-    let response = handle_dispatch(&Method::POST, &headers, body).await.unwrap();
+    let response = handle_dispatch(DispatchSchedule::Daily, &Method::POST, &headers, body)
+      .await
+      .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+  }
+
+  #[test]
+  fn schedule_from_query_defaults_daily() {
+    assert_eq!(DispatchSchedule::from_query(None), DispatchSchedule::Daily);
+    assert_eq!(
+      DispatchSchedule::from_query(Some("foo=bar")),
+      DispatchSchedule::Daily
+    );
+  }
+
+  #[test]
+  fn schedule_from_query_weekly() {
+    assert_eq!(
+      DispatchSchedule::from_query(Some("schedule=weekly")),
+      DispatchSchedule::Weekly
+    );
+    assert_eq!(
+      DispatchSchedule::from_query(Some("a=b&schedule=weekly&c=d")),
+      DispatchSchedule::Weekly
+    );
+  }
+
+  #[tokio::test]
+  async fn returns_not_configured_when_tidb_env_missing_for_weekly() {
+    std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+    std::env::remove_var("TIDB_DATABASE_URL");
+    std::env::remove_var("DATABASE_URL");
+
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", "Bearer secret".parse().unwrap());
+    headers.insert("content-type", "application/json".parse().unwrap());
+
+    let body = Bytes::from(r#"{"now_ms":1700000000000}"#);
+    let response = handle_dispatch(DispatchSchedule::Weekly, &Method::POST, &headers, body)
+      .await
+      .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
   }
 }
-
