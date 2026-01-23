@@ -71,6 +71,8 @@ struct TickRequest {
   now_ms: i64,
   #[serde(default)]
   limit: Option<i64>,
+  #[serde(default)]
+  tenant_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +154,11 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
   }
 
   let limit = parsed.limit.unwrap_or(10).clamp(1, 50) as i64;
+  let tenant_filter = parsed
+    .tenant_id
+    .as_deref()
+    .map(str::trim)
+    .filter(|v| !v.is_empty());
 
   let now = Utc
     .timestamp_millis_opt(parsed.now_ms)
@@ -166,39 +173,81 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
     .clamp(60, 3600);
   let stale_before = now - Duration::seconds(lock_ttl_secs);
 
-  let reclaimed = sqlx::query(
-    r#"
-      UPDATE job_tasks
-      SET status='retrying', run_after=?, locked_by=NULL, locked_at=NULL
-      WHERE status='running' AND locked_at IS NOT NULL AND locked_at < ?;
-    "#,
-  )
-  .bind(now)
-  .bind(stale_before)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?
-  .rows_affected();
+  let reclaimed = if let Some(tenant_id) = tenant_filter {
+    sqlx::query(
+      r#"
+        UPDATE job_tasks
+        SET status='retrying', run_after=?, locked_by=NULL, locked_at=NULL
+        WHERE tenant_id = ?
+          AND status='running'
+          AND locked_at IS NOT NULL
+          AND locked_at < ?;
+      "#,
+    )
+    .bind(now)
+    .bind(tenant_id)
+    .bind(stale_before)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?
+    .rows_affected()
+  } else {
+    sqlx::query(
+      r#"
+        UPDATE job_tasks
+        SET status='retrying', run_after=?, locked_by=NULL, locked_at=NULL
+        WHERE status='running' AND locked_at IS NOT NULL AND locked_at < ?;
+      "#,
+    )
+    .bind(now)
+    .bind(stale_before)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?
+    .rows_affected()
+  };
 
   let worker_id = worker_id();
 
   let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
-  let claimed: Vec<(i64, String, String, String, Option<chrono::NaiveDate>, i32, i32)> = sqlx::query_as(
-    r#"
-      SELECT id, tenant_id, job_type, channel_id, run_for_dt, attempt, max_attempt
-      FROM job_tasks
-      WHERE status IN ('pending','retrying')
-        AND run_after <= ?
-      ORDER BY id ASC
-      LIMIT ?
-      FOR UPDATE;
-    "#,
-  )
-  .bind(now)
-  .bind(limit)
-  .fetch_all(&mut *tx)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+  let claimed: Vec<(i64, String, String, String, Option<chrono::NaiveDate>, i32, i32)> =
+    if let Some(tenant_id) = tenant_filter {
+      sqlx::query_as(
+        r#"
+          SELECT id, tenant_id, job_type, channel_id, run_for_dt, attempt, max_attempt
+          FROM job_tasks
+          WHERE tenant_id = ?
+            AND status IN ('pending','retrying')
+            AND run_after <= ?
+          ORDER BY id ASC
+          LIMIT ?
+          FOR UPDATE;
+        "#,
+      )
+      .bind(tenant_id)
+      .bind(now)
+      .bind(limit)
+      .fetch_all(&mut *tx)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?
+    } else {
+      sqlx::query_as(
+        r#"
+          SELECT id, tenant_id, job_type, channel_id, run_for_dt, attempt, max_attempt
+          FROM job_tasks
+          WHERE status IN ('pending','retrying')
+            AND run_after <= ?
+          ORDER BY id ASC
+          LIMIT ?
+          FOR UPDATE;
+        "#,
+      )
+      .bind(now)
+      .bind(limit)
+      .fetch_all(&mut *tx)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?
+    };
 
   for (id, _tenant_id, _job_type, _channel_id, _run_for_dt, _attempt, _max_attempt) in claimed.iter() {
     sqlx::query(
@@ -491,6 +540,7 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
     serde_json::json!({
       "ok": true,
       "worker_id": worker_id,
+      "tenant_id": tenant_filter,
       "reclaimed": reclaimed,
       "claimed": claimed.len(),
       "succeeded": succeeded,
@@ -510,4 +560,35 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
   run(service_fn(handler)).await
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn returns_unauthorized_when_missing_internal_token() {
+    std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+
+    let headers = HeaderMap::new();
+    let response = handle_tick(&Method::POST, &headers, Bytes::new())
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+  }
+
+  #[tokio::test]
+  async fn returns_not_configured_when_tidb_env_missing_with_tenant_filter() {
+    std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+    std::env::remove_var("TIDB_DATABASE_URL");
+    std::env::remove_var("DATABASE_URL");
+
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", "Bearer secret".parse().unwrap());
+    headers.insert("content-type", "application/json".parse().unwrap());
+
+    let body = Bytes::from(r#"{"now_ms":1700000000000,"tenant_id":"t1"}"#);
+    let response = handle_tick(&Method::POST, &headers, body).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+  }
 }
