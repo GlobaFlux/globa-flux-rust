@@ -65,6 +65,8 @@ fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
 #[derive(Deserialize)]
 struct DispatchRequest {
   now_ms: i64,
+  #[serde(default)]
+  tenant_id: Option<String>,
 }
 
 async fn handle_dispatch(
@@ -116,18 +118,42 @@ async fn handle_dispatch(
 
   let pool = get_pool().await?;
 
-  let channels: Vec<(String, String)> = sqlx::query_as(
-    r#"
-      SELECT tenant_id, channel_id
-      FROM channel_connections
-      WHERE oauth_provider = 'youtube'
-        AND channel_id IS NOT NULL
-        AND channel_id <> '';
-    "#,
-  )
-  .fetch_all(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+  let tenant_filter = parsed
+    .tenant_id
+    .as_deref()
+    .map(str::trim)
+    .filter(|v| !v.is_empty())
+    .map(str::to_string);
+
+  let channels: Vec<(String, String)> = if let Some(tenant_id) = tenant_filter.as_deref() {
+    sqlx::query_as(
+      r#"
+        SELECT tenant_id, channel_id
+        FROM channel_connections
+        WHERE tenant_id = ?
+          AND oauth_provider = 'youtube'
+          AND channel_id IS NOT NULL
+          AND channel_id <> '';
+      "#,
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?
+  } else {
+    sqlx::query_as(
+      r#"
+        SELECT tenant_id, channel_id
+        FROM channel_connections
+        WHERE oauth_provider = 'youtube'
+          AND channel_id IS NOT NULL
+          AND channel_id <> '';
+      "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?
+  };
 
   let job_type = schedule.job_type();
 
@@ -154,6 +180,7 @@ async fn handle_dispatch(
     StatusCode::OK,
     serde_json::json!({
       "ok": true,
+      "tenant_id": tenant_filter,
       "job_type": job_type,
       "run_for_dt": run_for_dt.to_string(),
       "candidates": channels.len()
@@ -200,6 +227,24 @@ mod tests {
     headers.insert("content-type", "application/json".parse().unwrap());
 
     let body = Bytes::from(r#"{"now_ms":1700000000000}"#);
+    let response = handle_dispatch(DispatchSchedule::Daily, &Method::POST, &headers, body)
+      .await
+      .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+  }
+
+  #[tokio::test]
+  async fn returns_not_configured_when_tidb_env_missing_with_tenant_filter() {
+    std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+    std::env::remove_var("TIDB_DATABASE_URL");
+    std::env::remove_var("DATABASE_URL");
+
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", "Bearer secret".parse().unwrap());
+    headers.insert("content-type", "application/json".parse().unwrap());
+
+    let body = Bytes::from(r#"{"now_ms":1700000000000,"tenant_id":"t1"}"#);
     let response = handle_dispatch(DispatchSchedule::Daily, &Method::POST, &headers, body)
       .await
       .unwrap();

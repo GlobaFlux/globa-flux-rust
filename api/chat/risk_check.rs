@@ -237,7 +237,7 @@ You are NOT a risk-check bot. Reply naturally in Chinese.
 Scope:
 - Provide suggestions only (do not claim you changed anything).
 - Help optimize YouTube title/description/hook/script outline/community post copy.
-- If user asks to "发任务/跑任务/执行任务", explain it requires confirmation, and propose running the job worker tick.
+- If user asks to "发任务/跑任务/执行任务", explain it requires confirmation, and propose running "dispatch + worker tick" for their tenant.
 
 Output style:
 - Ask 1–3 clarifying questions if context is missing.
@@ -515,10 +515,11 @@ async fn handle_agent(
 
             let tool_proposal = if agent_wants_run_task(&message) {
                 Some(serde_json::json!({
-                  "type": "jobs_worker_tick",
+                  "type": "jobs_run_now",
+                  "schedule": "daily",
                   "limit": 10,
                   "requires_confirmation": true,
-                  "note": "Will attempt to run queued jobs for this tenant."
+                  "note": "Will dispatch and run queued jobs for this tenant."
                 }))
             } else {
                 None
@@ -598,10 +599,11 @@ async fn handle_agent(
 
     let tool_proposal = if agent_wants_run_task(&parsed.message) {
         Some(serde_json::json!({
-          "type": "jobs_worker_tick",
+          "type": "jobs_run_now",
+          "schedule": "daily",
           "limit": 10,
           "requires_confirmation": true,
-          "note": "Will attempt to run queued jobs for this tenant."
+          "note": "Will dispatch and run queued jobs for this tenant."
         }))
     } else {
         None
