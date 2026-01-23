@@ -1,12 +1,12 @@
 use http_body_util::BodyExt;
 use http_body_util::StreamBody;
 use hyper::body::Frame;
-use hyper::StatusCode;
+use hyper::{HeaderMap, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 
 use bytes::Bytes;
-use globa_flux_rust::cost::{compute_cost_usd, ModelPricingUsdPerMToken};
+use globa_flux_rust::cost::compute_cost_usd;
 use globa_flux_rust::db::{
     fetch_tenant_gemini_model, fetch_usage_event, get_pool, insert_usage_event, sum_spent_usd_today,
 };
@@ -14,15 +14,12 @@ use globa_flux_rust::providers::gemini::{
     generate_text as gemini_generate_text, pricing_for_model as gemini_pricing_for_model,
     stream_generate as gemini_stream_generate, GeminiConfig, GeminiStreamEvent,
 };
-use globa_flux_rust::providers::openai::{
-    build_chat_completions_request, build_risk_check_messages, build_risk_check_prompt,
-    openai_client, openai_client_with_idempotency, pricing_for_model as openai_pricing_for_model,
-    ChatCompletionsPayloadArgs, RiskCheckMessageArgs,
-};
+use globa_flux_rust::providers::openai::{build_risk_check_prompt, RiskCheckMessageArgs};
 use globa_flux_rust::sse::sse_event;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
+
+const GLOBAL_TENANT_ID: &str = "global";
 
 #[derive(Deserialize)]
 struct RiskCheckRequest {
@@ -48,8 +45,8 @@ fn bearer_token(header_value: Option<&str>) -> Option<&str> {
         .or_else(|| value.strip_prefix("bearer "))
 }
 
-fn wants_stream(req: &Request) -> bool {
-    if let Some(q) = req.uri().query() {
+fn wants_stream(uri: &hyper::Uri, headers: &HeaderMap) -> bool {
+    if let Some(q) = uri.query() {
         for part in q.split('&') {
             if part == "stream=1" {
                 return true;
@@ -57,7 +54,7 @@ fn wants_stream(req: &Request) -> bool {
         }
     }
 
-    req.headers()
+    headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("text/event-stream"))
@@ -81,8 +78,30 @@ fn json_response(
         .body(ResponseBody::from(value))?)
 }
 
-async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
-    if req.method() != "POST" {
+fn config_error_response(stream: bool, message: &str) -> Result<Response<ResponseBody>, Error> {
+    if stream {
+        return sse_response(
+            StatusCode::OK,
+            sse_event(
+                "error",
+                &serde_json::json!({"code":"config_error","message": message}).to_string(),
+            ),
+        );
+    }
+
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({"ok": false, "error": "config_error", "message": message}),
+    )
+}
+
+async fn handle_risk_check(
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &hyper::Uri,
+    body: Bytes,
+) -> Result<Response<ResponseBody>, Error> {
+    if method != Method::POST {
         return json_response(
             StatusCode::METHOD_NOT_ALLOWED,
             serde_json::json!({"ok": false, "error": "method_not_allowed"}),
@@ -91,7 +110,7 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
 
     let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
     let provided = bearer_token(
-        req.headers()
+        headers
             .get("authorization")
             .and_then(|v| v.to_str().ok()),
     )
@@ -104,10 +123,9 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
         );
     }
 
-    let stream = wants_stream(&req);
+    let stream = wants_stream(uri, headers);
 
-    let idempotency_key = req
-        .headers()
+    let idempotency_key = headers
         .get("x-idempotency-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
@@ -129,14 +147,25 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
         );
     }
 
-    let bytes = req.into_body().collect().await?.to_bytes();
-    let parsed: RiskCheckRequest = serde_json::from_slice(&bytes).map_err(|e| -> Error {
+    let mut gemini_cfg = match GeminiConfig::from_env_optional()? {
+        Some(cfg) => cfg,
+        None => {
+            return config_error_response(stream, "Missing GEMINI_API_KEY");
+        }
+    };
+
+    let parsed: RiskCheckRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
         Box::new(std::io::Error::other(format!("invalid json body: {e}")))
     })?;
 
     // TiDB budget precheck + idempotent usage accounting.
     // Note: Hydrogen passes `budget_usd_per_day` (trial entitlements), Rust enforces it here.
-    let pool = get_pool().await?;
+    let pool = match get_pool().await {
+        Ok(pool) => pool,
+        Err(err) => {
+            return config_error_response(stream, &err.to_string());
+        }
+    };
 
     const EVENT_TYPE: &str = "chat_risk_check";
     if let Some(existing) =
@@ -178,63 +207,33 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
     let spent_usd_today = sum_spent_usd_today(pool, &parsed.tenant_id, chrono::Utc::now()).await?;
     let temperature: f64 = 0.2;
 
-    let mut gemini_cfg = GeminiConfig::from_env_optional()?;
-    if let Some(cfg) = gemini_cfg.as_mut() {
-        if let Some(model) = fetch_tenant_gemini_model(pool, &parsed.tenant_id).await? {
-            let model = model.trim();
-            if !model.is_empty() {
-                cfg.model = model.to_string();
-            }
+    let db_model = match fetch_tenant_gemini_model(pool, GLOBAL_TENANT_ID).await {
+        Ok(model) => model.unwrap_or_default(),
+        Err(err) => {
+            return config_error_response(stream, &err.to_string());
         }
-    }
-    let use_gemini = gemini_cfg.is_some();
-
-    let (provider, model, max_output_tokens, prompt_reserve_tokens, pricing) = if use_gemini {
-        let model = gemini_cfg
-            .as_ref()
-            .map(|c| c.model.clone())
-            .unwrap_or_else(|| "gemini-1.5-flash".to_string());
-        let max_output_tokens: u32 = std::env::var("GEMINI_MAX_OUTPUT_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(600);
-        let prompt_reserve_tokens: u32 = std::env::var("GEMINI_PROMPT_TOKEN_RESERVE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2000);
-
-        (
-            "gemini".to_string(),
-            model.clone(),
-            max_output_tokens,
-            prompt_reserve_tokens,
-            gemini_pricing_for_model(&model),
-        )
-    } else {
-        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-        let max_output_tokens: u32 = std::env::var("OPENAI_MAX_COMPLETION_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(600);
-        let prompt_reserve_tokens: u32 = std::env::var("OPENAI_PROMPT_TOKEN_RESERVE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2000);
-
-        let pricing: ModelPricingUsdPerMToken = openai_pricing_for_model(&model).ok_or_else(|| {
-      Box::new(std::io::Error::other(format!(
-        "Missing pricing for model {model}. Set OPENAI_PRICE_PROMPT_USD_PER_M_TOKEN and OPENAI_PRICE_COMPLETION_USD_PER_M_TOKEN."
-      ))) as Error
-    })?;
-
-        (
-            "openai".to_string(),
-            model,
-            max_output_tokens,
-            prompt_reserve_tokens,
-            Some(pricing),
-        )
     };
+    let db_model = db_model.trim().to_string();
+    if db_model.is_empty() {
+        return config_error_response(
+            stream,
+            "Missing gemini_model for tenant_id=global",
+        );
+    }
+    gemini_cfg.model = db_model.clone();
+
+    let model = gemini_cfg.model.clone();
+    let max_output_tokens: u32 = std::env::var("GEMINI_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    let prompt_reserve_tokens: u32 = std::env::var("GEMINI_PROMPT_TOKEN_RESERVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+
+    let provider = "gemini".to_string();
+    let pricing = gemini_pricing_for_model(&model);
 
     let reserved_cost_usd = pricing
         .map(|p| compute_cost_usd(p, prompt_reserve_tokens, max_output_tokens))
@@ -284,211 +283,78 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
         let model2 = model.clone();
         let provider2 = provider.clone();
         let pricing2 = pricing;
-        let use_gemini2 = use_gemini;
         let gemini_cfg2 = gemini_cfg.clone();
         let max_output_tokens2 = max_output_tokens;
         let temperature2 = temperature;
 
         tokio::spawn(async move {
-            let mut output_text = String::new();
-            let mut usage: Option<Usage> = None;
+            let prompt = build_risk_check_prompt(RiskCheckMessageArgs {
+                action_type: &action_type,
+                note: note.as_deref(),
+            });
 
-            if use_gemini2 {
-                let cfg = match gemini_cfg2 {
-                    Some(c) => c,
-                    None => {
-                        let _ = tx
-                            .send(Ok(Frame::data(Bytes::from(sse_event(
-                                "error",
-                                r#"{"code":"config_error","message":"Missing GEMINI_API_KEY"}"#,
-                            )))))
-                            .await;
-                        return;
-                    }
-                };
+            let output_shared = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+            let usage_shared = std::sync::Arc::new(tokio::sync::Mutex::new(None::<Usage>));
 
-                let prompt = build_risk_check_prompt(RiskCheckMessageArgs {
-                    action_type: &action_type,
-                    note: note.as_deref(),
-                });
+            let output_shared2 = std::sync::Arc::clone(&output_shared);
+            let usage_shared2 = std::sync::Arc::clone(&usage_shared);
+            let tx2 = tx.clone();
 
-                let output_shared = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
-                let usage_shared = std::sync::Arc::new(tokio::sync::Mutex::new(None::<Usage>));
+            let res = gemini_stream_generate(
+                &gemini_cfg2,
+                &prompt.system,
+                &prompt.user,
+                temperature2,
+                max_output_tokens2,
+                move |event| {
+                    let output_shared2 = std::sync::Arc::clone(&output_shared2);
+                    let usage_shared2 = std::sync::Arc::clone(&usage_shared2);
+                    let tx2 = tx2.clone();
 
-                let output_shared2 = std::sync::Arc::clone(&output_shared);
-                let usage_shared2 = std::sync::Arc::clone(&usage_shared);
-                let tx2 = tx.clone();
-
-                let res = gemini_stream_generate(
-                    &cfg,
-                    &prompt.system,
-                    &prompt.user,
-                    temperature2,
-                    max_output_tokens2,
-                    move |event| {
-                        let output_shared2 = std::sync::Arc::clone(&output_shared2);
-                        let usage_shared2 = std::sync::Arc::clone(&usage_shared2);
-                        let tx2 = tx2.clone();
-
-                        async move {
-                            match event {
-                                GeminiStreamEvent::Usage(u) => {
-                                    *usage_shared2.lock().await = Some(Usage {
-                                        prompt_tokens: u.prompt_tokens,
-                                        completion_tokens: u.completion_tokens,
-                                    });
-                                    Ok(())
-                                }
-                                GeminiStreamEvent::Delta(delta) => {
-                                    {
-                                        let mut out = output_shared2.lock().await;
-                                        out.push_str(&delta);
-                                    }
-
-                                    tx2.send(Ok(Frame::data(Bytes::from(sse_event(
-                                        "token",
-                                        &serde_json::json!({"text": delta}).to_string(),
-                                    )))))
-                                    .await
-                                    .map_err(|e| {
-                                        Box::new(std::io::Error::other(e.to_string())) as Error
-                                    })?;
-                                    Ok(())
-                                }
-                            }
-                        }
-                    },
-                )
-                .await;
-
-                if let Err(e) = res {
-                    let _ = tx
-                        .send(Ok(Frame::data(Bytes::from(sse_event(
-                            "error",
-                            &serde_json::json!({"code":"upstream_error","message":e.to_string()})
-                                .to_string(),
-                        )))))
-                        .await;
-                    return;
-                }
-
-                output_text = output_shared.lock().await.clone();
-                usage = usage_shared.lock().await.clone();
-            } else {
-                let api_key = match std::env::var("OPENAI_API_KEY") {
-                    Ok(v) => v,
-                    Err(_) => {
-                        let _ = tx
-                            .send(Ok(Frame::data(Bytes::from(sse_event(
-                                "error",
-                                r#"{"code":"config_error","message":"Missing OPENAI_API_KEY"}"#,
-                            )))))
-                            .await;
-                        return;
-                    }
-                };
-
-                let client = match openai_client_with_idempotency(&api_key, &idempotency_key2) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Ok(Frame::data(Bytes::from(sse_event(
-                                "error",
-                                &serde_json::json!({"code":"config_error","message":e.to_string()})
-                                    .to_string(),
-                            )))))
-                            .await;
-                        return;
-                    }
-                };
-
-                let messages = match build_risk_check_messages(RiskCheckMessageArgs {
-                    action_type: &action_type,
-                    note: note.as_deref(),
-                }) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Ok(Frame::data(Bytes::from(sse_event(
-                                "error",
-                                &serde_json::json!({"code":"bad_request","message":e.to_string()})
-                                    .to_string(),
-                            )))))
-                            .await;
-                        return;
-                    }
-                };
-
-                let request = match build_chat_completions_request(ChatCompletionsPayloadArgs {
-                    model: &model2,
-                    messages,
-                    max_tokens: max_output_tokens2,
-                    stream: true,
-                }) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Ok(Frame::data(Bytes::from(sse_event(
-                                "error",
-                                &serde_json::json!({"code":"bad_request","message":e.to_string()})
-                                    .to_string(),
-                            )))))
-                            .await;
-                        return;
-                    }
-                };
-
-                let mut stream = match client.chat().create_stream(request).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx
-              .send(Ok(Frame::data(Bytes::from(sse_event(
-                "error",
-                &serde_json::json!({"code":"upstream_error","message":e.to_string()}).to_string(),
-              )))))
-              .await;
-                        return;
-                    }
-                };
-
-                while let Some(next) = stream.next().await {
-                    match next {
-                        Ok(chunk) => {
-                            if let Some(u) = chunk.usage {
-                                usage = Some(Usage {
-                                    prompt_tokens: u.prompt_tokens as i32,
-                                    completion_tokens: u.completion_tokens as i32,
+                    async move {
+                        match event {
+                            GeminiStreamEvent::Usage(u) => {
+                                *usage_shared2.lock().await = Some(Usage {
+                                    prompt_tokens: u.prompt_tokens,
+                                    completion_tokens: u.completion_tokens,
                                 });
-                                continue;
+                                Ok(())
                             }
+                            GeminiStreamEvent::Delta(delta) => {
+                                {
+                                    let mut out = output_shared2.lock().await;
+                                    out.push_str(&delta);
+                                }
 
-                            if let Some(token) = chunk
-                                .choices
-                                .get(0)
-                                .and_then(|c| c.delta.content.clone())
-                                .filter(|t| !t.is_empty())
-                            {
-                                output_text.push_str(&token);
-                                let _ = tx
-                                    .send(Ok(Frame::data(Bytes::from(sse_event(
-                                        "token",
-                                        &serde_json::json!({"text": token}).to_string(),
-                                    )))))
-                                    .await;
+                                tx2.send(Ok(Frame::data(Bytes::from(sse_event(
+                                    "token",
+                                    &serde_json::json!({"text": delta}).to_string(),
+                                )))))
+                                .await
+                                .map_err(|e| {
+                                    Box::new(std::io::Error::other(e.to_string())) as Error
+                                })?;
+                                Ok(())
                             }
-                        }
-                        Err(e) => {
-                            let _ = tx
-                .send(Ok(Frame::data(Bytes::from(sse_event(
-                  "error",
-                  &serde_json::json!({"code":"upstream_stream_error","message":e.to_string()}).to_string(),
-                )))))
-                .await;
-                            return;
                         }
                     }
-                }
+                },
+            )
+            .await;
+
+            if let Err(e) = res {
+                let _ = tx
+                    .send(Ok(Frame::data(Bytes::from(sse_event(
+                        "error",
+                        &serde_json::json!({"code":"upstream_error","message":e.to_string()})
+                            .to_string(),
+                    )))))
+                    .await;
+                return;
             }
+
+            let output_text = output_shared.lock().await.clone();
+            let usage = usage_shared.lock().await.clone();
 
             let usage = match usage {
                 Some(u) => u,
@@ -577,88 +443,33 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
     }
 
     // Non-streaming mode: call provider once and return JSON.
-    let (content, usage, cost_usd) = if use_gemini {
-        let cfg = gemini_cfg
-            .ok_or_else(|| Box::new(std::io::Error::other("Missing GEMINI_API_KEY")) as Error)?;
-        let prompt = build_risk_check_prompt(RiskCheckMessageArgs {
-            action_type: &parsed.action_type,
-            note: parsed.note.as_deref(),
-        });
-        let (text, u) = gemini_generate_text(
-            &cfg,
-            &prompt.system,
-            &prompt.user,
-            temperature,
-            max_output_tokens,
-        )
-        .await?;
+    let prompt = build_risk_check_prompt(RiskCheckMessageArgs {
+        action_type: &parsed.action_type,
+        note: parsed.note.as_deref(),
+    });
+    let (text, u) = gemini_generate_text(
+        &gemini_cfg,
+        &prompt.system,
+        &prompt.user,
+        temperature,
+        max_output_tokens,
+    )
+    .await?;
 
-        let usage = Usage {
-            prompt_tokens: u.as_ref().map(|x| x.prompt_tokens).unwrap_or(0),
-            completion_tokens: u.as_ref().map(|x| x.completion_tokens).unwrap_or(0),
-        };
-        let cost_usd = pricing
-            .map(|p| {
-                compute_cost_usd(
-                    p,
-                    usage.prompt_tokens as u32,
-                    usage.completion_tokens as u32,
-                )
-            })
-            .unwrap_or(0.0);
-        (text, usage, cost_usd)
-    } else {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| Box::new(std::io::Error::other("Missing OPENAI_API_KEY")) as Error)?;
-        let client = openai_client(&api_key);
-        let messages = build_risk_check_messages(RiskCheckMessageArgs {
-            action_type: &parsed.action_type,
-            note: parsed.note.as_deref(),
-        })?;
-        let request = build_chat_completions_request(ChatCompletionsPayloadArgs {
-            model: &model,
-            messages,
-            max_tokens: max_output_tokens,
-            stream: false,
-        })?;
-
-        let response = client
-            .chat()
-            .create(request)
-            .await
-            .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?;
-
-        let content = response
-            .choices
-            .get(0)
-            .and_then(|c| c.message.content.clone())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-
-        let usage = Usage {
-            prompt_tokens: response
-                .usage
-                .as_ref()
-                .map(|u| u.prompt_tokens)
-                .unwrap_or(0) as i32,
-            completion_tokens: response
-                .usage
-                .as_ref()
-                .map(|u| u.completion_tokens)
-                .unwrap_or(0) as i32,
-        };
-        let cost_usd = pricing
-            .map(|p| {
-                compute_cost_usd(
-                    p,
-                    usage.prompt_tokens as u32,
-                    usage.completion_tokens as u32,
-                )
-            })
-            .unwrap_or(0.0);
-        (content, usage, cost_usd)
+    let usage = Usage {
+        prompt_tokens: u.as_ref().map(|x| x.prompt_tokens).unwrap_or(0),
+        completion_tokens: u.as_ref().map(|x| x.completion_tokens).unwrap_or(0),
     };
+    let cost_usd = pricing
+        .map(|p| {
+            compute_cost_usd(
+                p,
+                usage.prompt_tokens as u32,
+                usage.completion_tokens as u32,
+            )
+        })
+        .unwrap_or(0.0);
+    let (content, usage, cost_usd) = (text, usage, cost_usd);
 
     let content = content.trim().to_string();
 
@@ -694,7 +505,47 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
     )
 }
 
+async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    let uri = req.uri().clone();
+    let bytes = req.into_body().collect().await?.to_bytes();
+    handle_risk_check(&method, &headers, &uri, bytes).await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     run(service_fn(handler)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn returns_config_error_when_gemini_key_missing() {
+        std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::remove_var("TIDB_DATABASE_URL");
+        std::env::remove_var("DATABASE_URL");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("x-idempotency-key", "k1".parse().unwrap());
+
+        let uri: hyper::Uri = "/api/chat/risk_check".parse().unwrap();
+        let body = Bytes::from(
+            r#"{"request_id":"r1","tenant_id":"t1","trial_started_at_ms":0,"budget_usd_per_day":1,"action_type":"change_title"}"#,
+        );
+
+        let response = handle_risk_check(&Method::POST, &headers, &uri, body).await;
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.get("error").and_then(|v| v.as_str()), Some("config_error"));
+    }
 }
