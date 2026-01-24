@@ -7,12 +7,19 @@ use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 
 use globa_flux_rust::db::{
   decision_daily_exists,
+  ensure_geo_monitor_run,
+  fetch_geo_monitor_project,
+  fetch_geo_monitor_prompt,
   fetch_new_video_publish_counts_by_dt,
   fetch_policy_params_json,
   fetch_revenue_sum_usd_7d,
+  fetch_tenant_gemini_model,
   fetch_top_video_ids_by_revenue,
   fetch_youtube_connection_tokens,
   get_pool,
+  finalize_geo_monitor_run_if_complete,
+  insert_geo_monitor_run_result,
+  insert_usage_event,
   update_youtube_connection_tokens,
   upsert_decision_outcome,
   upsert_observed_action,
@@ -22,8 +29,18 @@ use globa_flux_rust::db::{
 };
 use globa_flux_rust::decision_engine::{compute_decision, DecisionEngineConfig};
 use globa_flux_rust::outcome_engine::compute_outcome_label;
+use globa_flux_rust::providers::gemini::{
+  generate_text as gemini_generate_text, pricing_for_model as gemini_pricing_for_model, GeminiConfig,
+};
 use globa_flux_rust::providers::youtube::{refresh_tokens, youtube_oauth_client_from_env};
 use globa_flux_rust::providers::youtube_analytics::{fetch_video_daily_metrics, youtube_analytics_error_to_vercel_error};
+use globa_flux_rust::{
+  cost::compute_cost_usd,
+  geo_monitor::{
+    contains_any_case_insensitive, extract_rank_from_markdown_list, normalize_aliases,
+    parse_string_list_json,
+  },
+};
 
 fn bearer_token(header_value: Option<&str>) -> Option<&str> {
   let value = header_value?;
@@ -65,6 +82,8 @@ fn worker_id() -> String {
     .or_else(|_| std::env::var("VERCEL_ENV"))
     .unwrap_or_else(|_| "local".to_string())
 }
+
+const GLOBAL_TENANT_ID: &str = "global";
 
 #[derive(Deserialize)]
 struct TickRequest {
@@ -275,6 +294,164 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
     let attempt_next = attempt.saturating_add(1);
 
     let result: Result<(), Error> = match job_type.as_str() {
+      "geo_monitor_prompt" => {
+        let run_for_dt = run_for_dt.ok_or_else(|| {
+          Box::new(std::io::Error::other("geo_monitor_prompt task missing run_for_dt")) as Error
+        })?;
+
+        let mut parts = channel_id.split(':');
+        let project_id: i64 = parts
+          .next()
+          .unwrap_or("")
+          .parse()
+          .map_err(|_| Box::new(std::io::Error::other("geo_monitor_prompt invalid project_id")) as Error)?;
+        let prompt_id: i64 = parts
+          .next()
+          .unwrap_or("")
+          .parse()
+          .map_err(|_| Box::new(std::io::Error::other("geo_monitor_prompt invalid prompt_id")) as Error)?;
+
+        let project = fetch_geo_monitor_project(pool, tenant_id, project_id)
+          .await?
+          .ok_or_else(|| Box::new(std::io::Error::other("missing geo monitor project")) as Error)?;
+        let prompt = fetch_geo_monitor_prompt(pool, tenant_id, project_id, prompt_id)
+          .await?
+          .ok_or_else(|| Box::new(std::io::Error::other("missing geo monitor prompt")) as Error)?;
+
+        let prompt_total: i32 = sqlx::query_scalar(
+          r#"
+            SELECT COUNT(*) FROM geo_monitor_prompts
+            WHERE tenant_id = ? AND project_id = ? AND enabled = 1;
+          "#,
+        )
+        .bind(tenant_id)
+        .bind(project_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+
+        let mut gemini_cfg = GeminiConfig::from_env_optional()?
+          .ok_or_else(|| Box::new(std::io::Error::other("Missing GEMINI_API_KEY")) as Error)?;
+
+        let db_model = fetch_tenant_gemini_model(pool, GLOBAL_TENANT_ID).await?;
+        let model = db_model
+          .as_deref()
+          .map(str::trim)
+          .filter(|v| !v.is_empty())
+          .ok_or_else(|| Box::new(std::io::Error::other("Missing gemini_model for tenant_id=global")) as Error)?;
+
+        gemini_cfg.model = model.to_string();
+
+        let run = ensure_geo_monitor_run(
+          pool,
+          tenant_id,
+          project_id,
+          run_for_dt,
+          "gemini",
+          model,
+          prompt_total,
+        )
+        .await?;
+
+        let aliases = parse_string_list_json(project.brand_aliases_json.as_deref());
+        let needles = normalize_aliases(&project.name, aliases.as_slice());
+
+        let system = "You are a helpful assistant.";
+        let temperature = 0.2;
+        let max_output_tokens: u32 = 1024;
+
+        let idempotency_key =
+          format!("{tenant_id}:geo_monitor_prompt:{project_id}:{run_for_dt}:{prompt_id}");
+
+        let provider = "gemini";
+        let pricing = gemini_pricing_for_model(model);
+
+        match gemini_generate_text(
+          &gemini_cfg,
+          system,
+          &prompt.prompt_text,
+          temperature,
+          max_output_tokens,
+        )
+        .await
+        {
+          Ok((text, usage)) => {
+            let presence = contains_any_case_insensitive(&text, needles.as_slice());
+            let rank = extract_rank_from_markdown_list(&text, needles.as_slice());
+
+            let (prompt_tokens, completion_tokens, cost_usd) = if let (Some(u), Some(p)) = (usage, pricing) {
+              let cost = compute_cost_usd(p, u.prompt_tokens as u32, u.completion_tokens as u32);
+              (u.prompt_tokens, u.completion_tokens, cost)
+            } else {
+              (0, 0, 0.0)
+            };
+
+            if prompt_tokens > 0 || completion_tokens > 0 {
+              if let Err(err) = insert_usage_event(
+                pool,
+                tenant_id,
+                "geo_monitor_prompt",
+                &idempotency_key,
+                provider,
+                model,
+                prompt_tokens,
+                completion_tokens,
+                cost_usd,
+              )
+              .await
+              {
+                if err
+                  .as_database_error()
+                  .is_some_and(|e| e.is_unique_violation())
+                {
+                  // idempotent replay: ignore
+                } else {
+                  return Err(Box::new(err) as Error);
+                }
+              }
+            }
+
+            let _ = insert_geo_monitor_run_result(
+              pool,
+              tenant_id,
+              project_id,
+              run_for_dt,
+              run.id,
+              prompt_id,
+              &prompt.prompt_text,
+              Some(&text),
+              presence,
+              rank,
+              cost_usd,
+              None,
+            )
+            .await?;
+            let _ = finalize_geo_monitor_run_if_complete(pool, run.id).await?;
+
+            Ok(())
+          }
+          Err(err) => {
+            let msg = truncate_string(&err.to_string(), 2000);
+            let _ = insert_geo_monitor_run_result(
+              pool,
+              tenant_id,
+              project_id,
+              run_for_dt,
+              run.id,
+              prompt_id,
+              &prompt.prompt_text,
+              None,
+              false,
+              None,
+              0.0,
+              Some(&msg),
+            )
+            .await?;
+            let _ = finalize_geo_monitor_run_if_complete(pool, run.id).await?;
+            Ok(())
+          }
+        }
+      }
       "daily_channel" => {
         let run_for_dt = run_for_dt.ok_or_else(|| {
           Box::new(std::io::Error::other("daily_channel task missing run_for_dt")) as Error

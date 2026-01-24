@@ -73,6 +73,14 @@ path = "api/webhooks/billing.rs"
 name = "billing_subscription_status"
 path = "api/billing/subscription/status.rs"
 
+[[bin]]
+name = "geo_monitor"
+path = "api/geo_monitor.rs"
+
+[[bin]]
+name = "geo_monitor_dispatch"
+path = "api/geo_monitor_dispatch.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

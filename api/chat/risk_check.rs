@@ -45,6 +45,28 @@ struct AgentRequest {
     trial_started_at_ms: i64,
     budget_usd_per_day: f64,
     message: String,
+    #[serde(default)]
+    video_context: Option<VideoContext>,
+}
+
+#[derive(Deserialize, Clone)]
+struct VideoContext {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
+    #[serde(default)]
+    target_audience: Option<String>,
+    #[serde(default)]
+    new_angle: Option<String>,
+    #[serde(default)]
+    existing_description: Option<String>,
+    #[serde(default)]
+    outline: Option<String>,
+    #[serde(default)]
+    top_comments: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
 }
 
 fn bearer_token(header_value: Option<&str>) -> Option<&str> {
@@ -229,32 +251,117 @@ fn coerce_risk_check_result(raw_output: &str) -> serde_json::Value {
     v
 }
 
-fn build_agent_prompt(message: &str) -> (String, String) {
-    let system = r#"You are GF Agent for YouTube creators.
+fn trim_to_option(value: Option<&str>) -> Option<String> {
+    let v = value?.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
 
-You are NOT a risk-check bot. Reply naturally in Chinese.
+fn build_agent_prompt(message: &str, video_context: Option<&VideoContext>) -> (String, String) {
+    let title = video_context.and_then(|c| trim_to_option(c.title.as_deref()));
+    let topic = video_context.and_then(|c| trim_to_option(c.topic.as_deref()));
+    let target_audience = video_context.and_then(|c| trim_to_option(c.target_audience.as_deref()));
+    let new_angle = video_context.and_then(|c| trim_to_option(c.new_angle.as_deref()));
+    let existing_description =
+        video_context.and_then(|c| trim_to_option(c.existing_description.as_deref()));
+    let outline = video_context.and_then(|c| trim_to_option(c.outline.as_deref()));
+    let top_comments = video_context.and_then(|c| trim_to_option(c.top_comments.as_deref()));
+    let notes = video_context.and_then(|c| trim_to_option(c.notes.as_deref()));
 
-Scope:
-- Provide suggestions only (do not claim you changed anything).
-- Help optimize YouTube title/description/hook/script outline/community post copy.
-- If user asks to "发任务/跑任务/执行任务", explain it requires confirmation, and propose running "dispatch + worker tick" for their tenant.
+    let mut missing_required: Vec<&str> = Vec::new();
+    if title.is_none() {
+        missing_required.push("title");
+    }
+    if topic.is_none() {
+        missing_required.push("topic");
+    }
+    if target_audience.is_none() {
+        missing_required.push("target_audience");
+    }
+    if new_angle.is_none() {
+        missing_required.push("new_angle");
+    }
 
-Output style:
-- Ask 1–3 clarifying questions if context is missing.
-- Otherwise provide:
-  - 10 title options (short, high-CTR, clear)
-  - 3 description hooks (first 2 lines)
-  - 1 recommended pinned comment
-  - A/B testing tip (1–2 lines)
+    let system = r#"You are GF Agent: a YouTube-first Content Pack Generator.
+
+Reply naturally in Chinese.
+
+Rules:
+- Suggestions only. Do NOT claim you changed anything on YouTube.
+- Do NOT propose running internal jobs unless the user explicitly asks to "刷新/发任务/跑任务/执行任务/Run now".
+- If required context is missing (title/topic/target audience/new angle), ask at most 1–3 short questions and stop.
+- If required context is present, output a complete content pack using EXACTLY these Markdown sections/headings:
+
+## Quick Summary
+## Title Options (10)
+## Description
+### Hooks (3)
+### Full Description
+## Pinned Comment
+## Hook / Script Outline
+## A/B Tip
+
+Content requirements (when generating a content pack):
+- Quick Summary: 1–2 sentences confirming understanding of the video + audience.
+- Title Options (10): 10 short, clear, high-CTR options.
+- Description: Hooks (3) are the first 2 lines; Full Description is one complete description (include CTA + placeholders as needed).
+- Pinned Comment: 1 pinned comment that drives engagement.
+- Hook / Script Outline: 5–10 bullets, with the first 30s emphasized.
+- A/B Tip: 1–2 lines on how to compare two variants.
+
+Formatting rules (when generating a content pack):
+- Use a numbered list 1–10 for Title Options.
+- Use 3 bullets for Hooks (3).
+- Keep it copy/paste friendly; no extra preface, no apology.
 "#
     .to_string();
 
-    let user = format!(
-        r#"User message:
-{message}
+    let mut user = String::new();
+    user.push_str("Video context (single video):\n");
+    user.push_str(&format!(
+        "- Title: {}\n",
+        title.clone().unwrap_or_else(|| "（缺失）".to_string())
+    ));
+    user.push_str(&format!(
+        "- Topic: {}\n",
+        topic.clone().unwrap_or_else(|| "（缺失）".to_string())
+    ));
+    user.push_str(&format!(
+        "- Target audience: {}\n",
+        target_audience
+            .clone()
+            .unwrap_or_else(|| "（缺失）".to_string())
+    ));
+    user.push_str(&format!(
+        "- New/controversial angle: {}\n",
+        new_angle.clone().unwrap_or_else(|| "（缺失）".to_string())
+    ));
 
-If the user did not provide the current video title, topic, target audience, and what's "new/controversial", ask for them."#
-    );
+    if let Some(v) = existing_description.as_ref() {
+        user.push_str(&format!("\nExisting description (optional):\n{}\n", v));
+    }
+    if let Some(v) = outline.as_ref() {
+        user.push_str(&format!("\nOutline / notes (optional):\n{}\n", v));
+    }
+    if let Some(v) = top_comments.as_ref() {
+        user.push_str(&format!("\nTop comments / objections (optional):\n{}\n", v));
+    }
+    if let Some(v) = notes.as_ref() {
+        user.push_str(&format!("\nExtra context (optional):\n{}\n", v));
+    }
+
+    if !missing_required.is_empty() {
+        user.push_str(&format!(
+            "\nMissing required context: {}\n",
+            missing_required.join(", ")
+        ));
+    }
+
+    user.push_str("\nUser message:\n");
+    user.push_str(message);
 
     (system, user)
 }
@@ -264,6 +371,10 @@ fn agent_wants_run_task(message: &str) -> bool {
     m.contains("发任务")
         || m.contains("跑任务")
         || m.contains("执行任务")
+        || m.contains("刷新")
+        || m.contains("run now")
+        || m.contains("refresh")
+        || m.contains("dispatch")
         || m.contains("tick")
         || m.contains("worker")
 }
@@ -388,7 +499,7 @@ async fn handle_agent(
     }
 
     let temperature: f64 = 0.6;
-    let (system, user) = build_agent_prompt(&parsed.message);
+    let (system, user) = build_agent_prompt(&parsed.message, parsed.video_context.as_ref());
 
     if stream {
         let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Error>>(32);
@@ -1066,6 +1177,61 @@ mod tests {
     fn agent_mode_parses_mode_query() {
         let uri: hyper::Uri = "/api/chat/risk_check?mode=agent".parse().unwrap();
         assert!(is_agent_mode(&uri));
+    }
+
+    #[test]
+    fn build_agent_prompt_includes_stable_markdown_headings() {
+        let (system, _user) = build_agent_prompt("hello", None);
+        for heading in [
+            "## Quick Summary",
+            "## Title Options (10)",
+            "## Description",
+            "### Hooks (3)",
+            "### Full Description",
+            "## Pinned Comment",
+            "## Hook / Script Outline",
+            "## A/B Tip",
+        ] {
+            assert!(
+                system.contains(heading),
+                "expected system prompt to contain heading: {heading}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_agent_prompt_marks_missing_required_context() {
+        let (_system, user) = build_agent_prompt("hello", None);
+        assert!(user.contains("- Title: （缺失）"));
+        assert!(user.contains("- Topic: （缺失）"));
+        assert!(user.contains("- Target audience: （缺失）"));
+        assert!(user.contains("- New/controversial angle: （缺失）"));
+        assert!(user.contains("Missing required context: title, topic, target_audience, new_angle"));
+    }
+
+    #[test]
+    fn build_agent_prompt_does_not_mark_missing_when_required_present() {
+        let vc = VideoContext {
+            title: Some("Working title".to_string()),
+            topic: Some("Topic".to_string()),
+            target_audience: Some("Audience".to_string()),
+            new_angle: Some("Angle".to_string()),
+            existing_description: None,
+            outline: None,
+            top_comments: None,
+            notes: None,
+        };
+        let (_system, user) = build_agent_prompt("hello", Some(&vc));
+        assert!(!user.contains("Missing required context:"));
+        assert!(!user.contains("（缺失）"));
+    }
+
+    #[test]
+    fn agent_wants_run_task_keyword_gating() {
+        assert!(agent_wants_run_task("刷新"));
+        assert!(agent_wants_run_task("Run now"));
+        assert!(agent_wants_run_task("dispatch the worker tick"));
+        assert!(!agent_wants_run_task("Just generate a content pack please."));
     }
 
     #[tokio::test]

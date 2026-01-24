@@ -354,6 +354,100 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS geo_monitor_projects (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        name VARCHAR(256) NOT NULL,
+        website VARCHAR(512) NULL,
+        brand_aliases_json TEXT NULL,
+        competitor_names_json TEXT NULL,
+        schedule VARCHAR(16) NOT NULL DEFAULT 'weekly',
+        enabled TINYINT NOT NULL DEFAULT 1,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        KEY idx_geo_monitor_projects_tenant (tenant_id, updated_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS geo_monitor_prompts (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        project_id BIGINT NOT NULL,
+        theme VARCHAR(128) NULL,
+        prompt_text TEXT NOT NULL,
+        enabled TINYINT NOT NULL DEFAULT 1,
+        sort_order INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        KEY idx_geo_monitor_prompts_project (tenant_id, project_id, sort_order),
+        KEY idx_geo_monitor_prompts_id (tenant_id, id)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS geo_monitor_runs (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        project_id BIGINT NOT NULL,
+        run_for_dt DATE NOT NULL,
+        provider VARCHAR(32) NOT NULL,
+        model VARCHAR(64) NOT NULL,
+        status VARCHAR(16) NOT NULL DEFAULT 'running',
+        prompt_total INT NOT NULL DEFAULT 0,
+        started_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        finished_at TIMESTAMP(3) NULL,
+        last_error TEXT NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        UNIQUE KEY uq_geo_monitor_runs (tenant_id, project_id, run_for_dt),
+        KEY idx_geo_monitor_runs_project (tenant_id, project_id, run_for_dt)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS geo_monitor_run_results (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        project_id BIGINT NOT NULL,
+        run_for_dt DATE NOT NULL,
+        run_id BIGINT NOT NULL,
+        prompt_id BIGINT NOT NULL,
+        prompt_text LONGTEXT NOT NULL,
+        output_text LONGTEXT NULL,
+        presence TINYINT NOT NULL DEFAULT 0,
+        rank_int INT NULL,
+        cost_usd DECIMAL(12,6) NOT NULL DEFAULT 0,
+        error LONGTEXT NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        UNIQUE KEY uq_geo_monitor_results (tenant_id, project_id, run_for_dt, prompt_id),
+        KEY idx_geo_monitor_results_run (run_id),
+        KEY idx_geo_monitor_results_project (tenant_id, project_id, run_for_dt)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
   // Best-effort schema upgrades for existing tables (TiDB supports IF NOT EXISTS).
   sqlx::query(
     r#"
@@ -1199,6 +1293,657 @@ pub async fn upsert_youtube_connection(
   .await?;
 
   Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct GeoMonitorProjectRow {
+  pub id: i64,
+  pub tenant_id: String,
+  pub name: String,
+  pub website: Option<String>,
+  pub brand_aliases_json: Option<String>,
+  pub competitor_names_json: Option<String>,
+  pub schedule: String,
+  pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeoMonitorPromptRow {
+  pub id: i64,
+  pub project_id: i64,
+  pub theme: Option<String>,
+  pub prompt_text: String,
+  pub enabled: bool,
+  pub sort_order: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeoMonitorRunRow {
+  pub id: i64,
+  pub tenant_id: String,
+  pub project_id: i64,
+  pub run_for_dt: chrono::NaiveDate,
+  pub provider: String,
+  pub model: String,
+  pub status: String,
+  pub prompt_total: i32,
+  pub started_at: DateTime<Utc>,
+  pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeoMonitorRunSummary {
+  pub results_total: i64,
+  pub presence_count: i64,
+  pub top3_count: i64,
+  pub top5_count: i64,
+  pub error_count: i64,
+  pub cost_usd: f64,
+}
+
+pub async fn create_geo_monitor_project(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  name: &str,
+  website: Option<&str>,
+  brand_aliases_json: Option<&str>,
+  competitor_names_json: Option<&str>,
+  schedule: &str,
+) -> Result<i64, Error> {
+  let schedule = match schedule.trim() {
+    "daily" | "Daily" | "DAILY" => "daily",
+    _ => "weekly",
+  };
+
+  let res = sqlx::query(
+    r#"
+      INSERT INTO geo_monitor_projects
+        (tenant_id, name, website, brand_aliases_json, competitor_names_json, schedule, enabled)
+      VALUES
+        (?, ?, ?, ?, ?, ?, 1);
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(name)
+  .bind(website)
+  .bind(brand_aliases_json)
+  .bind(competitor_names_json)
+  .bind(schedule)
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(res.last_insert_id() as i64)
+}
+
+pub async fn list_geo_monitor_projects(
+  pool: &MySqlPool,
+  tenant_id: &str,
+) -> Result<Vec<GeoMonitorProjectRow>, Error> {
+  let rows: Vec<(i64, String, String, Option<String>, Option<String>, Option<String>, String, i8)> =
+    sqlx::query_as(
+      r#"
+        SELECT id, tenant_id, name, website, brand_aliases_json, competitor_names_json, schedule, enabled
+        FROM geo_monitor_projects
+        WHERE tenant_id = ?
+        ORDER BY updated_at DESC, id DESC;
+      "#,
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(
+    rows
+      .into_iter()
+      .map(
+        |(id, tenant_id, name, website, brand_aliases_json, competitor_names_json, schedule, enabled)| {
+          GeoMonitorProjectRow {
+            id,
+            tenant_id,
+            name,
+            website,
+            brand_aliases_json,
+            competitor_names_json,
+            schedule,
+            enabled: enabled != 0,
+          }
+        },
+      )
+      .collect(),
+  )
+}
+
+pub async fn fetch_geo_monitor_project(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  project_id: i64,
+) -> Result<Option<GeoMonitorProjectRow>, Error> {
+  let row: Option<(
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    i8,
+  )> = sqlx::query_as(
+    r#"
+      SELECT id, tenant_id, name, website, brand_aliases_json, competitor_names_json, schedule, enabled
+      FROM geo_monitor_projects
+      WHERE tenant_id = ? AND id = ?
+      LIMIT 1;
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(project_id)
+  .fetch_optional(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(row.map(
+    |(id, tenant_id, name, website, brand_aliases_json, competitor_names_json, schedule, enabled)| {
+      GeoMonitorProjectRow {
+        id,
+        tenant_id,
+        name,
+        website,
+        brand_aliases_json,
+        competitor_names_json,
+        schedule,
+        enabled: enabled != 0,
+      }
+    },
+  ))
+}
+
+pub async fn replace_geo_monitor_prompts(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  project_id: i64,
+  prompts: &[(Option<String>, String)],
+) -> Result<(), Error> {
+  let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
+      DELETE FROM geo_monitor_prompts
+      WHERE tenant_id = ? AND project_id = ?;
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(project_id)
+  .execute(&mut *tx)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  for (idx, (theme, prompt_text)) in prompts.iter().enumerate() {
+    sqlx::query(
+      r#"
+        INSERT INTO geo_monitor_prompts
+          (tenant_id, project_id, theme, prompt_text, enabled, sort_order)
+        VALUES
+          (?, ?, ?, ?, 1, ?);
+      "#,
+    )
+    .bind(tenant_id)
+    .bind(project_id)
+    .bind(theme.as_deref())
+    .bind(prompt_text)
+    .bind(idx as i32)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+  }
+
+  tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
+  Ok(())
+}
+
+pub async fn list_geo_monitor_prompts(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  project_id: i64,
+) -> Result<Vec<GeoMonitorPromptRow>, Error> {
+  let rows: Vec<(i64, i64, Option<String>, String, i8, i32)> = sqlx::query_as(
+    r#"
+      SELECT id, project_id, theme, prompt_text, enabled, sort_order
+      FROM geo_monitor_prompts
+      WHERE tenant_id = ? AND project_id = ?
+      ORDER BY sort_order ASC, id ASC;
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(project_id)
+  .fetch_all(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(
+    rows
+      .into_iter()
+      .map(|(id, project_id, theme, prompt_text, enabled, sort_order)| GeoMonitorPromptRow {
+        id,
+        project_id,
+        theme,
+        prompt_text,
+        enabled: enabled != 0,
+        sort_order,
+      })
+      .collect(),
+  )
+}
+
+pub async fn fetch_geo_monitor_prompt(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  project_id: i64,
+  prompt_id: i64,
+) -> Result<Option<GeoMonitorPromptRow>, Error> {
+  let row: Option<(i64, i64, Option<String>, String, i8, i32)> = sqlx::query_as(
+    r#"
+      SELECT id, project_id, theme, prompt_text, enabled, sort_order
+      FROM geo_monitor_prompts
+      WHERE tenant_id = ? AND project_id = ? AND id = ?
+      LIMIT 1;
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(project_id)
+  .bind(prompt_id)
+  .fetch_optional(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(row.map(|(id, project_id, theme, prompt_text, enabled, sort_order)| GeoMonitorPromptRow {
+    id,
+    project_id,
+    theme,
+    prompt_text,
+    enabled: enabled != 0,
+    sort_order,
+  }))
+}
+
+pub async fn ensure_geo_monitor_run(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  project_id: i64,
+  run_for_dt: chrono::NaiveDate,
+  provider: &str,
+  model: &str,
+  prompt_total: i32,
+) -> Result<GeoMonitorRunRow, Error> {
+  let existing: Option<(
+    i64,
+    String,
+    i64,
+    chrono::NaiveDate,
+    String,
+    String,
+    String,
+    i32,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+  )> = sqlx::query_as(
+    r#"
+      SELECT id, tenant_id, project_id, run_for_dt, provider, model, status, prompt_total, started_at, finished_at
+      FROM geo_monitor_runs
+      WHERE tenant_id = ? AND project_id = ? AND run_for_dt = ?
+      LIMIT 1;
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(project_id)
+  .bind(run_for_dt)
+  .fetch_optional(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  if let Some((
+    id,
+    tenant_id,
+    project_id,
+    run_for_dt,
+    provider,
+    model,
+    status,
+    prompt_total_db,
+    started_at,
+    finished_at,
+  )) = existing
+  {
+    // Best-effort: keep prompt_total up to date for current prompt set, but do not reset existing runs.
+    if prompt_total_db != prompt_total && prompt_total > 0 {
+      sqlx::query(
+        r#"
+          UPDATE geo_monitor_runs
+          SET prompt_total = ?, updated_at = CURRENT_TIMESTAMP(3)
+          WHERE id = ?;
+        "#,
+      )
+      .bind(prompt_total)
+      .bind(id)
+      .execute(pool)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?;
+    }
+
+    return Ok(GeoMonitorRunRow {
+      id,
+      tenant_id,
+      project_id,
+      run_for_dt,
+      provider,
+      model,
+      status,
+      prompt_total: prompt_total_db,
+      started_at,
+      finished_at,
+    });
+  }
+
+  let res = sqlx::query(
+    r#"
+      INSERT INTO geo_monitor_runs
+        (tenant_id, project_id, run_for_dt, provider, model, status, prompt_total)
+      VALUES
+        (?, ?, ?, ?, ?, 'running', ?);
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(project_id)
+  .bind(run_for_dt)
+  .bind(provider)
+  .bind(model)
+  .bind(prompt_total)
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  let id = res.last_insert_id() as i64;
+  let row: (
+    i64,
+    String,
+    i64,
+    chrono::NaiveDate,
+    String,
+    String,
+    String,
+    i32,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+  ) = sqlx::query_as(
+    r#"
+      SELECT id, tenant_id, project_id, run_for_dt, provider, model, status, prompt_total, started_at, finished_at
+      FROM geo_monitor_runs
+      WHERE id = ?
+      LIMIT 1;
+    "#,
+  )
+  .bind(id)
+  .fetch_one(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(GeoMonitorRunRow {
+    id: row.0,
+    tenant_id: row.1,
+    project_id: row.2,
+    run_for_dt: row.3,
+    provider: row.4,
+    model: row.5,
+    status: row.6,
+    prompt_total: row.7,
+    started_at: row.8,
+    finished_at: row.9,
+  })
+}
+
+pub async fn enqueue_geo_monitor_prompt_tasks(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  project_id: i64,
+  run_for_dt: chrono::NaiveDate,
+  prompt_ids: &[i64],
+) -> Result<u64, Error> {
+  let mut inserted: u64 = 0;
+  for prompt_id in prompt_ids.iter().copied() {
+    let dedupe_key = format!("{tenant_id}:geo_monitor_prompt:{project_id}:{run_for_dt}:{prompt_id}");
+    let channel_id = format!("{project_id}:{prompt_id}");
+
+    let res = sqlx::query(
+      r#"
+        INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status)
+        VALUES (?, 'geo_monitor_prompt', ?, ?, ?, 'pending')
+        ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP(3);
+      "#,
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(run_for_dt)
+    .bind(dedupe_key)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    inserted = inserted.saturating_add(res.rows_affected());
+  }
+
+  Ok(inserted)
+}
+
+pub async fn fetch_latest_geo_monitor_run(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  project_id: i64,
+) -> Result<Option<GeoMonitorRunRow>, Error> {
+  let row: Option<(
+    i64,
+    String,
+    i64,
+    chrono::NaiveDate,
+    String,
+    String,
+    String,
+    i32,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+  )> = sqlx::query_as(
+    r#"
+      SELECT id, tenant_id, project_id, run_for_dt, provider, model, status, prompt_total, started_at, finished_at
+      FROM geo_monitor_runs
+      WHERE tenant_id = ? AND project_id = ?
+      ORDER BY run_for_dt DESC, id DESC
+      LIMIT 1;
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(project_id)
+  .fetch_optional(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(row.map(|row| GeoMonitorRunRow {
+    id: row.0,
+    tenant_id: row.1,
+    project_id: row.2,
+    run_for_dt: row.3,
+    provider: row.4,
+    model: row.5,
+    status: row.6,
+    prompt_total: row.7,
+    started_at: row.8,
+    finished_at: row.9,
+  }))
+}
+
+pub async fn insert_geo_monitor_run_result(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  project_id: i64,
+  run_for_dt: chrono::NaiveDate,
+  run_id: i64,
+  prompt_id: i64,
+  prompt_text: &str,
+  output_text: Option<&str>,
+  presence: bool,
+  rank_int: Option<i32>,
+  cost_usd: f64,
+  error: Option<&str>,
+) -> Result<bool, Error> {
+  let res = sqlx::query(
+    r#"
+      INSERT IGNORE INTO geo_monitor_run_results
+        (tenant_id, project_id, run_for_dt, run_id, prompt_id, prompt_text, output_text, presence, rank_int, cost_usd, error)
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(project_id)
+  .bind(run_for_dt)
+  .bind(run_id)
+  .bind(prompt_id)
+  .bind(prompt_text)
+  .bind(output_text)
+  .bind(if presence { 1 } else { 0 })
+  .bind(rank_int)
+  .bind(cost_usd)
+  .bind(error)
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(res.rows_affected() > 0)
+}
+
+pub async fn finalize_geo_monitor_run_if_complete(
+  pool: &MySqlPool,
+  run_id: i64,
+) -> Result<bool, Error> {
+  let run: Option<(i32, Option<DateTime<Utc>>)> = sqlx::query_as(
+    r#"
+      SELECT prompt_total, finished_at
+      FROM geo_monitor_runs
+      WHERE id = ?
+      LIMIT 1;
+    "#,
+  )
+  .bind(run_id)
+  .fetch_optional(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  let Some((prompt_total, finished_at)) = run else {
+    return Ok(false);
+  };
+  if finished_at.is_some() || prompt_total <= 0 {
+    return Ok(false);
+  }
+
+  let results_total: i64 = sqlx::query_scalar(
+    r#"
+      SELECT COUNT(*) FROM geo_monitor_run_results WHERE run_id = ?;
+    "#,
+  )
+  .bind(run_id)
+  .fetch_one(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  if results_total < prompt_total as i64 {
+    return Ok(false);
+  }
+
+  let updated = sqlx::query(
+    r#"
+      UPDATE geo_monitor_runs
+      SET status='completed', finished_at=COALESCE(finished_at, CURRENT_TIMESTAMP(3))
+      WHERE id = ? AND finished_at IS NULL;
+    "#,
+  )
+  .bind(run_id)
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(updated.rows_affected() > 0)
+}
+
+pub async fn fetch_geo_monitor_run_summary(
+  pool: &MySqlPool,
+  run_id: i64,
+) -> Result<GeoMonitorRunSummary, Error> {
+  let row: (i64, i64, i64, i64, i64, f64) = sqlx::query_as(
+    r#"
+      SELECT
+        COUNT(*) AS results_total,
+        COALESCE(SUM(CASE WHEN presence = 1 THEN 1 ELSE 0 END), 0) AS presence_count,
+        COALESCE(SUM(CASE WHEN rank_int IS NOT NULL AND rank_int <= 3 THEN 1 ELSE 0 END), 0) AS top3_count,
+        COALESCE(SUM(CASE WHEN rank_int IS NOT NULL AND rank_int <= 5 THEN 1 ELSE 0 END), 0) AS top5_count,
+        COALESCE(SUM(CASE WHEN error IS NOT NULL AND error <> '' THEN 1 ELSE 0 END), 0) AS error_count,
+        COALESCE(CAST(SUM(cost_usd) AS DOUBLE), 0) AS cost_usd
+      FROM geo_monitor_run_results
+      WHERE run_id = ?;
+    "#,
+  )
+  .bind(run_id)
+  .fetch_one(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(GeoMonitorRunSummary {
+    results_total: row.0,
+    presence_count: row.1,
+    top3_count: row.2,
+    top5_count: row.3,
+    error_count: row.4,
+    cost_usd: row.5,
+  })
+}
+
+pub async fn fetch_geo_monitor_run_results(
+  pool: &MySqlPool,
+  run_id: i64,
+  limit: i64,
+) -> Result<Vec<(i64, i64, String, Option<String>, bool, Option<i32>, f64, Option<String>)>, Error> {
+  let limit = limit.clamp(1, 200);
+  let rows: Vec<(i64, i64, String, Option<String>, i8, Option<i32>, f64, Option<String>)> =
+    sqlx::query_as(
+      r#"
+        SELECT prompt_id, id, prompt_text, output_text, presence, rank_int, CAST(cost_usd AS DOUBLE) AS cost_usd, error
+        FROM geo_monitor_run_results
+        WHERE run_id = ?
+        ORDER BY prompt_id ASC
+        LIMIT ?;
+      "#,
+    )
+    .bind(run_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(
+    rows
+      .into_iter()
+      .map(|(prompt_id, id, prompt_text, output_text, presence, rank_int, cost_usd, error)| {
+        (
+          prompt_id,
+          id,
+          prompt_text,
+          output_text,
+          presence != 0,
+          rank_int,
+          cost_usd,
+          error,
+        )
+      })
+      .collect(),
+  )
 }
 
 #[cfg(test)]
