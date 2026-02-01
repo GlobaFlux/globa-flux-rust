@@ -2,8 +2,16 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     {
+      "source": "/api/jobs/daily/dispatch",
+      "destination": "/api/jobs/worker/tick?action=dispatch"
+    },
+    {
       "source": "/api/jobs/weekly/dispatch",
-      "destination": "/api/jobs/daily/dispatch?schedule=weekly"
+      "destination": "/api/jobs/worker/tick?action=dispatch&schedule=weekly"
+    },
+    {
+      "source": "/api/tenants/ensure_trial",
+      "destination": "/api/tenants/llm_settings?action=ensure_trial"
     },
     {
       "source": "/api/usage/chat_risk_check/consume",
@@ -12,6 +20,26 @@
     {
       "source": "/api/usage/chat_risk_check/today",
       "destination": "/api/usage/chat_risk_check"
+    },
+    {
+      "source": "/api/oauth/youtube/start",
+      "destination": "/api/oauth/youtube/router?action=start"
+    },
+    {
+      "source": "/api/oauth/youtube/exchange",
+      "destination": "/api/oauth/youtube/router?action=exchange"
+    },
+    {
+      "source": "/api/oauth/youtube/status",
+      "destination": "/api/oauth/youtube/router?action=status"
+    },
+    {
+      "source": "/api/billing/subscription/status",
+      "destination": "/api/webhooks/billing?action=subscription_status"
+    },
+    {
+      "source": "/api/geo_monitor_dispatch",
+      "destination": "/api/geo_monitor?op=dispatch"
     }
   ]
 }

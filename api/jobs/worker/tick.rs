@@ -83,7 +83,48 @@ fn worker_id() -> String {
     .unwrap_or_else(|_| "local".to_string())
 }
 
+fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+  let query = query?;
+  for part in query.split('&') {
+    let (k, v) = part.split_once('=')?;
+    if k == key {
+      return Some(v);
+    }
+  }
+  None
+}
+
 const GLOBAL_TENANT_ID: &str = "global";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchSchedule {
+  Daily,
+  Weekly,
+}
+
+impl DispatchSchedule {
+  fn from_query(query: Option<&str>) -> Self {
+    let value = query_value(query, "schedule").unwrap_or("");
+    match value {
+      "weekly" | "Weekly" | "WEEKLY" => DispatchSchedule::Weekly,
+      _ => DispatchSchedule::Daily,
+    }
+  }
+
+  fn job_type(&self) -> &'static str {
+    match self {
+      DispatchSchedule::Daily => "daily_channel",
+      DispatchSchedule::Weekly => "weekly_channel",
+    }
+  }
+}
+
+#[derive(Deserialize)]
+struct DispatchRequest {
+  now_ms: i64,
+  #[serde(default)]
+  tenant_id: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct TickRequest {
@@ -134,6 +175,125 @@ fn cfg_from_policy_params_json(raw: &str) -> Option<DecisionEngineConfig> {
   }
 
   Some(cfg)
+}
+
+async fn handle_dispatch(
+  schedule: DispatchSchedule,
+  method: &Method,
+  headers: &HeaderMap,
+  body: Bytes,
+) -> Result<Response<ResponseBody>, Error> {
+  if method != Method::POST {
+    return json_response(
+      StatusCode::METHOD_NOT_ALLOWED,
+      serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+    );
+  }
+
+  let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+  let provided = bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
+
+  if expected.is_empty() || provided != expected {
+    return json_response(
+      StatusCode::UNAUTHORIZED,
+      serde_json::json!({"ok": false, "error": "unauthorized"}),
+    );
+  }
+
+  if !has_tidb_url() {
+    return json_response(
+      StatusCode::NOT_IMPLEMENTED,
+      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+    );
+  }
+
+  let parsed: DispatchRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
+    Box::new(std::io::Error::other(format!("invalid json body: {e}")))
+  })?;
+
+  if parsed.now_ms <= 0 {
+    return json_response(
+      StatusCode::BAD_REQUEST,
+      serde_json::json!({"ok": false, "error": "bad_request", "message": "now_ms is required"}),
+    );
+  }
+
+  let now = Utc
+    .timestamp_millis_opt(parsed.now_ms)
+    .single()
+    .unwrap_or_else(Utc::now);
+  let run_for_dt = now.date_naive();
+
+  let pool = get_pool().await?;
+
+  let tenant_filter = parsed
+    .tenant_id
+    .as_deref()
+    .map(str::trim)
+    .filter(|v| !v.is_empty())
+    .map(str::to_string);
+
+  let channels: Vec<(String, String)> = if let Some(tenant_id) = tenant_filter.as_deref() {
+    sqlx::query_as(
+      r#"
+        SELECT tenant_id, channel_id
+        FROM channel_connections
+        WHERE tenant_id = ?
+          AND oauth_provider = 'youtube'
+          AND channel_id IS NOT NULL
+          AND channel_id <> '';
+      "#,
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?
+  } else {
+    sqlx::query_as(
+      r#"
+        SELECT tenant_id, channel_id
+        FROM channel_connections
+        WHERE oauth_provider = 'youtube'
+          AND channel_id IS NOT NULL
+          AND channel_id <> '';
+      "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?
+  };
+
+  let job_type = schedule.job_type();
+
+  for (tenant_id, channel_id) in channels.iter() {
+    let dedupe_key = format!("{tenant_id}:{job_type}:{channel_id}:{run_for_dt}");
+    sqlx::query(
+      r#"
+        INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+        ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP(3);
+      "#,
+    )
+    .bind(tenant_id)
+    .bind(job_type)
+    .bind(channel_id)
+    .bind(run_for_dt)
+    .bind(dedupe_key)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+  }
+
+  json_response(
+    StatusCode::OK,
+    serde_json::json!({
+      "ok": true,
+      "tenant_id": tenant_filter,
+      "job_type": job_type,
+      "run_for_dt": run_for_dt.to_string(),
+      "candidates": channels.len()
+    }),
+  )
 }
 
 async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Result<Response<ResponseBody>, Error> {
@@ -728,10 +888,26 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
 }
 
 async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
-  let method = req.method().clone();
-  let headers = req.headers().clone();
-  let bytes = req.into_body().collect().await?.to_bytes();
-  handle_tick(&method, &headers, bytes).await
+  let action = query_value(req.uri().query(), "action").unwrap_or("tick");
+  match action {
+    "dispatch" => {
+      let schedule = DispatchSchedule::from_query(req.uri().query());
+      let method = req.method().clone();
+      let headers = req.headers().clone();
+      let bytes = req.into_body().collect().await?.to_bytes();
+      handle_dispatch(schedule, &method, &headers, bytes).await
+    }
+    "" | "tick" => {
+      let method = req.method().clone();
+      let headers = req.headers().clone();
+      let bytes = req.into_body().collect().await?.to_bytes();
+      handle_tick(&method, &headers, bytes).await
+    }
+    _ => json_response(
+      StatusCode::NOT_FOUND,
+      serde_json::json!({"ok": false, "error": "not_found"}),
+    ),
+  }
 }
 
 #[tokio::main]
@@ -742,6 +918,17 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn dispatch_returns_unauthorized_when_missing_internal_token() {
+    std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+
+    let headers = HeaderMap::new();
+    let response = handle_dispatch(DispatchSchedule::Daily, &Method::POST, &headers, Bytes::new())
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+  }
 
   #[tokio::test]
   async fn returns_unauthorized_when_missing_internal_token() {

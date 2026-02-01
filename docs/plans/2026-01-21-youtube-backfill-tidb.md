@@ -40,7 +40,7 @@ Expected: PASS.
 ## Task 2: Enqueue backfill jobs on OAuth exchange (no new DB schema)
 
 **Files:**
-- Modify: `globa-flux-rust/api/oauth/youtube/exchange.rs`
+- Modify: `globa-flux-rust/api/oauth/youtube/router.rs` (handler for `action=exchange`)
 
 **Step 1: Decide defaults + env overrides**
 
@@ -59,7 +59,7 @@ Return `backfill_enqueued` count in JSON response (additive field).
 
 **Step 3: Verify compile/tests**
 
-Run: `cargo test oauth_youtube_exchange -- --nocapture`  
+Run: `cargo test --bin oauth_youtube_router -- --nocapture`  
 Expected: PASS.
 
 ---
@@ -70,4 +70,3 @@ Expected: PASS.
 - Create: `globa-flux-rust/api/jobs/backfill/dispatch.rs`
 
 Allow internal callers to trigger backfill for a tenant/channel without redoing OAuth.
-

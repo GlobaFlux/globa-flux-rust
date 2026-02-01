@@ -30,32 +30,16 @@ name = "chat_risk_check"
 path = "api/chat/risk_check.rs"
 
 [[bin]]
-name = "oauth_youtube_exchange"
-path = "api/oauth/youtube/exchange.rs"
-
-[[bin]]
-name = "oauth_youtube_start"
-path = "api/oauth/youtube/start.rs"
-
-[[bin]]
-name = "tenants_ensure_trial"
-path = "api/tenants/ensure_trial.rs"
+name = "oauth_youtube_router"
+path = "api/oauth/youtube/router.rs"
 
 [[bin]]
 name = "tenants_llm_settings"
 path = "api/tenants/llm_settings.rs"
 
 [[bin]]
-name = "oauth_youtube_status"
-path = "api/oauth/youtube/status.rs"
-
-[[bin]]
 name = "usage_chat_risk_check"
 path = "api/usage/chat_risk_check.rs"
-
-[[bin]]
-name = "jobs_daily_dispatch"
-path = "api/jobs/daily/dispatch.rs"
 
 [[bin]]
 name = "jobs_worker_tick"
@@ -70,16 +54,8 @@ name = "webhooks_billing"
 path = "api/webhooks/billing.rs"
 
 [[bin]]
-name = "billing_subscription_status"
-path = "api/billing/subscription/status.rs"
-
-[[bin]]
 name = "geo_monitor"
 path = "api/geo_monitor.rs"
-
-[[bin]]
-name = "geo_monitor_dispatch"
-path = "api/geo_monitor_dispatch.rs"
 
 [profile.release]
 lto = true

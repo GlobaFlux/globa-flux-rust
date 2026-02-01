@@ -4,7 +4,7 @@ use hyper::{HeaderMap, Method, StatusCode};
 use serde::Deserialize;
 use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 
-use globa_flux_rust::db::{fetch_tenant_gemini_model, get_pool, upsert_tenant_gemini_model};
+use globa_flux_rust::db::{ensure_trial_started, fetch_tenant_gemini_model, get_pool, upsert_tenant_gemini_model};
 
 const GLOBAL_TENANT_ID: &str = "global";
 
@@ -52,6 +52,61 @@ struct UpdateLlmSettingsRequest {
   gemini_model: String,
   #[serde(default)]
   updated_by: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EnsureTrialRequest {
+  tenant_id: String,
+  now_ms: i64,
+}
+
+async fn handle_ensure_trial(
+  method: &Method,
+  headers: &HeaderMap,
+  body: Bytes,
+) -> Result<Response<ResponseBody>, Error> {
+  if method != Method::POST {
+    return json_response(
+      StatusCode::METHOD_NOT_ALLOWED,
+      serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+    );
+  }
+
+  let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+  let provided = bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
+
+  if expected.is_empty() || provided != expected {
+    return json_response(
+      StatusCode::UNAUTHORIZED,
+      serde_json::json!({"ok": false, "error": "unauthorized"}),
+    );
+  }
+
+  if !has_tidb_url() {
+    return json_response(
+      StatusCode::NOT_IMPLEMENTED,
+      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+    );
+  }
+
+  let parsed: EnsureTrialRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
+    Box::new(std::io::Error::other(format!("invalid json body: {e}")))
+  })?;
+
+  if parsed.tenant_id.is_empty() {
+    return json_response(
+      StatusCode::BAD_REQUEST,
+      serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+    );
+  }
+
+  let pool = get_pool().await?;
+  let trial_started_at_ms = ensure_trial_started(pool, &parsed.tenant_id, parsed.now_ms).await?;
+
+  json_response(
+    StatusCode::OK,
+    serde_json::json!({"ok": true, "trial_started_at_ms": trial_started_at_ms}),
+  )
 }
 
 async fn handle_llm_settings(
@@ -157,12 +212,29 @@ async fn handle_llm_settings(
   }
 }
 
+async fn handle_router(
+  method: &Method,
+  headers: &HeaderMap,
+  uri: &hyper::Uri,
+  body: Bytes,
+) -> Result<Response<ResponseBody>, Error> {
+  let action = query_param(uri.query(), "action").unwrap_or_default();
+  match action.as_str() {
+    "ensure_trial" => handle_ensure_trial(method, headers, body).await,
+    "" | "llm_settings" => handle_llm_settings(method, headers, uri, body).await,
+    _ => json_response(
+      StatusCode::NOT_FOUND,
+      serde_json::json!({"ok": false, "error": "not_found"}),
+    ),
+  }
+}
+
 async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
   let method = req.method().clone();
   let headers = req.headers().clone();
   let uri = req.uri().clone();
   let bytes = req.into_body().collect().await?.to_bytes();
-  handle_llm_settings(&method, &headers, &uri, bytes).await
+  handle_router(&method, &headers, &uri, bytes).await
 }
 
 #[tokio::main]
@@ -173,6 +245,17 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn ensure_trial_returns_unauthorized_when_missing_internal_token() {
+    std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+
+    let headers = HeaderMap::new();
+    let response = handle_ensure_trial(&Method::POST, &headers, Bytes::new())
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+  }
 
   #[tokio::test]
   async fn returns_unauthorized_when_missing_internal_token() {
