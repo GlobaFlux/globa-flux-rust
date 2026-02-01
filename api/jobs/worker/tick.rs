@@ -3,6 +3,7 @@ use chrono::{Duration, TimeZone, Utc};
 use http_body_util::BodyExt;
 use hyper::{HeaderMap, Method, StatusCode};
 use serde::Deserialize;
+use sha2::Digest;
 use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 
 use globa_flux_rust::db::{
@@ -15,7 +16,9 @@ use globa_flux_rust::db::{
   fetch_revenue_sum_usd_7d,
   fetch_tenant_gemini_model,
   fetch_top_video_ids_by_revenue,
+  fetch_youtube_channel_id,
   fetch_youtube_connection_tokens,
+  fetch_youtube_oauth_app_config,
   get_pool,
   finalize_geo_monitor_run_if_complete,
   insert_geo_monitor_run_result,
@@ -32,8 +35,14 @@ use globa_flux_rust::outcome_engine::compute_outcome_label;
 use globa_flux_rust::providers::gemini::{
   generate_text as gemini_generate_text, pricing_for_model as gemini_pricing_for_model, GeminiConfig,
 };
-use globa_flux_rust::providers::youtube::{refresh_tokens, youtube_oauth_client_from_env};
+use globa_flux_rust::providers::youtube::{refresh_tokens, youtube_oauth_client_from_config};
 use globa_flux_rust::providers::youtube_analytics::{fetch_video_daily_metrics, youtube_analytics_error_to_vercel_error};
+use globa_flux_rust::providers::youtube_reporting::{
+  download_report_file,
+  ensure_job_for_report_type,
+  list_report_types,
+  list_reports,
+};
 use globa_flux_rust::{
   cost::compute_cost_usd,
   geo_monitor::{
@@ -95,11 +104,194 @@ fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
 }
 
 const GLOBAL_TENANT_ID: &str = "global";
+const YOUTUBE_REPORTING_BACKFILL_DAYS: i64 = 90;
+
+fn parse_youtube_reporting_report_task_key(value: &str) -> Option<(String, String)> {
+  let (content_owner_id, report_id) = value.split_once(':')?;
+  if content_owner_id.is_empty() || report_id.is_empty() {
+    return None;
+  }
+  Some((content_owner_id.to_string(), report_id.to_string()))
+}
+
+fn youtube_reporting_created_after_rfc3339(
+  run_for_dt: chrono::NaiveDate,
+  backfill_days: i64,
+) -> String {
+  let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+    run_for_dt.and_hms_opt(0, 0, 0).unwrap(),
+    Utc,
+  ) - chrono::Duration::days(backfill_days);
+
+  dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn yt_reporting_wide_table_name(report_type_id: &str) -> String {
+  let base = globa_flux_rust::db::sanitize_sql_identifier(report_type_id);
+  let hash = sha2::Sha256::digest(report_type_id.as_bytes());
+  let suffix = format!("{:x}", hash);
+  let suffix8 = &suffix[..8];
+
+  let mut name = format!("yt_rpt_{base}_{suffix8}");
+  if name.len() > 64 {
+    name.truncate(64);
+    while name.ends_with('_') {
+      name.pop();
+    }
+  }
+  name
+}
+
+fn maybe_gunzip_bytes(input: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+  use std::io::Read;
+
+  let is_gzip = input.len() >= 2 && input[0] == 0x1f && input[1] == 0x8b;
+  if !is_gzip {
+    return Ok(input.to_vec());
+  }
+
+  let mut decoder = flate2::read::GzDecoder::new(input);
+  let mut out = Vec::new();
+  decoder.read_to_end(&mut out)?;
+  Ok(out)
+}
+
+fn parse_rfc3339_utc(value: Option<&str>) -> Option<chrono::DateTime<Utc>> {
+  let value = value?;
+  chrono::DateTime::parse_from_rfc3339(value)
+    .ok()
+    .map(|dt| dt.with_timezone(&Utc))
+}
+
+async fn upsert_yt_reporting_wide_table_metadata(
+  pool: &sqlx::MySqlPool,
+  report_type_id: &str,
+  table_name: &str,
+  columns_json: &str,
+  parse_version: &str,
+) -> Result<(), Error> {
+  sqlx::query(
+    r#"
+      INSERT INTO yt_reporting_wide_tables (report_type_id, table_name, columns_json, parse_version)
+      VALUES (?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        table_name = VALUES(table_name),
+        columns_json = VALUES(columns_json),
+        parse_version = VALUES(parse_version),
+        updated_at = CURRENT_TIMESTAMP(3);
+    "#,
+  )
+  .bind(report_type_id)
+  .bind(table_name)
+  .bind(columns_json)
+  .bind(parse_version)
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(())
+}
+
+async fn ensure_yt_reporting_wide_table(
+  pool: &sqlx::MySqlPool,
+  table_name: &str,
+  columns: &[String],
+) -> Result<(), Error> {
+  let mut ddl = String::new();
+  ddl.push_str(&format!(
+    "CREATE TABLE IF NOT EXISTS `{table_name}` (\
+      tenant_id VARCHAR(128) NOT NULL,\
+      content_owner_id VARCHAR(128) NOT NULL,\
+      report_type_id VARCHAR(256) NOT NULL,\
+      job_id VARCHAR(256) NOT NULL,\
+      report_id VARCHAR(256) NOT NULL,\
+      row_no BIGINT NOT NULL,\
+      created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),\
+      updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)"
+  ));
+
+  for col in columns {
+    ddl.push_str(&format!(", `{}` LONGTEXT NULL", col));
+  }
+
+  ddl.push_str(
+    ", PRIMARY KEY (tenant_id, content_owner_id, report_id, row_no),\
+       KEY idx_owner_type (tenant_id, content_owner_id, report_type_id)\
+     );",
+  );
+
+  sqlx::query(&ddl)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+  for col in columns {
+    let alter = format!(
+      "ALTER TABLE `{table_name}` ADD COLUMN IF NOT EXISTS `{col}` LONGTEXT NULL;"
+    );
+    sqlx::query(&alter)
+      .execute(pool)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?;
+  }
+
+  Ok(())
+}
+
+async fn insert_yt_reporting_wide_rows_batch(
+  pool: &sqlx::MySqlPool,
+  table_name: &str,
+  columns: &[String],
+  tenant_id: &str,
+  content_owner_id: &str,
+  report_type_id: &str,
+  job_id: &str,
+  report_id: &str,
+  rows: &[(i64, Vec<Option<String>>)],
+) -> Result<(), Error> {
+  if rows.is_empty() {
+    return Ok(());
+  }
+
+  let mut qb = sqlx::QueryBuilder::<sqlx::MySql>::new("INSERT INTO ");
+  qb.push(format!("`{table_name}`"));
+  qb.push(" (tenant_id, content_owner_id, report_type_id, job_id, report_id, row_no");
+  for col in columns {
+    qb.push(", `");
+    qb.push(col);
+    qb.push("`");
+  }
+  qb.push(") ");
+
+  qb.push_values(rows.iter(), |mut b, (row_no, values)| {
+    b.push_bind(tenant_id);
+    b.push_bind(content_owner_id);
+    b.push_bind(report_type_id);
+    b.push_bind(job_id);
+    b.push_bind(report_id);
+    b.push_bind(*row_no);
+    for idx in 0..columns.len() {
+      let v = values.get(idx).cloned().unwrap_or(None);
+      b.push_bind(v);
+    }
+  });
+
+  qb.push(" ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP(3)");
+  qb.push(";");
+
+  qb.build()
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DispatchSchedule {
   Daily,
   Weekly,
+  YoutubeReporting,
 }
 
 impl DispatchSchedule {
@@ -107,6 +299,7 @@ impl DispatchSchedule {
     let value = query_value(query, "schedule").unwrap_or("");
     match value {
       "weekly" | "Weekly" | "WEEKLY" => DispatchSchedule::Weekly,
+      "youtube_reporting" | "youtubeReporting" | "YouTubeReporting" => DispatchSchedule::YoutubeReporting,
       _ => DispatchSchedule::Daily,
     }
   }
@@ -115,6 +308,50 @@ impl DispatchSchedule {
     match self {
       DispatchSchedule::Daily => "daily_channel",
       DispatchSchedule::Weekly => "weekly_channel",
+      DispatchSchedule::YoutubeReporting => "youtube_reporting_owner",
+    }
+  }
+}
+
+fn candidate_select_sql(schedule: DispatchSchedule, has_tenant_filter: bool) -> &'static str {
+  match (schedule, has_tenant_filter) {
+    (DispatchSchedule::YoutubeReporting, true) => {
+      r#"
+        SELECT DISTINCT tenant_id, content_owner_id
+        FROM channel_connections
+        WHERE tenant_id = ?
+          AND oauth_provider = 'youtube'
+          AND content_owner_id IS NOT NULL
+          AND content_owner_id <> '';
+      "#
+    }
+    (DispatchSchedule::YoutubeReporting, false) => {
+      r#"
+        SELECT DISTINCT tenant_id, content_owner_id
+        FROM channel_connections
+        WHERE oauth_provider = 'youtube'
+          AND content_owner_id IS NOT NULL
+          AND content_owner_id <> '';
+      "#
+    }
+    (_, true) => {
+      r#"
+        SELECT tenant_id, channel_id
+        FROM channel_connections
+        WHERE tenant_id = ?
+          AND oauth_provider = 'youtube'
+          AND channel_id IS NOT NULL
+          AND channel_id <> '';
+      "#
+    }
+    (_, false) => {
+      r#"
+        SELECT tenant_id, channel_id
+        FROM channel_connections
+        WHERE oauth_provider = 'youtube'
+          AND channel_id IS NOT NULL
+          AND channel_id <> '';
+      "#
     }
   }
 }
@@ -234,33 +471,16 @@ async fn handle_dispatch(
     .map(str::to_string);
 
   let channels: Vec<(String, String)> = if let Some(tenant_id) = tenant_filter.as_deref() {
-    sqlx::query_as(
-      r#"
-        SELECT tenant_id, channel_id
-        FROM channel_connections
-        WHERE tenant_id = ?
-          AND oauth_provider = 'youtube'
-          AND channel_id IS NOT NULL
-          AND channel_id <> '';
-      "#,
-    )
-    .bind(tenant_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?
+    sqlx::query_as(candidate_select_sql(schedule, true))
+      .bind(tenant_id)
+      .fetch_all(pool)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?
   } else {
-    sqlx::query_as(
-      r#"
-        SELECT tenant_id, channel_id
-        FROM channel_connections
-        WHERE oauth_provider = 'youtube'
-          AND channel_id IS NOT NULL
-          AND channel_id <> '';
-      "#,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?
+    sqlx::query_as(candidate_select_sql(schedule, false))
+      .fetch_all(pool)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?
   };
 
   let job_type = schedule.job_type();
@@ -645,7 +865,19 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
 
         if needs_refresh {
           if let Some(refresh) = tokens.refresh_token.clone() {
-            let (client, _redirect) = youtube_oauth_client_from_env()?;
+            let app = fetch_youtube_oauth_app_config(pool, tenant_id)
+              .await?
+              .ok_or_else(|| Box::new(std::io::Error::other("missing youtube oauth app config")) as Error)?;
+            let client_secret = app
+              .client_secret
+              .as_deref()
+              .map(str::trim)
+              .filter(|v| !v.is_empty())
+              .ok_or_else(|| {
+                Box::new(std::io::Error::other("missing youtube oauth client_secret")) as Error
+              })?;
+            let (client, _redirect) =
+              youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
             let refreshed = refresh_tokens(&client, &refresh).await?;
             update_youtube_connection_tokens(pool, tenant_id, channel_id, &refreshed).await?;
             tokens.access_token = refreshed.access_token;
@@ -657,7 +889,19 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
           Ok(rows) => rows,
           Err(err) if err.status == Some(401) => {
             if let Some(refresh) = tokens.refresh_token.clone() {
-              let (client, _redirect) = youtube_oauth_client_from_env()?;
+              let app = fetch_youtube_oauth_app_config(pool, tenant_id)
+                .await?
+                .ok_or_else(|| Box::new(std::io::Error::other("missing youtube oauth app config")) as Error)?;
+              let client_secret = app
+                .client_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                  Box::new(std::io::Error::other("missing youtube oauth client_secret")) as Error
+                })?;
+              let (client, _redirect) =
+                youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
               let refreshed = refresh_tokens(&client, &refresh).await?;
               update_youtube_connection_tokens(pool, tenant_id, channel_id, &refreshed).await?;
               tokens.access_token = refreshed.access_token;
@@ -810,6 +1054,454 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
 
         Ok(())
       }
+      "youtube_reporting_owner" => {
+        (|| async {
+          let run_for_dt = run_for_dt.ok_or_else(|| {
+            Box::new(std::io::Error::other("youtube_reporting_owner task missing run_for_dt")) as Error
+          })?;
+
+          let content_owner_id = channel_id.trim();
+          if content_owner_id.is_empty() {
+            return Err(Box::new(std::io::Error::other(
+              "youtube_reporting_owner task missing content_owner_id",
+            )) as Error);
+          }
+
+          let channel_id_for_tokens = fetch_youtube_channel_id(pool, tenant_id)
+            .await?
+            .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+
+          let mut tokens = fetch_youtube_connection_tokens(pool, tenant_id, &channel_id_for_tokens)
+            .await?
+            .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+
+          // Proactive refresh if expired (best-effort).
+          let needs_refresh = tokens
+            .expires_at
+            .map(|t| t <= now)
+            .unwrap_or(false);
+        if needs_refresh {
+          if let Some(refresh) = tokens.refresh_token.clone() {
+            let app = fetch_youtube_oauth_app_config(pool, tenant_id)
+              .await?
+              .ok_or_else(|| Box::new(std::io::Error::other("missing youtube oauth app config")) as Error)?;
+            let client_secret = app
+              .client_secret
+              .as_deref()
+              .map(str::trim)
+              .filter(|v| !v.is_empty())
+              .ok_or_else(|| {
+                Box::new(std::io::Error::other("missing youtube oauth client_secret")) as Error
+              })?;
+            let (client, _redirect) =
+              youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
+            let refreshed = refresh_tokens(&client, &refresh).await?;
+            update_youtube_connection_tokens(pool, tenant_id, &channel_id_for_tokens, &refreshed).await?;
+            tokens.access_token = refreshed.access_token;
+            tokens.refresh_token = refreshed.refresh_token.or(Some(refresh));
+          }
+        }
+
+          let created_after = youtube_reporting_created_after_rfc3339(
+            run_for_dt,
+            YOUTUBE_REPORTING_BACKFILL_DAYS,
+          );
+
+          let report_types = list_report_types(&tokens.access_token, content_owner_id)
+            .await
+            .map_err(|e| -> Error {
+              Box::new(std::io::Error::other(format!(
+                "youtube reporting list_report_types error: {e}"
+              )))
+            })?;
+
+          for rt in report_types {
+            let system_managed = if rt.system_managed { 1i8 } else { 0i8 };
+            sqlx::query(
+              r#"
+                INSERT INTO yt_reporting_report_types
+                  (content_owner_id, report_type_id, report_type_name, system_managed)
+                VALUES
+                  (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                  report_type_name = VALUES(report_type_name),
+                  system_managed = VALUES(system_managed),
+                  updated_at = CURRENT_TIMESTAMP(3);
+              "#,
+            )
+            .bind(content_owner_id)
+            .bind(&rt.report_type_id)
+            .bind(rt.report_type_name.as_deref())
+            .bind(system_managed)
+            .execute(pool)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?;
+
+            let job_id = match ensure_job_for_report_type(
+              &tokens.access_token,
+              content_owner_id,
+              &rt.report_type_id,
+            )
+            .await
+            {
+              Ok(v) => v,
+              Err(err) => {
+                eprintln!(
+                  "youtube_reporting_owner: ensure_job failed for report_type_id={}: {}",
+                  rt.report_type_id, err
+                );
+                continue;
+              }
+            };
+
+            sqlx::query(
+              r#"
+                INSERT INTO yt_reporting_jobs
+                  (tenant_id, content_owner_id, report_type_id, job_id)
+                VALUES
+                  (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                  job_id = VALUES(job_id),
+                  updated_at = CURRENT_TIMESTAMP(3);
+              "#,
+            )
+            .bind(tenant_id)
+            .bind(content_owner_id)
+            .bind(&rt.report_type_id)
+            .bind(&job_id)
+            .execute(pool)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?;
+
+            let reports = match list_reports(
+              &tokens.access_token,
+              &job_id,
+              content_owner_id,
+              Some(created_after.as_str()),
+            )
+            .await
+            {
+              Ok(v) => v,
+              Err(err) => {
+                eprintln!(
+                  "youtube_reporting_owner: list_reports failed for report_type_id={} job_id={}: {}",
+                  rt.report_type_id, job_id, err
+                );
+                continue;
+              }
+            };
+
+            for rep in reports {
+              let start_time = parse_rfc3339_utc(rep.start_time.as_deref());
+              let end_time = parse_rfc3339_utc(rep.end_time.as_deref());
+              let create_time = parse_rfc3339_utc(rep.create_time.as_deref());
+
+              sqlx::query(
+                r#"
+                  INSERT INTO yt_reporting_report_files
+                    (tenant_id, content_owner_id, report_type_id, job_id, report_id, download_url, start_time, end_time, create_time)
+                  VALUES
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  ON DUPLICATE KEY UPDATE
+                    download_url = COALESCE(VALUES(download_url), download_url),
+                    start_time = COALESCE(VALUES(start_time), start_time),
+                    end_time = COALESCE(VALUES(end_time), end_time),
+                    create_time = COALESCE(VALUES(create_time), create_time),
+                    updated_at = CURRENT_TIMESTAMP(3);
+                "#,
+              )
+              .bind(tenant_id)
+              .bind(content_owner_id)
+              .bind(&rt.report_type_id)
+              .bind(&job_id)
+              .bind(&rep.report_id)
+              .bind(rep.download_url.as_deref())
+              .bind(start_time)
+              .bind(end_time)
+              .bind(create_time)
+              .execute(pool)
+              .await
+              .map_err(|e| -> Error { Box::new(e) })?;
+
+              let task_channel_id = format!("{content_owner_id}:{}", rep.report_id);
+              let dedupe_key = format!(
+                "{tenant_id}:youtube_reporting_report:{content_owner_id}:{}",
+                rep.report_id
+              );
+              sqlx::query(
+                r#"
+                  INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status)
+                  VALUES (?, 'youtube_reporting_report', ?, ?, ?, 'pending')
+                  ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP(3);
+                "#,
+              )
+              .bind(tenant_id)
+              .bind(task_channel_id)
+              .bind(run_for_dt)
+              .bind(dedupe_key)
+              .execute(pool)
+              .await
+              .map_err(|e| -> Error { Box::new(e) })?;
+            }
+          }
+
+          Ok(())
+        })()
+        .await
+      }
+      "youtube_reporting_report" => {
+        (|| async {
+          let (content_owner_id, report_id) = parse_youtube_reporting_report_task_key(channel_id)
+            .ok_or_else(|| {
+              Box::new(std::io::Error::other("youtube_reporting_report invalid channel_id")) as Error
+            })?;
+
+          let channel_id_for_tokens = fetch_youtube_channel_id(pool, tenant_id)
+            .await?
+            .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+
+          let mut tokens = fetch_youtube_connection_tokens(pool, tenant_id, &channel_id_for_tokens)
+            .await?
+            .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+
+          // Proactive refresh if expired (best-effort).
+          let needs_refresh = tokens
+            .expires_at
+            .map(|t| t <= now)
+            .unwrap_or(false);
+          if needs_refresh {
+            if let Some(refresh) = tokens.refresh_token.clone() {
+              let app = fetch_youtube_oauth_app_config(pool, tenant_id)
+                .await?
+                .ok_or_else(|| Box::new(std::io::Error::other("missing youtube oauth app config")) as Error)?;
+              let client_secret = app
+                .client_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                  Box::new(std::io::Error::other("missing youtube oauth client_secret")) as Error
+                })?;
+              let (client, _redirect) =
+                youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
+              let refreshed = refresh_tokens(&client, &refresh).await?;
+              update_youtube_connection_tokens(pool, tenant_id, &channel_id_for_tokens, &refreshed).await?;
+              tokens.access_token = refreshed.access_token;
+              tokens.refresh_token = refreshed.refresh_token.or(Some(refresh));
+            }
+          }
+
+          let row = sqlx::query_as::<_, (String, String, Option<String>, Option<Vec<u8>>, String)>(
+            r#"
+              SELECT report_type_id, job_id, download_url, raw_bytes, parse_status
+              FROM yt_reporting_report_files
+              WHERE tenant_id = ?
+                AND content_owner_id = ?
+                AND report_id = ?
+              LIMIT 1;
+            "#,
+          )
+          .bind(tenant_id)
+          .bind(&content_owner_id)
+          .bind(&report_id)
+          .fetch_optional(pool)
+          .await
+          .map_err(|e| -> Error { Box::new(e) })?;
+
+          let Some((report_type_id, job_id, download_url, raw_bytes, parse_status)) = row else {
+            return Err(Box::new(std::io::Error::other(
+              "missing yt_reporting_report_files row",
+            )) as Error);
+          };
+
+          if parse_status == "parsed" {
+            return Ok(());
+          }
+
+          let bytes = match raw_bytes {
+            Some(b) => b,
+            None => {
+              let url = download_url.ok_or_else(|| {
+                Box::new(std::io::Error::other("missing download_url")) as Error
+              })?;
+
+              let downloaded = download_report_file(&tokens.access_token, &url)
+                .await
+                .map_err(|e| -> Error {
+                  Box::new(std::io::Error::other(format!(
+                    "youtube reporting download_report_file error: {e}"
+                  )))
+                })?;
+
+              let vec = downloaded.to_vec();
+              let sha256 = format!("{:x}", sha2::Sha256::digest(&vec));
+              let len = vec.len() as i64;
+
+              sqlx::query(
+                r#"
+                  UPDATE yt_reporting_report_files
+                  SET raw_sha256 = ?, raw_bytes = ?, raw_bytes_len = ?, downloaded_at = CURRENT_TIMESTAMP(3)
+                  WHERE tenant_id = ?
+                    AND content_owner_id = ?
+                    AND report_id = ?
+                    AND raw_bytes IS NULL;
+                "#,
+              )
+              .bind(sha256)
+              .bind(&vec)
+              .bind(len)
+              .bind(tenant_id)
+              .bind(&content_owner_id)
+              .bind(&report_id)
+              .execute(pool)
+              .await
+              .map_err(|e| -> Error { Box::new(e) })?;
+
+              vec
+            }
+          };
+
+          let parse_result: Result<(), Error> = (|| async {
+            let decoded = maybe_gunzip_bytes(&bytes).map_err(|e| -> Error { Box::new(e) })?;
+
+            let mut rdr = csv::ReaderBuilder::new()
+              .has_headers(true)
+              .from_reader(decoded.as_slice());
+
+            let headers = rdr
+              .headers()
+              .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?
+              .iter()
+              .map(|h| h.trim_start_matches('\u{feff}').to_string())
+              .collect::<Vec<_>>();
+
+            let columns = globa_flux_rust::db::dedupe_columns(&headers);
+            let table_name = yt_reporting_wide_table_name(&report_type_id);
+            let columns_json = serde_json::to_string(&columns).unwrap_or_else(|_| "[]".to_string());
+            let parse_version = "v1";
+
+            upsert_yt_reporting_wide_table_metadata(
+              pool,
+              &report_type_id,
+              &table_name,
+              &columns_json,
+              parse_version,
+            )
+            .await?;
+
+            ensure_yt_reporting_wide_table(pool, &table_name, &columns).await?;
+
+            let binds_per_row = 6usize.saturating_add(columns.len());
+            let max_rows = (65000usize / binds_per_row).max(1);
+            let batch_size = max_rows.min(200);
+
+            let mut row_no: i64 = 0;
+            let mut batch: Vec<(i64, Vec<Option<String>>)> = Vec::with_capacity(batch_size);
+
+            for result in rdr.records() {
+              let record = result
+                .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?;
+              row_no += 1;
+
+              let mut values: Vec<Option<String>> = Vec::with_capacity(columns.len());
+              for idx in 0..columns.len() {
+                let v = record.get(idx).unwrap_or("");
+                if v.is_empty() {
+                  values.push(None);
+                } else {
+                  values.push(Some(v.to_string()));
+                }
+              }
+
+              batch.push((row_no, values));
+              if batch.len() >= batch_size {
+                insert_yt_reporting_wide_rows_batch(
+                  pool,
+                  &table_name,
+                  &columns,
+                  tenant_id,
+                  &content_owner_id,
+                  &report_type_id,
+                  &job_id,
+                  &report_id,
+                  batch.as_slice(),
+                )
+                .await?;
+                batch.clear();
+              }
+            }
+
+            if !batch.is_empty() {
+              insert_yt_reporting_wide_rows_batch(
+                pool,
+                &table_name,
+                &columns,
+                tenant_id,
+                &content_owner_id,
+                &report_type_id,
+                &job_id,
+                &report_id,
+                batch.as_slice(),
+              )
+              .await?;
+            }
+
+            Ok(())
+          })()
+          .await;
+
+          match parse_result {
+            Ok(()) => {
+              sqlx::query(
+                r#"
+                  UPDATE yt_reporting_report_files
+                  SET parse_status = 'parsed',
+                      parse_version = 'v1',
+                      parsed_at = CURRENT_TIMESTAMP(3),
+                      parse_error = NULL
+                  WHERE tenant_id = ?
+                    AND content_owner_id = ?
+                    AND report_id = ?;
+                "#,
+              )
+              .bind(tenant_id)
+              .bind(&content_owner_id)
+              .bind(&report_id)
+              .execute(pool)
+              .await
+              .map_err(|e| -> Error { Box::new(e) })?;
+
+              Ok(())
+            }
+            Err(err) => {
+              let message = truncate_string(&err.to_string(), 2000);
+              sqlx::query(
+                r#"
+                  UPDATE yt_reporting_report_files
+                  SET parse_status = 'error',
+                      parse_version = 'v1',
+                      parsed_at = CURRENT_TIMESTAMP(3),
+                      parse_error = ?
+                  WHERE tenant_id = ?
+                    AND content_owner_id = ?
+                    AND report_id = ?;
+                "#,
+              )
+              .bind(message)
+              .bind(tenant_id)
+              .bind(&content_owner_id)
+              .bind(&report_id)
+              .execute(pool)
+              .await
+              .map_err(|e| -> Error { Box::new(e) })?;
+
+              // Parsing errors are not retried; the raw blob remains for replay.
+              Ok(())
+            }
+          }
+        })()
+        .await
+      }
       other => Err(Box::new(std::io::Error::other(format!(
         "unknown job_type: {other}"
       ))) as Error),
@@ -918,6 +1610,65 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn parses_youtube_reporting_report_task_key() {
+    assert_eq!(
+      parse_youtube_reporting_report_task_key("CMS123:rep_1"),
+      Some(("CMS123".to_string(), "rep_1".to_string()))
+    );
+    assert_eq!(parse_youtube_reporting_report_task_key("CMS123:"), None);
+    assert_eq!(parse_youtube_reporting_report_task_key(":rep_1"), None);
+    assert_eq!(parse_youtube_reporting_report_task_key("nope"), None);
+  }
+
+  #[test]
+  fn formats_created_after_for_backfill() {
+    let run_for_dt = chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+    let expected = chrono::Utc
+      .with_ymd_and_hms(2026, 2, 1, 0, 0, 0)
+      .unwrap()
+      - chrono::Duration::days(90);
+    assert_eq!(
+      youtube_reporting_created_after_rfc3339(run_for_dt, 90),
+      expected.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    );
+  }
+
+  #[test]
+  fn reporting_wide_table_name_is_mysql_safe() {
+    let name = yt_reporting_wide_table_name("channel_basic_a2");
+    assert!(name.starts_with("yt_rpt_"));
+    assert!(name.len() <= 64);
+    assert!(name
+      .chars()
+      .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'));
+  }
+
+  #[test]
+  fn gunzips_when_magic_header_present() {
+    use std::io::Write;
+
+    let plain = b"a,b\n1,2\n";
+
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(plain).unwrap();
+    let gz = enc.finish().unwrap();
+
+    assert_eq!(maybe_gunzip_bytes(&gz).unwrap(), plain);
+    assert_eq!(maybe_gunzip_bytes(plain).unwrap(), plain);
+  }
+
+  #[test]
+  fn parses_rfc3339_timestamps_as_utc() {
+    let dt = parse_rfc3339_utc(Some("2026-01-01T00:00:00Z")).unwrap();
+    assert_eq!(
+      dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+      "2026-01-01T00:00:00Z"
+    );
+    assert_eq!(parse_rfc3339_utc(Some("nope")), None);
+    assert_eq!(parse_rfc3339_utc(None), None);
+  }
 
   #[tokio::test]
   async fn dispatch_returns_unauthorized_when_missing_internal_token() {

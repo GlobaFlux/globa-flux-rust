@@ -7,16 +7,26 @@ use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 use chrono::{Duration, Utc};
 
 use globa_flux_rust::db::{
-  fetch_youtube_channel_id, get_pool, upsert_video_daily_metric, upsert_youtube_connection,
+  fetch_youtube_channel_id,
+  fetch_youtube_connection_tokens,
+  fetch_youtube_content_owner_id,
+  fetch_youtube_oauth_app_config,
+  get_pool,
+  set_youtube_content_owner_id,
+  update_youtube_connection_tokens,
+  upsert_video_daily_metric,
+  upsert_youtube_connection,
+  upsert_youtube_oauth_app_config,
 };
 use globa_flux_rust::decision_engine::{compute_decision, DecisionEngineConfig};
 use globa_flux_rust::providers::youtube::{
-  build_authorize_url, exchange_code_for_tokens, youtube_oauth_client_from_env,
+  build_authorize_url, exchange_code_for_tokens, refresh_tokens, youtube_oauth_client_from_config,
 };
 use globa_flux_rust::providers::youtube_analytics::{
   fetch_video_daily_metrics, youtube_analytics_error_to_vercel_error,
 };
 use globa_flux_rust::providers::youtube_api::fetch_my_channel_id;
+use globa_flux_rust::providers::youtube_partner::fetch_my_content_owner_id;
 
 fn bearer_token(header_value: Option<&str>) -> Option<&str> {
   let value = header_value?;
@@ -30,6 +40,13 @@ fn json_response(status: StatusCode, value: serde_json::Value) -> Result<Respons
       .header("content-type", "application/json; charset=utf-8")
       .body(ResponseBody::from(value))?,
   )
+}
+
+fn has_tidb_url() -> bool {
+  std::env::var("TIDB_DATABASE_URL")
+    .or_else(|_| std::env::var("DATABASE_URL"))
+    .map(|v| !v.is_empty())
+    .unwrap_or(false)
 }
 
 fn decode_hex_digit(b: u8) -> Option<u8> {
@@ -82,6 +99,7 @@ fn get_query_param(uri: &Uri, key: &str) -> Option<String> {
 
 #[derive(Deserialize)]
 struct StartRequest {
+  tenant_id: String,
   state: String,
 }
 
@@ -108,9 +126,23 @@ async fn handle_start(method: &Method, headers: &HeaderMap, body: Bytes) -> Resu
     );
   }
 
+  if !has_tidb_url() {
+    return json_response(
+      StatusCode::NOT_IMPLEMENTED,
+      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+    );
+  }
+
   let parsed: StartRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
     Box::new(std::io::Error::other(format!("invalid json body: {e}")))
   })?;
+
+  if parsed.tenant_id.is_empty() {
+    return json_response(
+      StatusCode::BAD_REQUEST,
+      serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+    );
+  }
 
   if parsed.state.is_empty() {
     return json_response(
@@ -119,7 +151,24 @@ async fn handle_start(method: &Method, headers: &HeaderMap, body: Bytes) -> Resu
     );
   }
 
-  let (client, _redirect) = youtube_oauth_client_from_env()?;
+  let pool = get_pool().await?;
+  let app = fetch_youtube_oauth_app_config(pool, &parsed.tenant_id).await?;
+  let Some(app) = app else {
+    return json_response(
+      StatusCode::NOT_FOUND,
+      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing YouTube OAuth app config for tenant"}),
+    );
+  };
+
+  let Some(client_secret) = app.client_secret.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+    return json_response(
+      StatusCode::NOT_FOUND,
+      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing YouTube OAuth client_secret for tenant"}),
+    );
+  };
+
+  let (client, _redirect) =
+    youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
   let (authorize_url, state) = build_authorize_url(&client, Some(parsed.state));
 
   json_response(
@@ -179,11 +228,25 @@ async fn handle_exchange(method: &Method, headers: &HeaderMap, body: Bytes) -> R
     );
   }
 
-  let (client, _redirect) = youtube_oauth_client_from_env()?;
+  let pool = get_pool().await?;
+  let app = fetch_youtube_oauth_app_config(pool, &parsed.tenant_id).await?;
+  let Some(app) = app else {
+    return json_response(
+      StatusCode::NOT_FOUND,
+      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing YouTube OAuth app config for tenant"}),
+    );
+  };
+  let Some(client_secret) = app.client_secret.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+    return json_response(
+      StatusCode::NOT_FOUND,
+      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing YouTube OAuth client_secret for tenant"}),
+    );
+  };
+  let (client, _redirect) =
+    youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
   let tokens = exchange_code_for_tokens(&client, &parsed.code).await?;
   let channel_id = fetch_my_channel_id(&tokens.access_token).await?;
 
-  let pool = get_pool().await?;
   upsert_youtube_connection(pool, &parsed.tenant_id, &channel_id, &tokens)
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
@@ -290,11 +353,7 @@ async fn handle_status(method: &Method, headers: &HeaderMap, uri: &Uri) -> Resul
     );
   }
 
-  let has_tidb_url = std::env::var("TIDB_DATABASE_URL")
-    .or_else(|_| std::env::var("DATABASE_URL"))
-    .map(|v| !v.is_empty())
-    .unwrap_or(false);
-  if !has_tidb_url {
+  if !has_tidb_url() {
     return json_response(
       StatusCode::NOT_IMPLEMENTED,
       serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
@@ -303,11 +362,253 @@ async fn handle_status(method: &Method, headers: &HeaderMap, uri: &Uri) -> Resul
 
   let pool = get_pool().await?;
   let channel_id = fetch_youtube_channel_id(pool, &tenant_id).await?;
+  let content_owner_id = fetch_youtube_content_owner_id(pool, &tenant_id).await?;
   let connected = channel_id.is_some();
 
   json_response(
     StatusCode::OK,
-    serde_json::json!({"ok": true, "connected": connected, "channel_id": channel_id}),
+    serde_json::json!({"ok": true, "connected": connected, "channel_id": channel_id, "content_owner_id": content_owner_id}),
+  )
+}
+
+#[derive(Deserialize)]
+struct AppConfigUpsertRequest {
+  tenant_id: String,
+  client_id: String,
+  #[serde(default)]
+  client_secret: Option<String>,
+  redirect_uri: String,
+}
+
+async fn handle_app_config(method: &Method, headers: &HeaderMap, uri: &Uri, body: Option<Bytes>) -> Result<Response<ResponseBody>, Error> {
+  let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+  let provided = bearer_token(
+    headers
+      .get("authorization")
+      .and_then(|v| v.to_str().ok()),
+  )
+  .unwrap_or("");
+
+  if expected.is_empty() || provided != expected {
+    return json_response(
+      StatusCode::UNAUTHORIZED,
+      serde_json::json!({"ok": false, "error": "unauthorized"}),
+    );
+  }
+
+  if !has_tidb_url() {
+    return json_response(
+      StatusCode::NOT_IMPLEMENTED,
+      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+    );
+  }
+
+  match *method {
+    Method::GET => {
+      let tenant_id = get_query_param(uri, "tenant_id").unwrap_or_default();
+      if tenant_id.is_empty() {
+        return json_response(
+          StatusCode::BAD_REQUEST,
+          serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+        );
+      }
+
+      let pool = get_pool().await?;
+      let cfg = fetch_youtube_oauth_app_config(pool, &tenant_id).await?;
+
+      let (client_id, redirect_uri, has_client_secret) = match cfg {
+        Some(cfg) => (
+          Some(cfg.client_id),
+          Some(cfg.redirect_uri),
+          cfg.client_secret
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty()),
+        ),
+        None => (None, None, false),
+      };
+
+      json_response(
+        StatusCode::OK,
+        serde_json::json!({
+          "ok": true,
+          "tenant_id": tenant_id,
+          "provider": "youtube",
+          "configured": has_client_secret
+            && client_id.as_deref().is_some_and(|v| !v.is_empty())
+            && redirect_uri.as_deref().is_some_and(|v| !v.is_empty()),
+          "client_id": client_id,
+          "redirect_uri": redirect_uri,
+          "has_client_secret": has_client_secret
+        }),
+      )
+    }
+    Method::POST => {
+      let body = body.ok_or_else(|| Box::new(std::io::Error::other("missing body")) as Error)?;
+      let parsed: AppConfigUpsertRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
+        Box::new(std::io::Error::other(format!("invalid json body: {e}")))
+      })?;
+
+      if parsed.tenant_id.trim().is_empty() {
+        return json_response(
+          StatusCode::BAD_REQUEST,
+          serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+        );
+      }
+      if parsed.client_id.trim().is_empty() {
+        return json_response(
+          StatusCode::BAD_REQUEST,
+          serde_json::json!({"ok": false, "error": "bad_request", "message": "client_id is required"}),
+        );
+      }
+      if parsed.redirect_uri.trim().is_empty() {
+        return json_response(
+          StatusCode::BAD_REQUEST,
+          serde_json::json!({"ok": false, "error": "bad_request", "message": "redirect_uri is required"}),
+        );
+      }
+
+      let secret = parsed
+        .client_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+      let pool = get_pool().await?;
+      let existing = fetch_youtube_oauth_app_config(pool, &parsed.tenant_id).await?;
+      let has_existing_secret = existing
+        .as_ref()
+        .and_then(|cfg| cfg.client_secret.as_deref())
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty());
+
+      if secret.is_none() && !has_existing_secret {
+        return json_response(
+          StatusCode::BAD_REQUEST,
+          serde_json::json!({"ok": false, "error": "bad_request", "message": "client_secret is required for initial setup"}),
+        );
+      }
+
+      upsert_youtube_oauth_app_config(
+        pool,
+        &parsed.tenant_id,
+        parsed.client_id.trim(),
+        secret,
+        parsed.redirect_uri.trim(),
+      )
+      .await?;
+
+      json_response(StatusCode::OK, serde_json::json!({"ok": true}))
+    }
+    _ => json_response(
+      StatusCode::METHOD_NOT_ALLOWED,
+      serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+    ),
+  }
+}
+
+#[derive(Deserialize)]
+struct ContentOwnerDiscoverRequest {
+  tenant_id: String,
+}
+
+async fn handle_content_owner_discover(method: &Method, headers: &HeaderMap, body: Bytes) -> Result<Response<ResponseBody>, Error> {
+  if method != Method::POST {
+    return json_response(
+      StatusCode::METHOD_NOT_ALLOWED,
+      serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+    );
+  }
+
+  let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+  let provided = bearer_token(
+    headers
+      .get("authorization")
+      .and_then(|v| v.to_str().ok()),
+  )
+  .unwrap_or("");
+
+  if expected.is_empty() || provided != expected {
+    return json_response(
+      StatusCode::UNAUTHORIZED,
+      serde_json::json!({"ok": false, "error": "unauthorized"}),
+    );
+  }
+
+  if !has_tidb_url() {
+    return json_response(
+      StatusCode::NOT_IMPLEMENTED,
+      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+    );
+  }
+
+  let parsed: ContentOwnerDiscoverRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
+    Box::new(std::io::Error::other(format!("invalid json body: {e}")))
+  })?;
+
+  if parsed.tenant_id.is_empty() {
+    return json_response(
+      StatusCode::BAD_REQUEST,
+      serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+    );
+  }
+
+  let pool = get_pool().await?;
+  let channel_id = fetch_youtube_channel_id(pool, &parsed.tenant_id).await?;
+  let Some(channel_id) = channel_id else {
+    return json_response(
+      StatusCode::NOT_FOUND,
+      serde_json::json!({"ok": false, "error": "not_connected", "message": "No YouTube channel connection found for this tenant"}),
+    );
+  };
+
+  let tokens = fetch_youtube_connection_tokens(pool, &parsed.tenant_id, &channel_id).await?;
+  let Some(mut tokens) = tokens else {
+    return json_response(
+      StatusCode::NOT_FOUND,
+      serde_json::json!({"ok": false, "error": "not_connected", "message": "No YouTube tokens found for this tenant"}),
+    );
+  };
+
+  // Best-effort proactive refresh if expired.
+  let needs_refresh = tokens
+    .expires_at
+    .map(|dt| dt <= chrono::Utc::now())
+    .unwrap_or(false);
+  if needs_refresh {
+    if let Some(refresh) = tokens.refresh_token.clone() {
+      let app = fetch_youtube_oauth_app_config(pool, &parsed.tenant_id).await?;
+      let Some(app) = app else {
+        return json_response(
+          StatusCode::NOT_FOUND,
+          serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing YouTube OAuth app config for tenant"}),
+        );
+      };
+      let Some(client_secret) = app.client_secret.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return json_response(
+          StatusCode::NOT_FOUND,
+          serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing YouTube OAuth client_secret for tenant"}),
+        );
+      };
+
+      let (client, _redirect) =
+        youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
+      let refreshed = refresh_tokens(&client, &refresh).await?;
+      update_youtube_connection_tokens(pool, &parsed.tenant_id, &channel_id, &refreshed).await?;
+      tokens.access_token = refreshed.access_token;
+      tokens.refresh_token = refreshed.refresh_token.or(Some(refresh));
+      tokens.expires_at = refreshed
+        .expires_in_seconds
+        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
+    }
+  }
+
+  let content_owner_id = fetch_my_content_owner_id(&tokens.access_token).await?;
+  set_youtube_content_owner_id(pool, &parsed.tenant_id, content_owner_id.as_deref()).await?;
+
+  json_response(
+    StatusCode::OK,
+    serde_json::json!({"ok": true, "content_owner_id": content_owner_id, "discovered": content_owner_id.is_some()}),
   )
 }
 
@@ -327,6 +628,23 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
       let headers = req.headers().clone();
       let bytes = req.into_body().collect().await?.to_bytes();
       handle_exchange(&method, &headers, bytes).await
+    }
+    "app_config" => {
+      let method = req.method().clone();
+      let headers = req.headers().clone();
+      let uri = req.uri().clone();
+      let body = if method == Method::POST {
+        Some(req.into_body().collect().await?.to_bytes())
+      } else {
+        None
+      };
+      handle_app_config(&method, &headers, &uri, body).await
+    }
+    "content_owner_discover" => {
+      let method = req.method().clone();
+      let headers = req.headers().clone();
+      let bytes = req.into_body().collect().await?.to_bytes();
+      handle_content_owner_discover(&method, &headers, bytes).await
     }
     "" => json_response(
       StatusCode::BAD_REQUEST,
@@ -349,30 +667,19 @@ mod tests {
   use super::*;
 
   #[tokio::test]
-  async fn start_returns_authorize_url_with_provided_state() {
+  async fn start_returns_not_configured_when_tidb_env_missing() {
     std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
-    std::env::set_var("YOUTUBE_CLIENT_ID", "id");
-    std::env::set_var("YOUTUBE_CLIENT_SECRET", "secret2");
-    std::env::set_var("YOUTUBE_REDIRECT_URI", "https://example.com/cb");
+    std::env::remove_var("TIDB_DATABASE_URL");
+    std::env::remove_var("DATABASE_URL");
 
     let mut headers = HeaderMap::new();
     headers.insert("authorization", "Bearer secret".parse().unwrap());
     headers.insert("content-type", "application/json".parse().unwrap());
 
-    let body = Bytes::from(r#"{"state":"state123"}"#);
+    let body = Bytes::from(r#"{"tenant_id":"t1","state":"state123"}"#);
     let response = handle_start(&Method::POST, &headers, body).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(parsed.get("ok").and_then(|v| v.as_bool()), Some(true));
-    assert_eq!(
-      parsed.get("state").and_then(|v| v.as_str()),
-      Some("state123")
-    );
-    let url = parsed.get("authorize_url").and_then(|v| v.as_str()).unwrap();
-    assert!(url.contains("accounts.google.com/o/oauth2/v2/auth"));
-    assert!(url.contains("state=state123"));
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
   }
 
   #[tokio::test]
@@ -384,4 +691,3 @@ mod tests {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
   }
 }
-

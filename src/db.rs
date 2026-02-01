@@ -1,5 +1,6 @@
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sqlx::{mysql::MySqlPoolOptions, MySqlPool};
+use std::collections::HashMap;
 use tokio::sync::OnceCell;
 use vercel_runtime::Error;
 
@@ -69,6 +70,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         tenant_id VARCHAR(128) NOT NULL,
         oauth_provider VARCHAR(32) NOT NULL,
         channel_id VARCHAR(128) NULL,
+        content_owner_id VARCHAR(128) NULL,
         access_token TEXT NOT NULL,
         refresh_token TEXT NULL,
         token_type VARCHAR(32) NOT NULL,
@@ -77,7 +79,31 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
         updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
         UNIQUE KEY uq_channel_connections_provider (tenant_id, oauth_provider),
+        KEY idx_channel_connections_owner (tenant_id, content_owner_id),
         KEY idx_channel_connections_updated (tenant_id, updated_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  // Per-tenant OAuth app configuration (BYO OAuth client).
+  // Note: `client_secret` is sensitive. For now we store it like other tokens (plaintext),
+  // but in production you likely want to encrypt it with a KMS/master key.
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS oauth_apps (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        provider VARCHAR(32) NOT NULL,
+        client_id VARCHAR(255) NOT NULL,
+        client_secret TEXT NULL,
+        redirect_uri VARCHAR(512) NOT NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        UNIQUE KEY uq_oauth_apps_provider (tenant_id, provider),
+        KEY idx_oauth_apps_updated (tenant_id, updated_at)
       );
     "#,
   )
@@ -204,6 +230,95 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         error TEXT NULL,
         created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
         KEY idx_sync_run_log_tenant (tenant_id, channel_id, started_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  // YouTube Reporting / Content ID ingestion tables (raw blobs + metadata).
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS yt_reporting_report_types (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        content_owner_id VARCHAR(128) NOT NULL,
+        report_type_id VARCHAR(256) NOT NULL,
+        report_type_name VARCHAR(512) NULL,
+        system_managed TINYINT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        UNIQUE KEY uq_yt_reporting_report_types (content_owner_id, report_type_id),
+        KEY idx_yt_reporting_report_types_owner (content_owner_id, updated_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS yt_reporting_jobs (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        content_owner_id VARCHAR(128) NOT NULL,
+        report_type_id VARCHAR(256) NOT NULL,
+        job_id VARCHAR(256) NOT NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        UNIQUE KEY uq_yt_reporting_jobs (tenant_id, content_owner_id, report_type_id),
+        KEY idx_yt_reporting_jobs_tenant (tenant_id, content_owner_id, updated_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS yt_reporting_report_files (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        content_owner_id VARCHAR(128) NOT NULL,
+        report_type_id VARCHAR(256) NOT NULL,
+        job_id VARCHAR(256) NOT NULL,
+        report_id VARCHAR(256) NOT NULL,
+        download_url TEXT NULL,
+        start_time TIMESTAMP(3) NULL,
+        end_time TIMESTAMP(3) NULL,
+        create_time TIMESTAMP(3) NULL,
+        raw_sha256 CHAR(64) NULL,
+        raw_bytes LONGBLOB NULL,
+        raw_bytes_len BIGINT NULL,
+        downloaded_at TIMESTAMP(3) NULL,
+        parse_status VARCHAR(16) NOT NULL DEFAULT 'pending',
+        parse_version VARCHAR(32) NULL,
+        parsed_at TIMESTAMP(3) NULL,
+        parse_error TEXT NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        UNIQUE KEY uq_yt_reporting_report_files (tenant_id, content_owner_id, report_id),
+        KEY idx_yt_reporting_report_files_job (tenant_id, content_owner_id, job_id, created_at),
+        KEY idx_yt_reporting_report_files_status (parse_status, updated_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS yt_reporting_wide_tables (
+        report_type_id VARCHAR(256) PRIMARY KEY,
+        table_name VARCHAR(128) NOT NULL,
+        columns_json LONGTEXT NOT NULL,
+        parse_version VARCHAR(32) NOT NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        UNIQUE KEY uq_yt_reporting_wide_tables_name (table_name)
       );
     "#,
   )
@@ -453,6 +568,16 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
     r#"
       ALTER TABLE channel_connections
       ADD COLUMN IF NOT EXISTS channel_id VARCHAR(128) NULL;
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
+      ALTER TABLE channel_connections
+      ADD COLUMN IF NOT EXISTS content_owner_id VARCHAR(128) NULL;
     "#,
   )
   .execute(pool)
@@ -760,6 +885,107 @@ pub async fn fetch_youtube_channel_id(
   .map_err(|e| -> Error { Box::new(e) })?;
 
   Ok(row.and_then(|(channel_id,)| channel_id))
+}
+
+pub async fn fetch_youtube_content_owner_id(
+  pool: &MySqlPool,
+  tenant_id: &str,
+) -> Result<Option<String>, Error> {
+  let row = sqlx::query_as::<_, (Option<String>,)>(
+    r#"
+      SELECT content_owner_id
+      FROM channel_connections
+      WHERE tenant_id = ? AND oauth_provider = 'youtube'
+      LIMIT 1;
+    "#,
+  )
+  .bind(tenant_id)
+  .fetch_optional(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(row.and_then(|(content_owner_id,)| content_owner_id))
+}
+
+pub async fn set_youtube_content_owner_id(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  content_owner_id: Option<&str>,
+) -> Result<(), Error> {
+  sqlx::query(
+    r#"
+      UPDATE channel_connections
+      SET content_owner_id = ?
+      WHERE tenant_id = ? AND oauth_provider = 'youtube';
+    "#,
+  )
+  .bind(content_owner_id)
+  .bind(tenant_id)
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct YoutubeOAuthAppConfig {
+  pub client_id: String,
+  pub client_secret: Option<String>,
+  pub redirect_uri: String,
+}
+
+pub async fn fetch_youtube_oauth_app_config(
+  pool: &MySqlPool,
+  tenant_id: &str,
+) -> Result<Option<YoutubeOAuthAppConfig>, Error> {
+  let row = sqlx::query_as::<_, (String, Option<String>, String)>(
+    r#"
+      SELECT client_id, client_secret, redirect_uri
+      FROM oauth_apps
+      WHERE tenant_id = ? AND provider = 'youtube'
+      LIMIT 1;
+    "#,
+  )
+  .bind(tenant_id)
+  .fetch_optional(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(row.map(|(client_id, client_secret, redirect_uri)| YoutubeOAuthAppConfig {
+    client_id,
+    client_secret,
+    redirect_uri,
+  }))
+}
+
+pub async fn upsert_youtube_oauth_app_config(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  client_id: &str,
+  client_secret: Option<&str>,
+  redirect_uri: &str,
+) -> Result<(), Error> {
+  sqlx::query(
+    r#"
+      INSERT INTO oauth_apps (tenant_id, provider, client_id, client_secret, redirect_uri)
+      VALUES (?, 'youtube', ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        client_id = VALUES(client_id),
+        client_secret = COALESCE(VALUES(client_secret), client_secret),
+        redirect_uri = VALUES(redirect_uri),
+        updated_at = CURRENT_TIMESTAMP(3);
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(client_id)
+  .bind(client_secret)
+  .bind(redirect_uri)
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1946,6 +2172,62 @@ pub async fn fetch_geo_monitor_run_results(
   )
 }
 
+pub fn sanitize_sql_identifier(header: &str) -> String {
+  let mut out = String::with_capacity(header.len());
+  let mut prev_underscore = false;
+
+  for ch in header.chars() {
+    let c = ch.to_ascii_lowercase();
+    if c.is_ascii_alphanumeric() {
+      out.push(c);
+      prev_underscore = false;
+    } else if !prev_underscore {
+      out.push('_');
+      prev_underscore = true;
+    }
+  }
+
+  let trimmed = out.trim_matches('_');
+  let mut normalized = if trimmed.is_empty() {
+    "c".to_string()
+  } else {
+    trimmed.to_string()
+  };
+
+  if normalized
+    .chars()
+    .next()
+    .map(|c| c.is_ascii_digit())
+    .unwrap_or(false)
+  {
+    normalized = format!("c_{normalized}");
+  }
+
+  if normalized.len() > 64 {
+    normalized.truncate(64);
+  }
+
+  normalized
+}
+
+pub fn dedupe_columns(headers: &[String]) -> Vec<String> {
+  let mut seen: HashMap<String, usize> = HashMap::new();
+  let mut out: Vec<String> = Vec::with_capacity(headers.len());
+
+  for header in headers {
+    let base = sanitize_sql_identifier(header);
+    let count = seen.entry(base.clone()).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+      out.push(base);
+    } else {
+      out.push(format!("{base}_{}", *count));
+    }
+  }
+
+  out
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1956,5 +2238,22 @@ mod tests {
     let (start, end) = utc_day_bounds(now);
     assert_eq!(start, Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap());
     assert_eq!(end, Utc.with_ymd_and_hms(2026, 1, 21, 0, 0, 0).unwrap());
+  }
+
+  #[test]
+  fn sanitize_sql_identifier_normalizes_headers() {
+    assert_eq!(
+      sanitize_sql_identifier("Total Revenue ($)"),
+      "total_revenue"
+    );
+    assert_eq!(sanitize_sql_identifier("123 Views"), "c_123_views");
+    assert_eq!(sanitize_sql_identifier("视频"), "c");
+  }
+
+  #[test]
+  fn dedupe_columns_appends_suffixes_for_conflicts() {
+    let headers = vec!["Views".to_string(), "views".to_string(), "Views ".to_string()];
+    let deduped = dedupe_columns(&headers);
+    assert_eq!(deduped, vec!["views", "views_2", "views_3"]);
   }
 }

@@ -34,6 +34,14 @@
       "destination": "/api/oauth/youtube/router?action=status"
     },
     {
+      "source": "/api/oauth/youtube/app_config",
+      "destination": "/api/oauth/youtube/router?action=app_config"
+    },
+    {
+      "source": "/api/oauth/youtube/content_owner/discover",
+      "destination": "/api/oauth/youtube/router?action=content_owner_discover"
+    },
+    {
       "source": "/api/billing/subscription/status",
       "destination": "/api/webhooks/billing?action=subscription_status"
     },

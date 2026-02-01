@@ -18,13 +18,20 @@ pub struct YoutubeOAuthTokens {
   pub expires_in_seconds: Option<u64>,
 }
 
-pub fn youtube_oauth_client_from_env() -> Result<(YoutubeOAuthClient, RedirectUrl), Error> {
-  let client_id = std::env::var("YOUTUBE_CLIENT_ID")
-    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_ID")) as Error)?;
-  let client_secret = std::env::var("YOUTUBE_CLIENT_SECRET")
-    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_SECRET")) as Error)?;
-  let redirect_uri = std::env::var("YOUTUBE_REDIRECT_URI")
-    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_REDIRECT_URI")) as Error)?;
+pub fn youtube_oauth_client_from_config(
+  client_id: &str,
+  client_secret: &str,
+  redirect_uri: &str,
+) -> Result<(YoutubeOAuthClient, RedirectUrl), Error> {
+  if client_id.trim().is_empty() {
+    return Err(Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_ID")) as Error);
+  }
+  if client_secret.trim().is_empty() {
+    return Err(Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_SECRET")) as Error);
+  }
+  if redirect_uri.trim().is_empty() {
+    return Err(Box::new(std::io::Error::other("Missing YOUTUBE_REDIRECT_URI")) as Error);
+  }
 
   let auth_url =
     AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string()).map_err(|e| {
@@ -35,16 +42,26 @@ pub fn youtube_oauth_client_from_env() -> Result<(YoutubeOAuthClient, RedirectUr
       Box::new(std::io::Error::other(e.to_string())) as Error
     })?;
 
-  let redirect_url = RedirectUrl::new(redirect_uri)
+  let redirect_url = RedirectUrl::new(redirect_uri.to_string())
     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?;
 
-  let client = BasicClient::new(ClientId::new(client_id))
-    .set_client_secret(ClientSecret::new(client_secret))
+  let client = BasicClient::new(ClientId::new(client_id.to_string()))
+    .set_client_secret(ClientSecret::new(client_secret.to_string()))
     .set_auth_uri(auth_url)
     .set_token_uri(token_url)
     .set_redirect_uri(redirect_url.clone());
 
   Ok((client, redirect_url))
+}
+
+pub fn youtube_oauth_client_from_env() -> Result<(YoutubeOAuthClient, RedirectUrl), Error> {
+  let client_id = std::env::var("YOUTUBE_CLIENT_ID")
+    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_ID")) as Error)?;
+  let client_secret = std::env::var("YOUTUBE_CLIENT_SECRET")
+    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_SECRET")) as Error)?;
+  let redirect_uri = std::env::var("YOUTUBE_REDIRECT_URI")
+    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_REDIRECT_URI")) as Error)?;
+  youtube_oauth_client_from_config(&client_id, &client_secret, &redirect_uri)
 }
 
 pub fn build_authorize_url(client: &YoutubeOAuthClient, state: Option<String>) -> (String, String) {
@@ -60,6 +77,12 @@ pub fn build_authorize_url(client: &YoutubeOAuthClient, state: Option<String>) -
     ))
     .add_scope(Scope::new(
       "https://www.googleapis.com/auth/yt-analytics.readonly".to_string(),
+    ))
+    .add_scope(Scope::new(
+      "https://www.googleapis.com/auth/yt-analytics-monetary.readonly".to_string(),
+    ))
+    .add_scope(Scope::new(
+      "https://www.googleapis.com/auth/youtubepartner".to_string(),
     ))
     .add_extra_param("access_type", "offline")
     .add_extra_param("prompt", "consent")
@@ -136,6 +159,8 @@ mod tests {
     assert!(url.contains("accounts.google.com/o/oauth2/v2/auth"));
     assert!(url.contains("scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube.readonly"));
     assert!(url.contains("yt-analytics.readonly"));
+    assert!(url.contains("yt-analytics-monetary.readonly"));
+    assert!(url.contains("youtubepartner"));
     assert!(url.contains("access_type=offline"));
     assert!(url.contains("prompt=consent"));
     assert_eq!(state, "state123");
