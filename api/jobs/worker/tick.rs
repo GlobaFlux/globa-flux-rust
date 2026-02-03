@@ -987,9 +987,14 @@ async fn handle_dispatch(
     let dedupe_key = format!("{tenant_id}:{job_type}:{channel_id}:{run_for_dt}");
     sqlx::query(
       r#"
-        INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status)
-        VALUES (?, ?, ?, ?, ?, 'pending')
-        ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP(3);
+        INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status, run_after)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+        ON DUPLICATE KEY UPDATE
+          updated_at = CURRENT_TIMESTAMP(3),
+          run_after = CASE
+            WHEN status IN ('pending','retrying') THEN LEAST(run_after, VALUES(run_after))
+            ELSE run_after
+          END;
       "#,
     )
     .bind(tenant_id)
@@ -997,6 +1002,7 @@ async fn handle_dispatch(
     .bind(channel_id)
     .bind(run_for_dt)
     .bind(dedupe_key)
+    .bind(now)
     .execute(pool)
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
