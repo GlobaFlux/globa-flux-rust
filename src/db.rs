@@ -237,6 +237,94 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
+  // CSV uploads (Studio export fallback) - raw file is handled on the frontend,
+  // backend persists parsed status + writes rows into `video_daily_metrics`.
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS yt_csv_uploads (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        channel_id VARCHAR(128) NOT NULL,
+        filename VARCHAR(512) NOT NULL,
+        rows_parsed INT NOT NULL DEFAULT 0,
+        status VARCHAR(16) NOT NULL DEFAULT 'received',
+        error TEXT NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        KEY idx_yt_csv_uploads_tenant (tenant_id, channel_id, created_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  // Agent alerts (derived from stored metrics or external signals).
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS yt_alerts (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        channel_id VARCHAR(128) NOT NULL,
+        alert_key VARCHAR(64) NOT NULL,
+        kind VARCHAR(128) NOT NULL,
+        severity VARCHAR(16) NOT NULL,
+        message TEXT NOT NULL,
+        detected_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        resolved_at TIMESTAMP(3) NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        UNIQUE KEY uq_yt_alerts_key (tenant_id, channel_id, alert_key),
+        KEY idx_yt_alerts_open (tenant_id, channel_id, resolved_at, detected_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  // Experiments (MVP: persisted experiment definitions + variants).
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS yt_experiments (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        channel_id VARCHAR(128) NOT NULL,
+        type VARCHAR(32) NOT NULL,
+        state VARCHAR(16) NOT NULL DEFAULT 'running',
+        video_ids_json TEXT NOT NULL,
+        stop_loss_pct DOUBLE NULL,
+        planned_duration_days INT NULL,
+        started_at TIMESTAMP(3) NULL,
+        ended_at TIMESTAMP(3) NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        KEY idx_yt_experiments_tenant (tenant_id, channel_id, created_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS yt_experiment_variants (
+        experiment_id BIGINT NOT NULL,
+        variant_id VARCHAR(32) NOT NULL,
+        payload_json TEXT NOT NULL,
+        status VARCHAR(16) NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        PRIMARY KEY (experiment_id, variant_id),
+        KEY idx_yt_experiment_variants_exp (experiment_id, created_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
   // YouTube Reporting / Content ID ingestion tables (raw blobs + metadata).
   sqlx::query(
     r#"
@@ -907,6 +995,28 @@ pub async fn fetch_youtube_content_owner_id(
   Ok(row.and_then(|(content_owner_id,)| content_owner_id))
 }
 
+pub async fn set_youtube_channel_id(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  channel_id: &str,
+) -> Result<(), Error> {
+  sqlx::query(
+    r#"
+      UPDATE channel_connections
+      SET channel_id = ?,
+          updated_at = CURRENT_TIMESTAMP(3)
+      WHERE tenant_id = ? AND oauth_provider = 'youtube';
+    "#,
+  )
+  .bind(channel_id)
+  .bind(tenant_id)
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(())
+}
+
 pub async fn set_youtube_content_owner_id(
   pool: &MySqlPool,
   tenant_id: &str,
@@ -986,6 +1096,65 @@ pub async fn upsert_youtube_oauth_app_config(
   .map_err(|e| -> Error { Box::new(e) })?;
 
   Ok(())
+}
+
+pub fn youtube_oauth_app_config_from_env() -> Result<YoutubeOAuthAppConfig, Error> {
+  let client_id = std::env::var("YOUTUBE_CLIENT_ID")
+    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_ID")) as Error)?;
+  let client_secret = std::env::var("YOUTUBE_CLIENT_SECRET")
+    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_SECRET")) as Error)?;
+  let redirect_uri = std::env::var("YOUTUBE_REDIRECT_URI")
+    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_REDIRECT_URI")) as Error)?;
+
+  let client_id = client_id.trim().to_string();
+  let client_secret = client_secret.trim().to_string();
+  let redirect_uri = redirect_uri.trim().to_string();
+
+  if client_id.is_empty() {
+    return Err(Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_ID")) as Error);
+  }
+  if client_secret.is_empty() {
+    return Err(Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_SECRET")) as Error);
+  }
+  if redirect_uri.is_empty() {
+    return Err(Box::new(std::io::Error::other("Missing YOUTUBE_REDIRECT_URI")) as Error);
+  }
+
+  Ok(YoutubeOAuthAppConfig {
+    client_id,
+    client_secret: Some(client_secret),
+    redirect_uri,
+  })
+}
+
+pub async fn fetch_or_seed_youtube_oauth_app_config(
+  pool: &MySqlPool,
+  tenant_id: &str,
+) -> Result<Option<YoutubeOAuthAppConfig>, Error> {
+  let existing = fetch_youtube_oauth_app_config(pool, tenant_id).await?;
+  if existing.is_some() {
+    return Ok(existing);
+  }
+
+  let defaults = youtube_oauth_app_config_from_env();
+  let Ok(defaults) = defaults else {
+    return Ok(None);
+  };
+
+  let client_id = defaults.client_id.trim();
+  let redirect_uri = defaults.redirect_uri.trim();
+  let client_secret = defaults
+    .client_secret
+    .as_deref()
+    .map(str::trim)
+    .filter(|v| !v.is_empty());
+
+  if client_id.is_empty() || redirect_uri.is_empty() || client_secret.is_none() {
+    return Ok(None);
+  }
+
+  upsert_youtube_oauth_app_config(pool, tenant_id, client_id, client_secret, redirect_uri).await?;
+  Ok(Some(defaults))
 }
 
 #[derive(Debug, Clone)]

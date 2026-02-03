@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use http_body_util::BodyExt;
 use hyper::{HeaderMap, Method, StatusCode};
 use serde::Deserialize;
@@ -18,7 +18,7 @@ use globa_flux_rust::db::{
   fetch_top_video_ids_by_revenue,
   fetch_youtube_channel_id,
   fetch_youtube_connection_tokens,
-  fetch_youtube_oauth_app_config,
+  fetch_or_seed_youtube_oauth_app_config,
   get_pool,
   finalize_geo_monitor_run_if_complete,
   insert_geo_monitor_run_result,
@@ -36,7 +36,12 @@ use globa_flux_rust::providers::gemini::{
   generate_text as gemini_generate_text, pricing_for_model as gemini_pricing_for_model, GeminiConfig,
 };
 use globa_flux_rust::providers::youtube::{refresh_tokens, youtube_oauth_client_from_config};
-use globa_flux_rust::providers::youtube_analytics::{fetch_video_daily_metrics, youtube_analytics_error_to_vercel_error};
+use globa_flux_rust::providers::youtube_analytics::{
+  fetch_video_daily_metrics_for_channel, youtube_analytics_error_to_vercel_error,
+};
+use globa_flux_rust::providers::youtube_videos::{
+  set_video_thumbnail_from_url, update_video_publish_at, update_video_title,
+};
 use globa_flux_rust::providers::youtube_reporting::{
   download_report_file,
   ensure_job_for_report_type,
@@ -112,6 +117,499 @@ fn parse_youtube_reporting_report_task_key(value: &str) -> Option<(String, Strin
     return None;
   }
   Some((content_owner_id.to_string(), report_id.to_string()))
+}
+
+fn parse_video_ids_json(raw: &str) -> Vec<String> {
+  serde_json::from_str::<Vec<String>>(raw)
+    .unwrap_or_default()
+    .into_iter()
+    .map(|v| v.trim().to_string())
+    .filter(|v| !v.is_empty())
+    .collect()
+}
+
+fn json_string_field(payload: &serde_json::Value, key: &str) -> Option<String> {
+  payload
+    .get(key)
+    .and_then(|v| v.as_str())
+    .map(|v| v.trim().to_string())
+    .filter(|v| !v.is_empty())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AggMetrics {
+  revenue_usd: f64,
+  impressions: i64,
+  views: i64,
+}
+
+fn agg_ctr(m: AggMetrics) -> Option<f64> {
+  if m.impressions > 0 {
+    Some((m.views as f64) / (m.impressions as f64))
+  } else {
+    None
+  }
+}
+
+fn agg_rpm(m: AggMetrics) -> Option<f64> {
+  if m.views > 0 {
+    Some((m.revenue_usd / (m.views as f64)) * 1000.0)
+  } else {
+    None
+  }
+}
+
+async fn aggregate_metrics_for_videos(
+  pool: &sqlx::MySqlPool,
+  tenant_id: &str,
+  channel_id: &str,
+  video_ids: &[String],
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+) -> Result<AggMetrics, Error> {
+  if start_dt > end_dt || video_ids.is_empty() {
+    return Ok(AggMetrics::default());
+  }
+
+  let mut qb = sqlx::QueryBuilder::<sqlx::MySql>::new(
+    r#"
+      SELECT CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
+             CAST(COALESCE(SUM(impressions), 0) AS SIGNED) AS impressions,
+             CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views
+      FROM video_daily_metrics
+      WHERE tenant_id =
+    "#,
+  );
+  qb.push_bind(tenant_id);
+  qb.push(" AND channel_id = ");
+  qb.push_bind(channel_id);
+  qb.push(" AND dt BETWEEN ");
+  qb.push_bind(start_dt);
+  qb.push(" AND ");
+  qb.push_bind(end_dt);
+  qb.push(" AND video_id IN (");
+  {
+    let mut separated = qb.separated(", ");
+    for vid in video_ids {
+      separated.push_bind(vid);
+    }
+  }
+  qb.push(");");
+
+  let (revenue_usd, impressions, views) = qb
+    .build_query_as::<(f64, i64, i64)>()
+    .fetch_one(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(AggMetrics {
+    revenue_usd,
+    impressions,
+    views,
+  })
+}
+
+async fn upsert_alert(
+  pool: &sqlx::MySqlPool,
+  tenant_id: &str,
+  channel_id: &str,
+  alert_key: &str,
+  kind: &str,
+  severity: &str,
+  message: &str,
+) -> Result<(), Error> {
+  sqlx::query(
+    r#"
+      INSERT INTO yt_alerts (
+        tenant_id, channel_id, alert_key,
+        kind, severity, message,
+        detected_at, resolved_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3), NULL)
+      ON DUPLICATE KEY UPDATE
+        kind = VALUES(kind),
+        severity = VALUES(severity),
+        message = VALUES(message),
+        detected_at = CURRENT_TIMESTAMP(3),
+        resolved_at = NULL,
+        updated_at = CURRENT_TIMESTAMP(3);
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(channel_id)
+  .bind(alert_key)
+  .bind(kind)
+  .bind(severity)
+  .bind(message)
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(())
+}
+
+async fn evaluate_running_experiments_for_channel(
+  pool: &sqlx::MySqlPool,
+  tenant_id: &str,
+  channel_id: &str,
+  access_token: &str,
+  run_for_dt: NaiveDate,
+) -> Result<(), Error> {
+  let last_complete_dt = run_for_dt - Duration::days(1);
+
+  let rows = sqlx::query_as::<
+    _,
+    (
+      i64,
+      String,
+      String,
+      Option<f64>,
+      Option<i64>,
+      Option<chrono::NaiveDateTime>,
+      Option<chrono::NaiveDateTime>,
+    ),
+  >(
+    r#"
+      SELECT id, type, video_ids_json,
+             stop_loss_pct, planned_duration_days,
+             started_at, ended_at
+      FROM yt_experiments
+      WHERE tenant_id = ?
+        AND channel_id = ?
+        AND state = 'running'
+      ORDER BY created_at DESC
+      LIMIT 50;
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(channel_id)
+  .fetch_all(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  for (id, exp_type, video_ids_json, stop_loss_pct, planned_duration_days, started_at, ended_at) in rows {
+    let Some(started_at) = started_at else {
+      continue;
+    };
+
+    let video_ids = parse_video_ids_json(&video_ids_json);
+    if video_ids.len() != 1 {
+      continue;
+    }
+    let primary_video_id = video_ids[0].trim().to_string();
+
+    let start_dt = started_at.date();
+    let baseline_start_dt = start_dt - Duration::days(7);
+    let baseline_end_dt = start_dt - Duration::days(1);
+    let ended_dt = ended_at.map(|dt| dt.date());
+    let current_end_dt = ended_dt.unwrap_or(last_complete_dt).min(last_complete_dt);
+
+    let baseline = aggregate_metrics_for_videos(
+      pool,
+      tenant_id,
+      channel_id,
+      &video_ids,
+      baseline_start_dt,
+      baseline_end_dt,
+    )
+    .await?;
+    let current =
+      aggregate_metrics_for_videos(pool, tenant_id, channel_id, &video_ids, start_dt, current_end_dt).await?;
+
+    let (metric_name, baseline_metric, current_metric, sample_ok) = match exp_type.as_str() {
+      "publish_time" => {
+        let base = agg_rpm(baseline).unwrap_or(0.0);
+        let cur = agg_rpm(current).unwrap_or(0.0);
+        let ok = baseline.views >= 1000 && current.views >= 1000 && base > 0.0;
+        ("RPM", base, cur, ok)
+      }
+      _ => {
+        let base = agg_ctr(baseline).unwrap_or(0.0);
+        let cur = agg_ctr(current).unwrap_or(0.0);
+        let ok = baseline.impressions >= 5000 && current.impressions >= 5000 && base > 0.0;
+        ("CTR", base, cur, ok)
+      }
+    };
+
+    if !sample_ok {
+      continue;
+    }
+
+    let uplift = ((current_metric - baseline_metric) / baseline_metric).max(-1.0);
+
+    let stop_loss_threshold = stop_loss_pct
+      .filter(|v| *v > 0.0)
+      .map(|v| -v / 100.0);
+
+    if stop_loss_threshold.is_some_and(|t| uplift <= t) {
+      let baseline_payload_json = sqlx::query_scalar::<_, String>(
+        r#"
+          SELECT payload_json
+          FROM yt_experiment_variants
+          WHERE experiment_id = ?
+            AND variant_id = 'A'
+          LIMIT 1;
+        "#,
+      )
+      .bind(id)
+      .fetch_optional(pool)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?;
+
+      let baseline_payload = baseline_payload_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+      let rollback_err: Option<String> = match exp_type.as_str() {
+        "title" => match json_string_field(&baseline_payload, "title") {
+          None => Some("baseline variant A missing title".to_string()),
+          Some(title) => update_video_title(access_token, &primary_video_id, &title)
+            .await
+            .err()
+            .map(|e| e.to_string()),
+        },
+        "thumbnail" => match json_string_field(&baseline_payload, "thumbnail_url")
+          .or_else(|| json_string_field(&baseline_payload, "thumbnailUrl"))
+        {
+          None => Some("baseline variant A missing thumbnail_url".to_string()),
+          Some(url) => set_video_thumbnail_from_url(access_token, &primary_video_id, &url)
+            .await
+            .err()
+            .map(|e| e.to_string()),
+        },
+        "publish_time" => match json_string_field(&baseline_payload, "publish_at")
+          .or_else(|| json_string_field(&baseline_payload, "publishAt"))
+        {
+          None => Some("baseline variant A missing publish_at".to_string()),
+          Some(publish_at) => update_video_publish_at(access_token, &primary_video_id, &publish_at)
+            .await
+            .err()
+            .map(|e| e.to_string()),
+        },
+        _ => None,
+      };
+
+      let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
+      let updated = sqlx::query(
+        r#"
+          UPDATE yt_experiments
+          SET state = 'stopped',
+              ended_at = CURRENT_TIMESTAMP(3),
+              updated_at = CURRENT_TIMESTAMP(3)
+          WHERE id = ? AND tenant_id = ? AND state = 'running';
+        "#,
+      )
+      .bind(id)
+      .bind(tenant_id)
+      .execute(&mut *tx)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?;
+
+      if updated.rows_affected() > 0 {
+        sqlx::query(
+          r#"
+            UPDATE yt_experiment_variants
+            SET status = CASE
+              WHEN variant_id = 'A' THEN 'won'
+              WHEN variant_id = 'B' THEN 'lost'
+              ELSE status
+            END,
+            updated_at = CURRENT_TIMESTAMP(3)
+            WHERE experiment_id = ?;
+          "#,
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+
+        let mut msg = match metric_name {
+          "RPM" => format!(
+            "Experiment exp_{id} stop-loss triggered: RPM {:+.0}% vs baseline (current ${:.2}, baseline ${:.2}; views {}/{}).",
+            uplift * 100.0,
+            current_metric,
+            baseline_metric,
+            current.views,
+            baseline.views
+          ),
+          _ => format!(
+            "Experiment exp_{id} stop-loss triggered: CTR {:+.0}% vs baseline (current {:.2}%, baseline {:.2}%; impressions {}/{}).",
+            uplift * 100.0,
+            current_metric * 100.0,
+            baseline_metric * 100.0,
+            current.impressions,
+            baseline.impressions
+          ),
+        };
+        if let Some(err) = rollback_err.as_deref() {
+          msg.push_str(&format!(" Rollback failed: {err}"));
+        }
+
+        tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
+
+        let severity = if rollback_err.is_some() { "error" } else { "warning" };
+        let _ = upsert_alert(
+          pool,
+          tenant_id,
+          channel_id,
+          &format!("exp_{id}_stoploss"),
+          "Experiment stop-loss",
+          severity,
+          &msg,
+        )
+        .await;
+      } else {
+        tx.rollback().await.map_err(|e| -> Error { Box::new(e) })?;
+      }
+
+      continue;
+    }
+
+    if let Some(days) = planned_duration_days.filter(|v| *v > 0) {
+      let elapsed_days = if current_end_dt >= start_dt {
+        (current_end_dt - start_dt).num_days() + 1
+      } else {
+        0
+      };
+
+      if elapsed_days >= days {
+        let (state, winner, loser) = if uplift >= 0.0 {
+          ("won", "B", "A")
+        } else {
+          ("lost", "A", "B")
+        };
+
+        let baseline_payload_json = sqlx::query_scalar::<_, String>(
+          r#"
+            SELECT payload_json
+            FROM yt_experiment_variants
+            WHERE experiment_id = ?
+              AND variant_id = 'A'
+            LIMIT 1;
+          "#,
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+
+        let baseline_payload = baseline_payload_json
+          .as_deref()
+          .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+          .filter(|v| v.is_object())
+          .unwrap_or_else(|| serde_json::json!({}));
+
+        let rollback_err: Option<String> = if state == "lost" {
+          match exp_type.as_str() {
+            "title" => match json_string_field(&baseline_payload, "title") {
+              None => Some("baseline variant A missing title".to_string()),
+              Some(title) => update_video_title(access_token, &primary_video_id, &title)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+            },
+            "thumbnail" => match json_string_field(&baseline_payload, "thumbnail_url")
+              .or_else(|| json_string_field(&baseline_payload, "thumbnailUrl"))
+            {
+              None => Some("baseline variant A missing thumbnail_url".to_string()),
+              Some(url) => set_video_thumbnail_from_url(access_token, &primary_video_id, &url)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+            },
+            "publish_time" => match json_string_field(&baseline_payload, "publish_at")
+              .or_else(|| json_string_field(&baseline_payload, "publishAt"))
+            {
+              None => Some("baseline variant A missing publish_at".to_string()),
+              Some(publish_at) => update_video_publish_at(access_token, &primary_video_id, &publish_at)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+            },
+            _ => None,
+          }
+        } else {
+          None
+        };
+
+        let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
+        let updated = sqlx::query(
+          r#"
+            UPDATE yt_experiments
+            SET state = ?,
+                ended_at = CURRENT_TIMESTAMP(3),
+                updated_at = CURRENT_TIMESTAMP(3)
+            WHERE id = ? AND tenant_id = ? AND state = 'running';
+          "#,
+        )
+        .bind(state)
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+
+        if updated.rows_affected() > 0 {
+          sqlx::query(
+            r#"
+              UPDATE yt_experiment_variants
+              SET status = CASE
+                WHEN variant_id = ? THEN 'won'
+                WHEN variant_id = ? THEN 'lost'
+                ELSE status
+              END,
+              updated_at = CURRENT_TIMESTAMP(3)
+              WHERE experiment_id = ?;
+            "#,
+          )
+          .bind(winner)
+          .bind(loser)
+          .bind(id)
+          .execute(&mut *tx)
+          .await
+          .map_err(|e| -> Error { Box::new(e) })?;
+
+          let mut msg = match metric_name {
+            "RPM" => format!(
+              "Experiment exp_{id} finished: {winner} wins ({metric_name} {:+.0}% vs baseline; current ${:.2}, baseline ${:.2}).",
+              uplift * 100.0,
+              current_metric,
+              baseline_metric
+            ),
+            _ => format!(
+              "Experiment exp_{id} finished: {winner} wins ({metric_name} {:+.0}% vs baseline; current {:.2}%, baseline {:.2}%).",
+              uplift * 100.0,
+              current_metric * 100.0,
+              baseline_metric * 100.0
+            ),
+          };
+          if let Some(err) = rollback_err.as_deref() {
+            msg.push_str(&format!(" Rollback failed: {err}"));
+          }
+
+          tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
+
+          let severity = if rollback_err.is_some() { "error" } else { "info" };
+          let _ = upsert_alert(
+            pool,
+            tenant_id,
+            channel_id,
+            &format!("exp_{id}_result"),
+            "Experiment result",
+            severity,
+            &msg,
+          )
+          .await;
+        } else {
+          tx.rollback().await.map_err(|e| -> Error { Box::new(e) })?;
+        }
+      }
+    }
+  }
+
+  Ok(())
 }
 
 fn youtube_reporting_created_after_rfc3339(
@@ -865,7 +1363,7 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
 
         if needs_refresh {
           if let Some(refresh) = tokens.refresh_token.clone() {
-            let app = fetch_youtube_oauth_app_config(pool, tenant_id)
+            let app = fetch_or_seed_youtube_oauth_app_config(pool, tenant_id)
               .await?
               .ok_or_else(|| Box::new(std::io::Error::other("missing youtube oauth app config")) as Error)?;
             let client_secret = app
@@ -885,11 +1383,11 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
           }
         }
 
-        let metrics = match fetch_video_daily_metrics(&tokens.access_token, start_dt, end_dt).await {
+        let metrics = match fetch_video_daily_metrics_for_channel(&tokens.access_token, channel_id, start_dt, end_dt).await {
           Ok(rows) => rows,
           Err(err) if err.status == Some(401) => {
             if let Some(refresh) = tokens.refresh_token.clone() {
-              let app = fetch_youtube_oauth_app_config(pool, tenant_id)
+              let app = fetch_or_seed_youtube_oauth_app_config(pool, tenant_id)
                 .await?
                 .ok_or_else(|| Box::new(std::io::Error::other("missing youtube oauth app config")) as Error)?;
               let client_secret = app
@@ -906,7 +1404,7 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
               update_youtube_connection_tokens(pool, tenant_id, channel_id, &refreshed).await?;
               tokens.access_token = refreshed.access_token;
 
-              fetch_video_daily_metrics(&tokens.access_token, start_dt, end_dt)
+              fetch_video_daily_metrics_for_channel(&tokens.access_token, channel_id, start_dt, end_dt)
                 .await
                 .map_err(youtube_analytics_error_to_vercel_error)?
             } else {
@@ -1027,6 +1525,21 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
           .await?;
         }
 
+        if let Err(err) = evaluate_running_experiments_for_channel(
+          pool,
+          tenant_id,
+          channel_id,
+          &tokens.access_token,
+          run_for_dt,
+        )
+        .await
+        {
+          eprintln!(
+            "daily_channel: evaluate_running_experiments_for_channel error: {}",
+            err
+          );
+        }
+
         Ok(())
       }
       "weekly_channel" => {
@@ -1082,7 +1595,7 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
             .unwrap_or(false);
         if needs_refresh {
           if let Some(refresh) = tokens.refresh_token.clone() {
-            let app = fetch_youtube_oauth_app_config(pool, tenant_id)
+            let app = fetch_or_seed_youtube_oauth_app_config(pool, tenant_id)
               .await?
               .ok_or_else(|| Box::new(std::io::Error::other("missing youtube oauth app config")) as Error)?;
             let client_secret = app
@@ -1271,7 +1784,7 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
             .unwrap_or(false);
           if needs_refresh {
             if let Some(refresh) = tokens.refresh_token.clone() {
-              let app = fetch_youtube_oauth_app_config(pool, tenant_id)
+              let app = fetch_or_seed_youtube_oauth_app_config(pool, tenant_id)
                 .await?
                 .ok_or_else(|| Box::new(std::io::Error::other("missing youtube oauth app config")) as Error)?;
               let client_secret = app

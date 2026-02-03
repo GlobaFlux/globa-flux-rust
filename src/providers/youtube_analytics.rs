@@ -35,24 +35,65 @@ impl std::fmt::Display for YoutubeAnalyticsError {
 
 impl std::error::Error for YoutubeAnalyticsError {}
 
-pub fn build_reports_url(base_url: &str, start_dt: NaiveDate, end_dt: NaiveDate) -> String {
+fn build_reports_url_with_ids(
+  base_url: &str,
+  ids_value: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+) -> String {
   let base = base_url.trim_end_matches('/');
   format!(
     // Note: YouTube Analytics API v2 does not support an `impressions` metric for this report on all projects,
     // and will return `Unknown identifier (impressions) given in field parameters.metrics.`.
     // Keep the schema column but request only stable metrics here.
-    "{base}/v2/reports?ids=channel==MINE&startDate={}&endDate={}&metrics=estimatedRevenue,views&dimensions=day,video&sort=day&maxResults=200",
+    "{base}/v2/reports?ids={ids_value}&startDate={}&endDate={}&metrics=estimatedRevenue,views&dimensions=day,video&sort=day&maxResults=200",
+    start_dt,
+    end_dt
+  )
+}
+
+pub fn build_reports_url(base_url: &str, start_dt: NaiveDate, end_dt: NaiveDate) -> String {
+  build_reports_url_with_ids(base_url, "channel==MINE", start_dt, end_dt)
+}
+
+pub fn build_reports_url_for_channel(
+  base_url: &str,
+  channel_id: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+) -> String {
+  build_reports_url_with_ids(base_url, &format!("channel=={}", channel_id.trim()), start_dt, end_dt)
+}
+
+fn build_channel_reports_url_with_ids(
+  base_url: &str,
+  ids_value: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+) -> String {
+  let base = base_url.trim_end_matches('/');
+  format!(
+    "{base}/v2/reports?ids={ids_value}&startDate={}&endDate={}&metrics=estimatedRevenue,views&dimensions=day&sort=day&maxResults=200",
     start_dt,
     end_dt
   )
 }
 
 fn build_channel_reports_url(base_url: &str, start_dt: NaiveDate, end_dt: NaiveDate) -> String {
-  let base = base_url.trim_end_matches('/');
-  format!(
-    "{base}/v2/reports?ids=channel==MINE&startDate={}&endDate={}&metrics=estimatedRevenue,views&dimensions=day&sort=day&maxResults=200",
+  build_channel_reports_url_with_ids(base_url, "channel==MINE", start_dt, end_dt)
+}
+
+fn build_channel_reports_url_for_channel(
+  base_url: &str,
+  channel_id: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+) -> String {
+  build_channel_reports_url_with_ids(
+    base_url,
+    &format!("channel=={}", channel_id.trim()),
     start_dt,
-    end_dt
+    end_dt,
   )
 }
 
@@ -278,6 +319,51 @@ async fn fetch_report_json_by_url(access_token: &str, url: &str) -> Result<Value
   })
 }
 
+async fn fetch_video_daily_metrics_for_channel_with_base_url(
+  access_token: &str,
+  base_url: &str,
+  channel_id: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+) -> Result<Vec<VideoDailyMetricRow>, YoutubeAnalyticsError> {
+  let channel_id = channel_id.trim();
+  if channel_id.is_empty() {
+    return Err(YoutubeAnalyticsError {
+      status: None,
+      message: "missing channel_id".to_string(),
+    });
+  }
+
+  // Prefer video-level report. Some channels/projects return 0 rows for `dimensions=day,video`,
+  // so we fall back to day-level aggregation to at least populate the pipeline.
+  let video_url = build_reports_url_for_channel(base_url, channel_id, start_dt, end_dt);
+  let json = fetch_report_json_by_url(access_token, &video_url).await?;
+  let rows = parse_rows(&json);
+  if !rows.is_empty() {
+    return Ok(rows);
+  }
+
+  let channel_url = build_channel_reports_url_for_channel(base_url, channel_id, start_dt, end_dt);
+  let json = fetch_report_json_by_url(access_token, &channel_url).await?;
+  Ok(parse_rows_channel(&json))
+}
+
+pub async fn fetch_video_daily_metrics_for_channel(
+  access_token: &str,
+  channel_id: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+) -> Result<Vec<VideoDailyMetricRow>, YoutubeAnalyticsError> {
+  fetch_video_daily_metrics_for_channel_with_base_url(
+    access_token,
+    "https://youtubeanalytics.googleapis.com/",
+    channel_id,
+    start_dt,
+    end_dt,
+  )
+  .await
+}
+
 pub async fn fetch_video_daily_metrics_with_base_url(
   access_token: &str,
   base_url: &str,
@@ -345,6 +431,21 @@ mod tests {
     assert!(url.contains("endDate=2026-01-07"));
     assert!(url.contains("metrics=estimatedRevenue,views"));
     assert!(url.contains("dimensions=day&"));
+  }
+
+  #[test]
+  fn build_reports_url_for_channel_includes_channel_id() {
+    let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
+    let url = build_reports_url_for_channel(
+      "https://youtubeanalytics.googleapis.com/",
+      "UC123",
+      start_dt,
+      end_dt,
+    );
+
+    assert!(url.contains("ids=channel==UC123"));
+    assert!(url.contains("dimensions=day,video"));
   }
 
   #[test]

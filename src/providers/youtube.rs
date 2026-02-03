@@ -76,6 +76,12 @@ pub fn build_authorize_url(client: &YoutubeOAuthClient, state: Option<String>) -
       "https://www.googleapis.com/auth/youtube.readonly".to_string(),
     ))
     .add_scope(Scope::new(
+      "https://www.googleapis.com/auth/youtube.force-ssl".to_string(),
+    ))
+    .add_scope(Scope::new(
+      "https://www.googleapis.com/auth/youtube.upload".to_string(),
+    ))
+    .add_scope(Scope::new(
       "https://www.googleapis.com/auth/yt-analytics.readonly".to_string(),
     ))
     .add_scope(Scope::new(
@@ -158,6 +164,8 @@ mod tests {
     let (url, state) = build_authorize_url(&client, Some("state123".to_string()));
     assert!(url.contains("accounts.google.com/o/oauth2/v2/auth"));
     assert!(url.contains("scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube.readonly"));
+    assert!(url.contains("youtube.force-ssl"));
+    assert!(url.contains("youtube.upload"));
     assert!(url.contains("yt-analytics.readonly"));
     assert!(url.contains("yt-analytics-monetary.readonly"));
     assert!(url.contains("youtubepartner"));

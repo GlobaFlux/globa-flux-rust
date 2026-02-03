@@ -30,6 +30,10 @@
       "destination": "/api/oauth/youtube/router?action=exchange"
     },
     {
+      "source": "/api/oauth/youtube/set_active_channel",
+      "destination": "/api/oauth/youtube/router?action=set_active_channel"
+    },
+    {
       "source": "/api/oauth/youtube/status",
       "destination": "/api/oauth/youtube/router?action=status"
     },
@@ -40,6 +44,38 @@
     {
       "source": "/api/oauth/youtube/content_owner/discover",
       "destination": "/api/oauth/youtube/router?action=content_owner_discover"
+    },
+    {
+      "source": "/api/youtube/metrics/daily",
+      "destination": "/api/oauth/youtube/router?action=youtube_metrics_daily"
+    },
+    {
+      "source": "/api/youtube/sponsor_quote_defaults",
+      "destination": "/api/oauth/youtube/router?action=youtube_sponsor_quote_defaults"
+    },
+    {
+      "source": "/api/youtube/sponsor_quote",
+      "destination": "/api/oauth/youtube/router?action=youtube_sponsor_quote"
+    },
+    {
+      "source": "/api/youtube/uploads",
+      "destination": "/api/oauth/youtube/router?action=youtube_uploads_list"
+    },
+    {
+      "source": "/api/youtube/uploads/csv",
+      "destination": "/api/oauth/youtube/router?action=youtube_upload_csv"
+    },
+    {
+      "source": "/api/youtube/alerts",
+      "destination": "/api/oauth/youtube/router?action=youtube_alerts"
+    },
+    {
+      "source": "/api/youtube/experiments",
+      "destination": "/api/oauth/youtube/router?action=youtube_experiments"
+    },
+    {
+      "source": "/api/youtube/experiments/:id",
+      "destination": "/api/oauth/youtube/router?action=youtube_experiment_get&id=:id"
     },
     {
       "source": "/api/billing/subscription/status",
