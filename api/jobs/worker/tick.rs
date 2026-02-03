@@ -942,9 +942,15 @@ async fn handle_dispatch(
     );
   }
 
-  let parsed: DispatchRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
-    Box::new(std::io::Error::other(format!("invalid json body: {e}")))
-  })?;
+  let parsed: DispatchRequest = match serde_json::from_slice(&body) {
+    Ok(v) => v,
+    Err(e) => {
+      return json_response(
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({"ok": false, "error": "bad_request", "message": format!("invalid json body: {e}")}),
+      );
+    }
+  };
 
   if parsed.now_ms <= 0 {
     return json_response(
@@ -992,7 +998,7 @@ async fn handle_dispatch(
         ON DUPLICATE KEY UPDATE
           updated_at = CURRENT_TIMESTAMP(3),
           run_after = CASE
-            WHEN status IN ('pending','retrying') THEN LEAST(run_after, VALUES(run_after))
+            WHEN status IN ('pending','retrying') THEN ?
             ELSE run_after
           END;
       "#,
@@ -1002,6 +1008,7 @@ async fn handle_dispatch(
     .bind(channel_id)
     .bind(run_for_dt)
     .bind(dedupe_key)
+    .bind(now)
     .bind(now)
     .execute(pool)
     .await
@@ -1045,9 +1052,15 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
     );
   }
 
-  let parsed: TickRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
-    Box::new(std::io::Error::other(format!("invalid json body: {e}")))
-  })?;
+  let parsed: TickRequest = match serde_json::from_slice(&body) {
+    Ok(v) => v,
+    Err(e) => {
+      return json_response(
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({"ok": false, "error": "bad_request", "message": format!("invalid json body: {e}")}),
+      );
+    }
+  };
 
   if parsed.now_ms <= 0 {
     return json_response(
@@ -2100,7 +2113,7 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
 
 async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
   let action = query_value(req.uri().query(), "action").unwrap_or("tick");
-  match action {
+  let result = match action {
     "dispatch" => {
       let schedule = DispatchSchedule::from_query(req.uri().query());
       let method = req.method().clone();
@@ -2118,6 +2131,17 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
       StatusCode::NOT_FOUND,
       serde_json::json!({"ok": false, "error": "not_found"}),
     ),
+  };
+
+  match result {
+    Ok(resp) => Ok(resp),
+    Err(err) => {
+      let message = truncate_string(&err.to_string(), 2000);
+      json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"ok": false, "error": "internal_error", "message": message}),
+      )
+    }
   }
 }
 
