@@ -4,7 +4,7 @@ use hyper::{HeaderMap, Method, StatusCode, Uri};
 use serde::Deserialize;
 use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 
 use globa_flux_rust::db::{
   fetch_youtube_channel_id,
@@ -1418,7 +1418,7 @@ async fn handle_youtube_uploads_list(
     );
   }
 
-  let rows = sqlx::query_as::<_, (i64, String, String, chrono::NaiveDateTime)>(
+  let rows = sqlx::query_as::<_, (i64, String, String, DateTime<Utc>)>(
     r#"
       SELECT id, filename, status, created_at
       FROM yt_csv_uploads
@@ -1440,7 +1440,7 @@ async fn handle_youtube_uploads_list(
       id: format!("upload_{id}"),
       filename,
       channel_id: channel_id.clone(),
-      created_at: created_at.and_utc().to_rfc3339(),
+      created_at: created_at.to_rfc3339(),
       status,
     })
     .collect();
@@ -2057,7 +2057,7 @@ async fn handle_youtube_alerts(method: &Method, headers: &HeaderMap, uri: &Uri, 
       Err(err) => Some(truncate_string(&err.to_string(), 2000)),
     };
 
-    let rows = match sqlx::query_as::<_, (i64, String, String, String, chrono::NaiveDateTime, Option<chrono::NaiveDateTime>)>(
+    let rows = match sqlx::query_as::<_, (i64, String, String, String, DateTime<Utc>, Option<DateTime<Utc>>)>(
         r#"
           SELECT id, kind, severity, message, detected_at, resolved_at
           FROM yt_alerts
@@ -2093,8 +2093,8 @@ async fn handle_youtube_alerts(method: &Method, headers: &HeaderMap, uri: &Uri, 
         kind,
         severity,
         message,
-        detected_at: detected_at.and_utc().to_rfc3339(),
-        resolved_at: resolved_at.map(|dt| dt.and_utc().to_rfc3339()),
+        detected_at: detected_at.to_rfc3339(),
+        resolved_at: resolved_at.map(|dt| dt.to_rfc3339()),
       })
       .collect();
 
@@ -2406,7 +2406,7 @@ async fn handle_youtube_experiment_get(
   };
 
   let pool = get_pool().await?;
-  let row = sqlx::query_as::<_, (i64, String, String, String, String, Option<f64>, Option<i64>, Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>)>(
+  let row = sqlx::query_as::<_, (i64, String, String, String, String, Option<f64>, Option<i64>, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
     r#"
       SELECT id, channel_id, type, state, video_ids_json,
              stop_loss_pct, planned_duration_days,
@@ -2433,12 +2433,12 @@ async fn handle_youtube_experiment_get(
   let mut variants = fetch_experiment_variants(pool, id).await?;
 
   if let Some(started_at) = started_at {
-    let start_dt = started_at.date();
+    let start_dt = started_at.date_naive();
     let baseline_start_dt = start_dt - Duration::days(7);
     let baseline_end_dt = start_dt - Duration::days(1);
 
     let last_complete_dt = Utc::now().date_naive() - Duration::days(1);
-    let ended_dt = ended_at.map(|dt| dt.date());
+    let ended_dt = ended_at.map(|dt| dt.date_naive());
     let current_end_dt = ended_dt.unwrap_or(last_complete_dt).min(last_complete_dt);
 
     let baseline =
@@ -2458,8 +2458,8 @@ async fn handle_youtube_experiment_get(
     state,
     stop_loss_pct,
     planned_duration_days,
-    started_at: started_at.map(|dt| dt.and_utc().to_rfc3339()),
-    ended_at: ended_at.map(|dt| dt.and_utc().to_rfc3339()),
+    started_at: started_at.map(|dt| dt.to_rfc3339()),
+    ended_at: ended_at.map(|dt| dt.to_rfc3339()),
     variants: if variants.is_empty() { None } else { Some(variants) },
   };
 
@@ -2551,7 +2551,7 @@ async fn handle_youtube_experiments(
       );
     }
 
-    let rows = sqlx::query_as::<_, (i64, String, String, String, String, Option<f64>, Option<i64>, Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>)>(
+    let rows = sqlx::query_as::<_, (i64, String, String, String, String, Option<f64>, Option<i64>, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
       r#"
         SELECT id, channel_id, type, state, video_ids_json,
                stop_loss_pct, planned_duration_days,
@@ -2577,11 +2577,11 @@ async fn handle_youtube_experiments(
       let mut variants = fetch_experiment_variants(pool, id).await?;
 
       if let Some(started_at) = started_at {
-        let start_dt = started_at.date();
+        let start_dt = started_at.date_naive();
         let baseline_start_dt = start_dt - Duration::days(7);
         let baseline_end_dt = start_dt - Duration::days(1);
 
-        let ended_dt = ended_at.map(|dt| dt.date());
+        let ended_dt = ended_at.map(|dt| dt.date_naive());
         let current_end_dt = ended_dt.unwrap_or(last_complete_dt).min(last_complete_dt);
 
         let baseline = aggregate_metrics_for_videos(
@@ -2613,8 +2613,8 @@ async fn handle_youtube_experiments(
         state,
         stop_loss_pct,
         planned_duration_days,
-        started_at: started_at.map(|dt| dt.and_utc().to_rfc3339()),
-        ended_at: ended_at.map(|dt| dt.and_utc().to_rfc3339()),
+        started_at: started_at.map(|dt| dt.to_rfc3339()),
+        ended_at: ended_at.map(|dt| dt.to_rfc3339()),
         variants: if variants.is_empty() { None } else { Some(variants) },
       });
     }
