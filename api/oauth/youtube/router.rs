@@ -54,6 +54,20 @@ fn has_tidb_url() -> bool {
     .unwrap_or(false)
 }
 
+fn truncate_string(value: &str, max_chars: usize) -> String {
+  if max_chars == 0 {
+    return String::new();
+  }
+  let mut out = String::new();
+  for (idx, ch) in value.chars().enumerate() {
+    if idx >= max_chars {
+      break;
+    }
+    out.push(ch);
+  }
+  out
+}
+
 fn now_ms() -> i64 {
   use std::time::{SystemTime, UNIX_EPOCH};
   SystemTime::now()
@@ -3203,7 +3217,7 @@ async fn handle_youtube_experiments(
 async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
   let action = get_query_param(req.uri(), "action").unwrap_or_default();
 
-  match action.as_str() {
+  let result = match action.as_str() {
     "status" => handle_status(req.method(), req.headers(), req.uri()).await,
     "start" => {
       let method = req.method().clone();
@@ -3291,6 +3305,17 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
       StatusCode::NOT_FOUND,
       serde_json::json!({"ok": false, "error": "not_found"}),
     ),
+  };
+
+  match result {
+    Ok(resp) => Ok(resp),
+    Err(err) => {
+      let message = truncate_string(&err.to_string(), 2000);
+      json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"ok": false, "error": "internal_error", "action": action, "message": message}),
+      )
+    }
   }
 }
 
