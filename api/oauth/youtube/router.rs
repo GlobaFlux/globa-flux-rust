@@ -27,7 +27,7 @@ use globa_flux_rust::providers::youtube::{
 use globa_flux_rust::providers::youtube_analytics::{
   fetch_video_daily_metrics_for_channel, youtube_analytics_error_to_vercel_error,
 };
-use globa_flux_rust::providers::youtube_api::fetch_my_channel_id;
+use globa_flux_rust::providers::youtube_api::{fetch_my_channel_id, list_my_channels};
 use globa_flux_rust::providers::youtube_videos::{
   fetch_video_snapshot, set_video_thumbnail_from_url, update_video_publish_at, update_video_title,
 };
@@ -644,6 +644,107 @@ async fn handle_status(method: &Method, headers: &HeaderMap, uri: &Uri) -> Resul
   json_response(
     StatusCode::OK,
     serde_json::json!({"ok": true, "connected": connected, "channel_id": channel_id, "content_owner_id": content_owner_id}),
+  )
+}
+
+async fn handle_youtube_channels_mine(method: &Method, headers: &HeaderMap, uri: &Uri) -> Result<Response<ResponseBody>, Error> {
+  if method != Method::GET {
+    return json_response(
+      StatusCode::METHOD_NOT_ALLOWED,
+      serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+    );
+  }
+
+  let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+  let provided = bearer_token(
+    headers
+      .get("authorization")
+      .and_then(|v| v.to_str().ok()),
+  )
+  .unwrap_or("");
+
+  if expected.is_empty() || provided != expected {
+    return json_response(
+      StatusCode::UNAUTHORIZED,
+      serde_json::json!({"ok": false, "error": "unauthorized"}),
+    );
+  }
+
+  let tenant_id = get_query_param(uri, "tenant_id").unwrap_or_default();
+  if tenant_id.is_empty() {
+    return json_response(
+      StatusCode::BAD_REQUEST,
+      serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+    );
+  }
+
+  if !has_tidb_url() {
+    return json_response(
+      StatusCode::NOT_IMPLEMENTED,
+      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+    );
+  }
+
+  let pool = get_pool().await?;
+  let channel_id = fetch_youtube_channel_id(pool, &tenant_id).await?;
+  let Some(channel_id) = channel_id else {
+    return json_response(
+      StatusCode::NOT_FOUND,
+      serde_json::json!({"ok": false, "error": "not_connected", "message": "No YouTube channel connection found for this tenant"}),
+    );
+  };
+
+  let mut tokens = fetch_youtube_connection_tokens(pool, &tenant_id, &channel_id)
+    .await?
+    .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+
+  // Proactive refresh if expired (best-effort).
+  let needs_refresh = tokens
+    .expires_at
+    .map(|dt| dt <= chrono::Utc::now())
+    .unwrap_or(false);
+  if needs_refresh {
+    if let Some(refresh) = tokens.refresh_token.clone() {
+      let app = fetch_or_seed_youtube_oauth_app_config(pool, &tenant_id).await?;
+      let Some(app) = app else {
+        return json_response(
+          StatusCode::NOT_FOUND,
+          serde_json::json!({
+            "ok": false,
+            "error": "not_configured",
+            "message": "Missing YouTube OAuth app config for tenant. Configure via /api/oauth/youtube/app_config or set YOUTUBE_CLIENT_ID/YOUTUBE_CLIENT_SECRET/YOUTUBE_REDIRECT_URI on the Rust backend."
+          }),
+        );
+      };
+      let Some(client_secret) = app.client_secret.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return json_response(
+          StatusCode::NOT_FOUND,
+          serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing YouTube OAuth client_secret for tenant"}),
+        );
+      };
+
+      let (client, _redirect) =
+        youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
+      let refreshed = refresh_tokens(&client, &refresh).await?;
+      update_youtube_connection_tokens(pool, &tenant_id, &channel_id, &refreshed).await?;
+      tokens.access_token = refreshed.access_token;
+      tokens.refresh_token = refreshed.refresh_token.or(Some(refresh));
+    }
+  }
+
+  let items = match list_my_channels(&tokens.access_token).await {
+    Ok(items) => items,
+    Err(err) => {
+      return json_response(
+        StatusCode::BAD_GATEWAY,
+        serde_json::json!({"ok": false, "error": "youtube_api_error", "message": err.to_string()}),
+      );
+    }
+  };
+
+  json_response(
+    StatusCode::OK,
+    serde_json::json!({"ok": true, "active_channel_id": channel_id, "items": items}),
   )
 }
 
@@ -3271,6 +3372,7 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
       let bytes = req.into_body().collect().await?.to_bytes();
       handle_set_active_channel(&method, &headers, bytes).await
     }
+    "youtube_channels_mine" => handle_youtube_channels_mine(req.method(), req.headers(), req.uri()).await,
     "youtube_metrics_daily" => handle_youtube_metrics_daily(req.method(), req.headers(), req.uri()).await,
     "youtube_sponsor_quote_defaults" => {
       let method = req.method().clone();

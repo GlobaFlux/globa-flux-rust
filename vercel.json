@@ -50,6 +50,10 @@
       "destination": "/api/oauth/youtube/router?action=youtube_metrics_daily"
     },
     {
+      "source": "/api/youtube/channels",
+      "destination": "/api/oauth/youtube/router?action=youtube_channels_mine"
+    },
+    {
       "source": "/api/youtube/sponsor_quote_defaults",
       "destination": "/api/oauth/youtube/router?action=youtube_sponsor_quote_defaults"
     },
