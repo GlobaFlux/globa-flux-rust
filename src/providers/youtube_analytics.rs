@@ -44,6 +44,14 @@ fn is_query_not_supported(err: &YoutubeAnalyticsError) -> bool {
       || msg.contains("Unknown dimension"))
 }
 
+fn is_forbidden(err: &YoutubeAnalyticsError) -> bool {
+  err.status == Some(403)
+}
+
+fn should_fallback_to_views_only(err: &YoutubeAnalyticsError) -> bool {
+  is_query_not_supported(err) || is_forbidden(err)
+}
+
 fn build_reports_url_with_ids_and_metrics(
   base_url: &str,
   ids_value: &str,
@@ -379,11 +387,11 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
   let video_url = build_reports_url_with_ids(base_url, ids_value, start_dt, end_dt);
   let rows = match fetch_report_json_by_url(access_token, &video_url).await {
     Ok(json) => parse_rows(&json),
-    Err(err) if is_query_not_supported(&err) => {
+    Err(err) if should_fallback_to_views_only(&err) => {
       let video_url = build_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
       match fetch_report_json_by_url(access_token, &video_url).await {
         Ok(json) => parse_rows(&json),
-        Err(err) if is_query_not_supported(&err) => vec![],
+        Err(err) if should_fallback_to_views_only(&err) => vec![],
         Err(err) => return Err(err),
       }
     }
@@ -396,7 +404,7 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
   let channel_url = build_channel_reports_url_with_ids(base_url, ids_value, start_dt, end_dt);
   match fetch_report_json_by_url(access_token, &channel_url).await {
     Ok(json) => Ok(parse_rows_channel(&json)),
-    Err(err) if is_query_not_supported(&err) => {
+    Err(err) if should_fallback_to_views_only(&err) => {
       let channel_url = build_channel_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
       let json = fetch_report_json_by_url(access_token, &channel_url).await?;
       Ok(parse_rows_channel(&json))
@@ -650,6 +658,109 @@ mod tests {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
     assert_eq!(rows[0].video_id, "vid1");
+    assert_eq!(rows[0].views, 200);
+
+    task.await.unwrap();
+  }
+
+  async fn serve_reports_forbidden(listener: TcpListener, max_connections: usize) {
+    for _ in 0..max_connections {
+      let (stream, _) = listener.accept().await.unwrap();
+      let io = TokioIo::new(stream);
+      http1::Builder::new()
+        .serve_connection(
+          io,
+          service_fn(|req: Request<Incoming>| async move {
+            let query = req.uri().query().unwrap_or("");
+
+            // Video-level request succeeds but returns no rows (forces channel-level fallback).
+            if query.contains("dimensions=day,video") && query.contains("metrics=estimatedRevenue,views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"video","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"estimatedRevenue","columnType":"METRIC","dataType":"FLOAT"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": []
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            // Channel-level request with revenue is forbidden.
+            if query.contains("dimensions=day") && query.contains("metrics=estimatedRevenue,views") {
+              let body = r#"{ "error": { "code": 403, "message": "Forbidden", "errors": [ { "message": "Forbidden", "domain": "global", "reason": "forbidden" } ] } }"#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::FORBIDDEN)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            // Views-only channel report works.
+            if query.contains("dimensions=day") && query.contains("metrics=views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": [
+                    ["2026-01-02", 200]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            Ok::<_, hyper::Error>(
+              Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from_static(b"not found")))
+                .unwrap(),
+            )
+          }),
+        )
+        .await
+        .unwrap();
+    }
+  }
+
+  #[tokio::test]
+  async fn falls_back_to_views_only_channel_report_when_forbidden() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}/", addr);
+
+    let task = tokio::spawn(serve_reports_forbidden(listener, 3));
+
+    let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
+    let rows =
+      fetch_video_daily_metrics_for_channel_with_base_url("token123", &base_url, "UC123", start_dt, end_dt)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    assert_eq!(rows[0].video_id, FALLBACK_CHANNEL_VIDEO_ID);
+    assert_eq!(rows[0].estimated_revenue_usd, 0.0);
     assert_eq!(rows[0].views, 200);
 
     task.await.unwrap();
