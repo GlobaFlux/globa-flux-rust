@@ -1186,225 +1186,212 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
   let mut succeeded = 0usize;
   let mut retried = 0usize;
   let mut dead = 0usize;
+  let mut last_error: Option<String> = None;
 
   for (id, tenant_id, job_type, channel_id, run_for_dt, attempt, max_attempt) in claimed.iter() {
     let attempt_next = attempt.saturating_add(1);
 
     let result: Result<(), Error> = match job_type.as_str() {
       "geo_monitor_prompt" => {
-        let run_for_dt = run_for_dt.ok_or_else(|| {
-          Box::new(std::io::Error::other("geo_monitor_prompt task missing run_for_dt")) as Error
-        })?;
+        (|| async {
+          let run_for_dt = run_for_dt.ok_or_else(|| {
+            Box::new(std::io::Error::other("geo_monitor_prompt task missing run_for_dt")) as Error
+          })?;
 
-        let mut parts = channel_id.split(':');
-        let project_id: i64 = parts
-          .next()
-          .unwrap_or("")
-          .parse()
-          .map_err(|_| Box::new(std::io::Error::other("geo_monitor_prompt invalid project_id")) as Error)?;
-        let prompt_id: i64 = parts
-          .next()
-          .unwrap_or("")
-          .parse()
-          .map_err(|_| Box::new(std::io::Error::other("geo_monitor_prompt invalid prompt_id")) as Error)?;
+          let mut parts = channel_id.split(':');
+          let project_id: i64 = parts
+            .next()
+            .unwrap_or("")
+            .parse()
+            .map_err(|_| Box::new(std::io::Error::other("geo_monitor_prompt invalid project_id")) as Error)?;
+          let prompt_id: i64 = parts
+            .next()
+            .unwrap_or("")
+            .parse()
+            .map_err(|_| Box::new(std::io::Error::other("geo_monitor_prompt invalid prompt_id")) as Error)?;
 
-        let project = fetch_geo_monitor_project(pool, tenant_id, project_id)
-          .await?
-          .ok_or_else(|| Box::new(std::io::Error::other("missing geo monitor project")) as Error)?;
-        let prompt = fetch_geo_monitor_prompt(pool, tenant_id, project_id, prompt_id)
-          .await?
-          .ok_or_else(|| Box::new(std::io::Error::other("missing geo monitor prompt")) as Error)?;
+          let project = fetch_geo_monitor_project(pool, tenant_id, project_id)
+            .await?
+            .ok_or_else(|| Box::new(std::io::Error::other("missing geo monitor project")) as Error)?;
+          let prompt = fetch_geo_monitor_prompt(pool, tenant_id, project_id, prompt_id)
+            .await?
+            .ok_or_else(|| Box::new(std::io::Error::other("missing geo monitor prompt")) as Error)?;
 
-        let prompt_total: i32 = sqlx::query_scalar(
-          r#"
-            SELECT COUNT(*) FROM geo_monitor_prompts
-            WHERE tenant_id = ? AND project_id = ? AND enabled = 1;
-          "#,
-        )
-        .bind(tenant_id)
-        .bind(project_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| -> Error { Box::new(e) })?;
+          let prompt_total: i32 = sqlx::query_scalar(
+            r#"
+              SELECT COUNT(*) FROM geo_monitor_prompts
+              WHERE tenant_id = ? AND project_id = ? AND enabled = 1;
+            "#,
+          )
+          .bind(tenant_id)
+          .bind(project_id)
+          .fetch_one(pool)
+          .await
+          .map_err(|e| -> Error { Box::new(e) })?;
 
-        let mut gemini_cfg = GeminiConfig::from_env_optional()?
-          .ok_or_else(|| Box::new(std::io::Error::other("Missing GEMINI_API_KEY")) as Error)?;
+          let mut gemini_cfg = GeminiConfig::from_env_optional()?
+            .ok_or_else(|| Box::new(std::io::Error::other("Missing GEMINI_API_KEY")) as Error)?;
 
-        let db_model = fetch_tenant_gemini_model(pool, GLOBAL_TENANT_ID).await?;
-        let model = db_model
-          .as_deref()
-          .map(str::trim)
-          .filter(|v| !v.is_empty())
-          .ok_or_else(|| Box::new(std::io::Error::other("Missing gemini_model for tenant_id=global")) as Error)?;
+          let db_model = fetch_tenant_gemini_model(pool, GLOBAL_TENANT_ID).await?;
+          let model = db_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+              Box::new(std::io::Error::other("Missing gemini_model for tenant_id=global")) as Error
+            })?;
 
-        gemini_cfg.model = model.to_string();
+          gemini_cfg.model = model.to_string();
 
-        let run = ensure_geo_monitor_run(
-          pool,
-          tenant_id,
-          project_id,
-          run_for_dt,
-          "gemini",
-          model,
-          prompt_total,
-        )
-        .await?;
+          let run = ensure_geo_monitor_run(
+            pool,
+            tenant_id,
+            project_id,
+            run_for_dt,
+            "gemini",
+            model,
+            prompt_total,
+          )
+          .await?;
 
-        let aliases = parse_string_list_json(project.brand_aliases_json.as_deref());
-        let needles = normalize_aliases(&project.name, aliases.as_slice());
+          let aliases = parse_string_list_json(project.brand_aliases_json.as_deref());
+          let needles = normalize_aliases(&project.name, aliases.as_slice());
 
-        let system = "You are a helpful assistant.";
-        let temperature = 0.2;
-        let max_output_tokens: u32 = 1024;
+          let system = "You are a helpful assistant.";
+          let temperature = 0.2;
+          let max_output_tokens: u32 = 1024;
 
-        let idempotency_key =
-          format!("{tenant_id}:geo_monitor_prompt:{project_id}:{run_for_dt}:{prompt_id}");
+          let idempotency_key =
+            format!("{tenant_id}:geo_monitor_prompt:{project_id}:{run_for_dt}:{prompt_id}");
 
-        let provider = "gemini";
-        let pricing = gemini_pricing_for_model(model);
+          let provider = "gemini";
+          let pricing = gemini_pricing_for_model(model);
 
-        match gemini_generate_text(
-          &gemini_cfg,
-          system,
-          &prompt.prompt_text,
-          temperature,
-          max_output_tokens,
-        )
-        .await
-        {
-          Ok((text, usage)) => {
-            let presence = contains_any_case_insensitive(&text, needles.as_slice());
-            let rank = extract_rank_from_markdown_list(&text, needles.as_slice());
+          match gemini_generate_text(
+            &gemini_cfg,
+            system,
+            &prompt.prompt_text,
+            temperature,
+            max_output_tokens,
+          )
+          .await
+          {
+            Ok((text, usage)) => {
+              let presence = contains_any_case_insensitive(&text, needles.as_slice());
+              let rank = extract_rank_from_markdown_list(&text, needles.as_slice());
 
-            let (prompt_tokens, completion_tokens, cost_usd) = if let (Some(u), Some(p)) = (usage, pricing) {
-              let cost = compute_cost_usd(p, u.prompt_tokens as u32, u.completion_tokens as u32);
-              (u.prompt_tokens, u.completion_tokens, cost)
-            } else {
-              (0, 0, 0.0)
-            };
+              let (prompt_tokens, completion_tokens, cost_usd) = if let (Some(u), Some(p)) = (usage, pricing) {
+                let cost = compute_cost_usd(p, u.prompt_tokens as u32, u.completion_tokens as u32);
+                (u.prompt_tokens, u.completion_tokens, cost)
+              } else {
+                (0, 0, 0.0)
+              };
 
-            if prompt_tokens > 0 || completion_tokens > 0 {
-              if let Err(err) = insert_usage_event(
-                pool,
-                tenant_id,
-                "geo_monitor_prompt",
-                &idempotency_key,
-                provider,
-                model,
-                prompt_tokens,
-                completion_tokens,
-                cost_usd,
-              )
-              .await
-              {
-                if err
-                  .as_database_error()
-                  .is_some_and(|e| e.is_unique_violation())
+              if prompt_tokens > 0 || completion_tokens > 0 {
+                if let Err(err) = insert_usage_event(
+                  pool,
+                  tenant_id,
+                  "geo_monitor_prompt",
+                  &idempotency_key,
+                  provider,
+                  model,
+                  prompt_tokens,
+                  completion_tokens,
+                  cost_usd,
+                )
+                .await
                 {
-                  // idempotent replay: ignore
-                } else {
-                  return Err(Box::new(err) as Error);
+                  if err
+                    .as_database_error()
+                    .is_some_and(|e| e.is_unique_violation())
+                  {
+                    // idempotent replay: ignore
+                  } else {
+                    return Err(Box::new(err) as Error);
+                  }
                 }
               }
+
+              let _ = insert_geo_monitor_run_result(
+                pool,
+                tenant_id,
+                project_id,
+                run_for_dt,
+                run.id,
+                prompt_id,
+                &prompt.prompt_text,
+                Some(&text),
+                presence,
+                rank,
+                cost_usd,
+                None,
+              )
+              .await?;
+              let _ = finalize_geo_monitor_run_if_complete(pool, run.id).await?;
+
+              Ok(())
             }
-
-            let _ = insert_geo_monitor_run_result(
-              pool,
-              tenant_id,
-              project_id,
-              run_for_dt,
-              run.id,
-              prompt_id,
-              &prompt.prompt_text,
-              Some(&text),
-              presence,
-              rank,
-              cost_usd,
-              None,
-            )
-            .await?;
-            let _ = finalize_geo_monitor_run_if_complete(pool, run.id).await?;
-
-            Ok(())
+            Err(err) => {
+              let msg = truncate_string(&err.to_string(), 2000);
+              let _ = insert_geo_monitor_run_result(
+                pool,
+                tenant_id,
+                project_id,
+                run_for_dt,
+                run.id,
+                prompt_id,
+                &prompt.prompt_text,
+                None,
+                false,
+                None,
+                0.0,
+                Some(&msg),
+              )
+              .await?;
+              let _ = finalize_geo_monitor_run_if_complete(pool, run.id).await?;
+              Ok(())
+            }
           }
-          Err(err) => {
-            let msg = truncate_string(&err.to_string(), 2000);
-            let _ = insert_geo_monitor_run_result(
-              pool,
-              tenant_id,
-              project_id,
-              run_for_dt,
-              run.id,
-              prompt_id,
-              &prompt.prompt_text,
-              None,
-              false,
-              None,
-              0.0,
-              Some(&msg),
-            )
-            .await?;
-            let _ = finalize_geo_monitor_run_if_complete(pool, run.id).await?;
-            Ok(())
-          }
-        }
+        })()
+        .await
       }
       "daily_channel" => {
-        let run_for_dt = run_for_dt.ok_or_else(|| {
-          Box::new(std::io::Error::other("daily_channel task missing run_for_dt")) as Error
-        })?;
+        (|| async {
+          let run_for_dt = run_for_dt.ok_or_else(|| {
+            Box::new(std::io::Error::other("daily_channel task missing run_for_dt")) as Error
+          })?;
 
-        let start_dt = run_for_dt - chrono::Duration::days(7);
-        let end_dt = run_for_dt - chrono::Duration::days(1);
+          let start_dt = run_for_dt - chrono::Duration::days(7);
+          let end_dt = run_for_dt - chrono::Duration::days(1);
 
-        let mut tokens = fetch_youtube_connection_tokens(pool, tenant_id, channel_id)
-          .await?
-          .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+          let mut tokens = fetch_youtube_connection_tokens(pool, tenant_id, channel_id)
+            .await?
+            .ok_or_else(|| {
+              Box::new(std::io::Error::other(format!(
+                "missing youtube channel connection: tenant_id={tenant_id} channel_id={channel_id}"
+              ))) as Error
+            })?;
 
-        let active_cfg_default = DecisionEngineConfig::default();
-        let active_params_json = fetch_policy_params_json(pool, tenant_id, channel_id, "active").await?;
-        let cfg = active_params_json
-          .as_deref()
-          .and_then(cfg_from_policy_params_json)
-          .unwrap_or_else(DecisionEngineConfig::default);
+          let active_cfg_default = DecisionEngineConfig::default();
+          let active_params_json = fetch_policy_params_json(pool, tenant_id, channel_id, "active").await?;
+          let cfg = active_params_json
+            .as_deref()
+            .and_then(cfg_from_policy_params_json)
+            .unwrap_or_else(DecisionEngineConfig::default);
 
-        if active_params_json.is_none() {
-          let params_json = default_policy_params_json(&active_cfg_default);
-          upsert_policy_params(pool, tenant_id, channel_id, "active", &params_json, "system").await?;
-        }
-
-        // Proactive refresh if expired (best-effort).
-        let now_dt = now;
-        let needs_refresh = tokens
-          .expires_at
-          .map(|t| t <= now_dt)
-          .unwrap_or(false);
-
-        if needs_refresh {
-          if let Some(refresh) = tokens.refresh_token.clone() {
-            let app = fetch_or_seed_youtube_oauth_app_config(pool, tenant_id)
-              .await?
-              .ok_or_else(|| Box::new(std::io::Error::other("missing youtube oauth app config")) as Error)?;
-            let client_secret = app
-              .client_secret
-              .as_deref()
-              .map(str::trim)
-              .filter(|v| !v.is_empty())
-              .ok_or_else(|| {
-                Box::new(std::io::Error::other("missing youtube oauth client_secret")) as Error
-              })?;
-            let (client, _redirect) =
-              youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
-            let refreshed = refresh_tokens(&client, &refresh).await?;
-            update_youtube_connection_tokens(pool, tenant_id, channel_id, &refreshed).await?;
-            tokens.access_token = refreshed.access_token;
-            tokens.refresh_token = refreshed.refresh_token.or(Some(refresh));
+          if active_params_json.is_none() {
+            let params_json = default_policy_params_json(&active_cfg_default);
+            upsert_policy_params(pool, tenant_id, channel_id, "active", &params_json, "system").await?;
           }
-        }
 
-        let metrics = match fetch_video_daily_metrics_for_channel(&tokens.access_token, channel_id, start_dt, end_dt).await {
-          Ok(rows) => rows,
-          Err(err) if err.status == Some(401) => {
+          // Proactive refresh if expired (best-effort).
+          let now_dt = now;
+          let needs_refresh = tokens
+            .expires_at
+            .map(|t| t <= now_dt)
+            .unwrap_or(false);
+
+          if needs_refresh {
             if let Some(refresh) = tokens.refresh_token.clone() {
               let app = fetch_or_seed_youtube_oauth_app_config(pool, tenant_id)
                 .await?
@@ -1422,169 +1409,198 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
               let refreshed = refresh_tokens(&client, &refresh).await?;
               update_youtube_connection_tokens(pool, tenant_id, channel_id, &refreshed).await?;
               tokens.access_token = refreshed.access_token;
-
-              fetch_video_daily_metrics_for_channel(&tokens.access_token, channel_id, start_dt, end_dt)
-                .await
-                .map_err(youtube_analytics_error_to_vercel_error)?
-            } else {
-              return Err(youtube_analytics_error_to_vercel_error(err));
+              tokens.refresh_token = refreshed.refresh_token.or(Some(refresh));
             }
           }
-          Err(err) => return Err(youtube_analytics_error_to_vercel_error(err)),
-        };
 
-        for row in metrics.iter() {
-          upsert_video_daily_metric(
-            pool,
-            tenant_id,
-            channel_id,
-            row.dt,
-            &row.video_id,
-            row.estimated_revenue_usd,
-            row.impressions,
-            row.views,
-          )
-          .await?;
-        }
+          let metrics = match fetch_video_daily_metrics_for_channel(&tokens.access_token, channel_id, start_dt, end_dt).await {
+            Ok(rows) => rows,
+            Err(err) if err.status == Some(401) => {
+              if let Some(refresh) = tokens.refresh_token.clone() {
+                let app = fetch_or_seed_youtube_oauth_app_config(pool, tenant_id)
+                  .await?
+                  .ok_or_else(|| Box::new(std::io::Error::other("missing youtube oauth app config")) as Error)?;
+                let client_secret = app
+                  .client_secret
+                  .as_deref()
+                  .map(str::trim)
+                  .filter(|v| !v.is_empty())
+                  .ok_or_else(|| {
+                    Box::new(std::io::Error::other("missing youtube oauth client_secret")) as Error
+                  })?;
+                let (client, _redirect) =
+                  youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
+                let refreshed = refresh_tokens(&client, &refresh).await?;
+                update_youtube_connection_tokens(pool, tenant_id, channel_id, &refreshed).await?;
+                tokens.access_token = refreshed.access_token;
 
-        let publish_counts =
-          fetch_new_video_publish_counts_by_dt(pool, tenant_id, channel_id, start_dt, end_dt).await?;
-        for (dt, new_videos) in publish_counts.into_iter() {
-          if new_videos <= 0 {
-            continue;
-          }
-          let meta_json = serde_json::json!({ "new_videos": new_videos }).to_string();
-          upsert_observed_action(pool, tenant_id, channel_id, dt, "publish", Some(&meta_json)).await?;
-        }
+                fetch_video_daily_metrics_for_channel(&tokens.access_token, channel_id, start_dt, end_dt)
+                  .await
+                  .map_err(youtube_analytics_error_to_vercel_error)?
+              } else {
+                return Err(youtube_analytics_error_to_vercel_error(err));
+              }
+            }
+            Err(err) => return Err(youtube_analytics_error_to_vercel_error(err)),
+          };
 
-        let decision = compute_decision(
-          metrics.as_slice(),
-          run_for_dt,
-          start_dt,
-          end_dt,
-          cfg.clone(),
-        );
-
-        let evidence_json = serde_json::to_string(&decision.evidence).unwrap_or_else(|_| "[]".to_string());
-        let forbidden_json = serde_json::to_string(&decision.forbidden).unwrap_or_else(|_| "[]".to_string());
-        let reevaluate_json = serde_json::to_string(&decision.reevaluate).unwrap_or_else(|_| "[]".to_string());
-
-        sqlx::query(
-          r#"
-            INSERT INTO decision_daily (
-              tenant_id, channel_id, as_of_dt,
-              direction, confidence,
-              evidence_json, forbidden_json, reevaluate_json
+          for row in metrics.iter() {
+            upsert_video_daily_metric(
+              pool,
+              tenant_id,
+              channel_id,
+              row.dt,
+              &row.video_id,
+              row.estimated_revenue_usd,
+              row.impressions,
+              row.views,
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON DUPLICATE KEY UPDATE
-              direction = VALUES(direction),
-              confidence = VALUES(confidence),
-              evidence_json = VALUES(evidence_json),
-              forbidden_json = VALUES(forbidden_json),
-              reevaluate_json = VALUES(reevaluate_json),
-              updated_at = CURRENT_TIMESTAMP(3);
-          "#,
-        )
-        .bind(tenant_id)
-        .bind(channel_id)
-        .bind(run_for_dt)
-        .bind(&decision.direction)
-        .bind(decision.confidence)
-        .bind(evidence_json)
-        .bind(forbidden_json)
-        .bind(reevaluate_json)
-        .execute(pool)
-        .await
-        .map_err(|e| -> Error { Box::new(e) })?;
+            .await?;
+          }
 
-        let decision_dt = run_for_dt - chrono::Duration::days(7);
-        if decision_daily_exists(pool, tenant_id, channel_id, decision_dt).await? {
-          let pre_start_dt = decision_dt - chrono::Duration::days(7);
-          let pre_end_dt = decision_dt - chrono::Duration::days(1);
-          let post_start_dt = decision_dt;
-          let post_end_dt = decision_dt + chrono::Duration::days(6);
+          let publish_counts =
+            fetch_new_video_publish_counts_by_dt(pool, tenant_id, channel_id, start_dt, end_dt).await?;
+          for (dt, new_videos) in publish_counts.into_iter() {
+            if new_videos <= 0 {
+              continue;
+            }
+            let meta_json = serde_json::json!({ "new_videos": new_videos }).to_string();
+            upsert_observed_action(pool, tenant_id, channel_id, dt, "publish", Some(&meta_json)).await?;
+          }
 
-          let pre_sum =
-            fetch_revenue_sum_usd_7d(pool, tenant_id, channel_id, pre_start_dt, pre_end_dt).await?;
-          let post_sum = fetch_revenue_sum_usd_7d(
+          let decision = compute_decision(
+            metrics.as_slice(),
+            run_for_dt,
+            start_dt,
+            end_dt,
+            cfg.clone(),
+          );
+
+          let evidence_json = serde_json::to_string(&decision.evidence).unwrap_or_else(|_| "[]".to_string());
+          let forbidden_json = serde_json::to_string(&decision.forbidden).unwrap_or_else(|_| "[]".to_string());
+          let reevaluate_json = serde_json::to_string(&decision.reevaluate).unwrap_or_else(|_| "[]".to_string());
+
+          sqlx::query(
+            r#"
+              INSERT INTO decision_daily (
+                tenant_id, channel_id, as_of_dt,
+                direction, confidence,
+                evidence_json, forbidden_json, reevaluate_json
+              )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE
+                direction = VALUES(direction),
+                confidence = VALUES(confidence),
+                evidence_json = VALUES(evidence_json),
+                forbidden_json = VALUES(forbidden_json),
+                reevaluate_json = VALUES(reevaluate_json),
+                updated_at = CURRENT_TIMESTAMP(3);
+            "#,
+          )
+          .bind(tenant_id)
+          .bind(channel_id)
+          .bind(run_for_dt)
+          .bind(&decision.direction)
+          .bind(decision.confidence)
+          .bind(evidence_json)
+          .bind(forbidden_json)
+          .bind(reevaluate_json)
+          .execute(pool)
+          .await
+          .map_err(|e| -> Error { Box::new(e) })?;
+
+          let decision_dt = run_for_dt - chrono::Duration::days(7);
+          if decision_daily_exists(pool, tenant_id, channel_id, decision_dt).await? {
+            let pre_start_dt = decision_dt - chrono::Duration::days(7);
+            let pre_end_dt = decision_dt - chrono::Duration::days(1);
+            let post_start_dt = decision_dt;
+            let post_end_dt = decision_dt + chrono::Duration::days(6);
+
+            let pre_sum =
+              fetch_revenue_sum_usd_7d(pool, tenant_id, channel_id, pre_start_dt, pre_end_dt).await?;
+            let post_sum = fetch_revenue_sum_usd_7d(
+              pool,
+              tenant_id,
+              channel_id,
+              post_start_dt,
+              post_end_dt,
+            )
+            .await?;
+
+            let top_n = (cfg.top_n_for_new_asset as i64).clamp(1, 10);
+            let pre_top =
+              fetch_top_video_ids_by_revenue(pool, tenant_id, channel_id, pre_start_dt, pre_end_dt, top_n).await?;
+            let post_top =
+              fetch_top_video_ids_by_revenue(pool, tenant_id, channel_id, post_start_dt, post_end_dt, top_n).await?;
+
+            let outcome = compute_outcome_label(pre_sum, post_sum, &pre_top, &post_top);
+            let notes = serde_json::json!({
+              "pre_window": { "start_dt": pre_start_dt.to_string(), "end_dt": pre_end_dt.to_string(), "revenue_sum_usd_7d": pre_sum },
+              "post_window": { "start_dt": post_start_dt.to_string(), "end_dt": post_end_dt.to_string(), "revenue_sum_usd_7d": post_sum },
+              "top_n": top_n,
+            })
+            .to_string();
+
+            upsert_decision_outcome(
+              pool,
+              tenant_id,
+              channel_id,
+              decision_dt,
+              run_for_dt,
+              outcome.revenue_change_pct_7d,
+              outcome.catastrophic_flag,
+              outcome.new_top_asset_flag,
+              Some(&notes),
+            )
+            .await?;
+          }
+
+          if let Err(err) = evaluate_running_experiments_for_channel(
             pool,
             tenant_id,
             channel_id,
-            post_start_dt,
-            post_end_dt,
+            &tokens.access_token,
+            run_for_dt,
           )
-          .await?;
+          .await
+          {
+            eprintln!(
+              "daily_channel: evaluate_running_experiments_for_channel error: {}",
+              err
+            );
+          }
 
-          let top_n = (cfg.top_n_for_new_asset as i64).clamp(1, 10);
-          let pre_top =
-            fetch_top_video_ids_by_revenue(pool, tenant_id, channel_id, pre_start_dt, pre_end_dt, top_n).await?;
-          let post_top =
-            fetch_top_video_ids_by_revenue(pool, tenant_id, channel_id, post_start_dt, post_end_dt, top_n).await?;
+          Ok(())
+        })()
+        .await
+      }
+      "weekly_channel" => {
+        (|| async {
+          let run_for_dt = run_for_dt.ok_or_else(|| {
+            Box::new(std::io::Error::other("weekly_channel task missing run_for_dt")) as Error
+          })?;
 
-          let outcome = compute_outcome_label(pre_sum, post_sum, &pre_top, &post_top);
-          let notes = serde_json::json!({
-            "pre_window": { "start_dt": pre_start_dt.to_string(), "end_dt": pre_end_dt.to_string(), "revenue_sum_usd_7d": pre_sum },
-            "post_window": { "start_dt": post_start_dt.to_string(), "end_dt": post_end_dt.to_string(), "revenue_sum_usd_7d": post_sum },
-            "top_n": top_n,
+          let default_cfg = DecisionEngineConfig::default();
+          let params_json = default_policy_params_json(&default_cfg);
+
+          upsert_policy_params(pool, tenant_id, channel_id, "active", &params_json, "system").await?;
+
+          let candidate_version = format!("candidate-{run_for_dt}");
+          upsert_policy_params(pool, tenant_id, channel_id, &candidate_version, &params_json, "system").await?;
+
+          let replay_metrics_json = serde_json::json!({
+            "ok": true,
+            "note": "v1 scaffold: replay gate not implemented yet",
+            "candidate_version": candidate_version,
+            "run_for_dt": run_for_dt.to_string(),
           })
           .to_string();
 
-          upsert_decision_outcome(
-            pool,
-            tenant_id,
-            channel_id,
-            decision_dt,
-            run_for_dt,
-            outcome.revenue_change_pct_7d,
-            outcome.catastrophic_flag,
-            outcome.new_top_asset_flag,
-            Some(&notes),
-          )
-          .await?;
-        }
+          upsert_policy_eval_report(pool, tenant_id, channel_id, &candidate_version, &replay_metrics_json, false).await?;
 
-        if let Err(err) = evaluate_running_experiments_for_channel(
-          pool,
-          tenant_id,
-          channel_id,
-          &tokens.access_token,
-          run_for_dt,
-        )
+          Ok(())
+        })()
         .await
-        {
-          eprintln!(
-            "daily_channel: evaluate_running_experiments_for_channel error: {}",
-            err
-          );
-        }
-
-        Ok(())
-      }
-      "weekly_channel" => {
-        let run_for_dt = run_for_dt.ok_or_else(|| {
-          Box::new(std::io::Error::other("weekly_channel task missing run_for_dt")) as Error
-        })?;
-
-        let default_cfg = DecisionEngineConfig::default();
-        let params_json = default_policy_params_json(&default_cfg);
-
-        upsert_policy_params(pool, tenant_id, channel_id, "active", &params_json, "system").await?;
-
-        let candidate_version = format!("candidate-{run_for_dt}");
-        upsert_policy_params(pool, tenant_id, channel_id, &candidate_version, &params_json, "system").await?;
-
-        let replay_metrics_json = serde_json::json!({
-          "ok": true,
-          "note": "v1 scaffold: replay gate not implemented yet",
-          "candidate_version": candidate_version,
-          "run_for_dt": run_for_dt.to_string(),
-        })
-        .to_string();
-
-        upsert_policy_eval_report(pool, tenant_id, channel_id, &candidate_version, &replay_metrics_json, false).await?;
-
-        Ok(())
       }
       "youtube_reporting_owner" => {
         (|| async {
@@ -1601,11 +1617,19 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
 
           let channel_id_for_tokens = fetch_youtube_channel_id(pool, tenant_id)
             .await?
-            .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+            .ok_or_else(|| {
+              Box::new(std::io::Error::other(format!(
+                "missing youtube channel connection: tenant_id={tenant_id}"
+              ))) as Error
+            })?;
 
           let mut tokens = fetch_youtube_connection_tokens(pool, tenant_id, &channel_id_for_tokens)
             .await?
-            .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+            .ok_or_else(|| {
+              Box::new(std::io::Error::other(format!(
+                "missing youtube channel connection: tenant_id={tenant_id} channel_id={channel_id_for_tokens}"
+              ))) as Error
+            })?;
 
           // Proactive refresh if expired (best-effort).
           let needs_refresh = tokens
@@ -1790,11 +1814,19 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
 
           let channel_id_for_tokens = fetch_youtube_channel_id(pool, tenant_id)
             .await?
-            .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+            .ok_or_else(|| {
+              Box::new(std::io::Error::other(format!(
+                "missing youtube channel connection: tenant_id={tenant_id}"
+              ))) as Error
+            })?;
 
           let mut tokens = fetch_youtube_connection_tokens(pool, tenant_id, &channel_id_for_tokens)
             .await?
-            .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+            .ok_or_else(|| {
+              Box::new(std::io::Error::other(format!(
+                "missing youtube channel connection: tenant_id={tenant_id} channel_id={channel_id_for_tokens}"
+              ))) as Error
+            })?;
 
           // Proactive refresh if expired (best-effort).
           let needs_refresh = tokens
@@ -2057,6 +2089,9 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
       }
       Err(err) => {
         let message = truncate_string(&err.to_string(), 2000);
+        if last_error.is_none() {
+          last_error = Some(message.clone());
+        }
 
         if attempt_next >= *max_attempt {
           sqlx::query(
@@ -2107,6 +2142,7 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
       "succeeded": succeeded,
       "retried": retried,
       "dead": dead,
+      "last_error": last_error,
     }),
   )
 }
