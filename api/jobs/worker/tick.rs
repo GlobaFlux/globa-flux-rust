@@ -914,6 +914,7 @@ fn cfg_from_policy_params_json(raw: &str) -> Option<DecisionEngineConfig> {
 
 async fn handle_dispatch(
   schedule: DispatchSchedule,
+  force: bool,
   method: &Method,
   headers: &HeaderMap,
   body: Bytes,
@@ -991,52 +992,102 @@ async fn handle_dispatch(
 
   for (tenant_id, channel_id) in channels.iter() {
     let dedupe_key = format!("{tenant_id}:{job_type}:{channel_id}:{run_for_dt}");
-    sqlx::query(
-      r#"
-        INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status, attempt, max_attempt, run_after)
-        VALUES (?, ?, ?, ?, ?, 'pending', 0, 3, ?)
-        ON DUPLICATE KEY UPDATE
-          updated_at = CURRENT_TIMESTAMP(3),
-          max_attempt = CASE
-            WHEN max_attempt < 3 THEN 3
-            ELSE max_attempt
-          END,
-          attempt = CASE
-            WHEN status = 'dead' THEN 0
-            ELSE attempt
-          END,
-          last_error = CASE
-            WHEN status = 'dead' THEN NULL
-            ELSE last_error
-          END,
-          locked_by = CASE
-            WHEN status = 'dead' THEN NULL
-            ELSE locked_by
-          END,
-          locked_at = CASE
-            WHEN status = 'dead' THEN NULL
-            ELSE locked_at
-          END,
-          run_after = CASE
-            WHEN status IN ('pending','retrying','dead') THEN ?
-            ELSE run_after
-          END,
-          status = CASE
-            WHEN status = 'dead' THEN 'pending'
-            ELSE status
-          END;
-      "#,
-    )
-    .bind(tenant_id)
-    .bind(job_type)
-    .bind(channel_id)
-    .bind(run_for_dt)
-    .bind(dedupe_key)
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
+
+    if force {
+      sqlx::query(
+        r#"
+          INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status, attempt, max_attempt, run_after)
+          VALUES (?, ?, ?, ?, ?, 'pending', 0, 3, ?)
+          ON DUPLICATE KEY UPDATE
+            updated_at = CURRENT_TIMESTAMP(3),
+            max_attempt = CASE
+              WHEN max_attempt < 3 THEN 3
+              ELSE max_attempt
+            END,
+            run_after = CASE
+              WHEN status = 'running' THEN run_after
+              ELSE ?
+            END,
+            status = CASE
+              WHEN status = 'running' THEN status
+              ELSE 'pending'
+            END,
+            attempt = CASE
+              WHEN status = 'running' THEN attempt
+              ELSE 0
+            END,
+            last_error = CASE
+              WHEN status = 'running' THEN last_error
+              ELSE NULL
+            END,
+            locked_by = CASE
+              WHEN status = 'running' THEN locked_by
+              ELSE NULL
+            END,
+            locked_at = CASE
+              WHEN status = 'running' THEN locked_at
+              ELSE NULL
+            END;
+        "#,
+      )
+      .bind(tenant_id)
+      .bind(job_type)
+      .bind(channel_id)
+      .bind(run_for_dt)
+      .bind(dedupe_key)
+      .bind(now)
+      .bind(now)
+      .execute(pool)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?;
+    } else {
+      sqlx::query(
+        r#"
+          INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status, attempt, max_attempt, run_after)
+          VALUES (?, ?, ?, ?, ?, 'pending', 0, 3, ?)
+          ON DUPLICATE KEY UPDATE
+            updated_at = CURRENT_TIMESTAMP(3),
+            max_attempt = CASE
+              WHEN max_attempt < 3 THEN 3
+              ELSE max_attempt
+            END,
+            attempt = CASE
+              WHEN status = 'dead' THEN 0
+              ELSE attempt
+            END,
+            last_error = CASE
+              WHEN status = 'dead' THEN NULL
+              ELSE last_error
+            END,
+            locked_by = CASE
+              WHEN status = 'dead' THEN NULL
+              ELSE locked_by
+            END,
+            locked_at = CASE
+              WHEN status = 'dead' THEN NULL
+              ELSE locked_at
+            END,
+            run_after = CASE
+              WHEN status IN ('pending','retrying','dead') THEN ?
+              ELSE run_after
+            END,
+            status = CASE
+              WHEN status = 'dead' THEN 'pending'
+              ELSE status
+            END;
+        "#,
+      )
+      .bind(tenant_id)
+      .bind(job_type)
+      .bind(channel_id)
+      .bind(run_for_dt)
+      .bind(dedupe_key)
+      .bind(now)
+      .bind(now)
+      .execute(pool)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?;
+    }
   }
 
   json_response(
@@ -1046,6 +1097,7 @@ async fn handle_dispatch(
       "tenant_id": tenant_filter,
       "job_type": job_type,
       "run_for_dt": run_for_dt.to_string(),
+      "force": force,
       "candidates": channels.len()
     }),
   )
@@ -2176,10 +2228,13 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
   let result = match action {
     "dispatch" => {
       let schedule = DispatchSchedule::from_query(req.uri().query());
+      let force = query_value(req.uri().query(), "force")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
       let method = req.method().clone();
       let headers = req.headers().clone();
       let bytes = req.into_body().collect().await?.to_bytes();
-      handle_dispatch(schedule, &method, &headers, bytes).await
+      handle_dispatch(schedule, force, &method, &headers, bytes).await
     }
     "" | "tick" => {
       let method = req.method().clone();
@@ -2278,7 +2333,7 @@ mod tests {
     std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
 
     let headers = HeaderMap::new();
-    let response = handle_dispatch(DispatchSchedule::Daily, &Method::POST, &headers, Bytes::new())
+    let response = handle_dispatch(DispatchSchedule::Daily, false, &Method::POST, &headers, Bytes::new())
       .await
       .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

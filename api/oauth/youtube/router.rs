@@ -2052,22 +2052,39 @@ async fn handle_youtube_alerts(method: &Method, headers: &HeaderMap, uri: &Uri, 
     }
 
     // Best-effort: keep alerts fresh without requiring a separate job.
-    evaluate_alerts(pool, tenant_id.trim(), channel_id.trim()).await?;
+    let eval_error = match evaluate_alerts(pool, tenant_id.trim(), channel_id.trim()).await {
+      Ok(()) => None,
+      Err(err) => Some(truncate_string(&err.to_string(), 2000)),
+    };
 
-    let rows = sqlx::query_as::<_, (i64, String, String, String, chrono::NaiveDateTime, Option<chrono::NaiveDateTime>)>(
-      r#"
-        SELECT id, kind, severity, message, detected_at, resolved_at
-        FROM yt_alerts
-        WHERE tenant_id = ? AND channel_id = ?
-        ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
-        LIMIT 50;
-      "#,
-    )
-    .bind(tenant_id.trim())
-    .bind(channel_id.trim())
-    .fetch_all(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
+    let rows = match sqlx::query_as::<_, (i64, String, String, String, chrono::NaiveDateTime, Option<chrono::NaiveDateTime>)>(
+        r#"
+          SELECT id, kind, severity, message, detected_at, resolved_at
+          FROM yt_alerts
+          WHERE tenant_id = ? AND channel_id = ?
+          ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
+          LIMIT 50;
+        "#,
+      )
+      .bind(tenant_id.trim())
+      .bind(channel_id.trim())
+      .fetch_all(pool)
+      .await
+    {
+      Ok(v) => v,
+      Err(e) => {
+        return json_response(
+          StatusCode::OK,
+          serde_json::json!({
+            "ok": false,
+            "error": "alerts_query_failed",
+            "message": truncate_string(&e.to_string(), 2000),
+            "channel_id": channel_id,
+            "eval_error": eval_error,
+          }),
+        );
+      }
+    };
 
     let items: Vec<AlertItem> = rows
       .into_iter()
@@ -2083,7 +2100,7 @@ async fn handle_youtube_alerts(method: &Method, headers: &HeaderMap, uri: &Uri, 
 
     return json_response(
       StatusCode::OK,
-      serde_json::json!({"ok": true, "items": items, "channel_id": channel_id}),
+      serde_json::json!({"ok": true, "items": items, "channel_id": channel_id, "eval_error": eval_error}),
     );
   }
 
