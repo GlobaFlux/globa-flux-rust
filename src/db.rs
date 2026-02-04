@@ -963,7 +963,11 @@ pub async fn fetch_youtube_channel_id(
     r#"
       SELECT channel_id
       FROM channel_connections
-      WHERE tenant_id = ? AND oauth_provider = 'youtube'
+      WHERE tenant_id = ?
+        AND oauth_provider = 'youtube'
+        AND channel_id IS NOT NULL
+        AND channel_id <> ''
+      ORDER BY updated_at DESC
       LIMIT 1;
     "#,
   )
@@ -983,7 +987,11 @@ pub async fn fetch_youtube_content_owner_id(
     r#"
       SELECT content_owner_id
       FROM channel_connections
-      WHERE tenant_id = ? AND oauth_provider = 'youtube'
+      WHERE tenant_id = ?
+        AND oauth_provider = 'youtube'
+        AND content_owner_id IS NOT NULL
+        AND content_owner_id <> ''
+      ORDER BY updated_at DESC
       LIMIT 1;
     "#,
   )
