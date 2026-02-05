@@ -3259,10 +3259,16 @@ async fn handle_youtube_alerts(
 
         let handled_at = Utc::now().to_rfc3339();
         let updated_details_json = {
-            let mut details_val = existing_details_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
+            let mut details_val = match existing_details_json.as_deref() {
+                Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+                    Ok(v) => v,
+                    Err(_) => serde_json::json!({
+                      "evidence_parse_error": true,
+                      "evidence_raw": raw,
+                    }),
+                },
+                None => serde_json::json!({}),
+            };
 
             if !details_val.is_object() {
                 details_val = serde_json::json!({ "evidence": details_val });
