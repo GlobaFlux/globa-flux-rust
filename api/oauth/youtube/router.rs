@@ -3073,6 +3073,8 @@ struct AlertItem {
 struct ResolveAlertRequest {
     tenant_id: String,
     id: String,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 fn parse_prefixed_id(raw: &str, prefix: &str) -> Option<i64> {
@@ -3227,9 +3229,9 @@ async fn handle_youtube_alerts(
         };
 
         let pool = get_pool().await?;
-        let row = sqlx::query_as::<_, (String, String)>(
+        let row = sqlx::query_as::<_, (String, String, Option<String>)>(
             r#"
-        SELECT channel_id, alert_key
+        SELECT channel_id, alert_key, details_json
         FROM yt_alerts
         WHERE id = ? AND tenant_id = ?
         LIMIT 1;
@@ -3241,21 +3243,57 @@ async fn handle_youtube_alerts(
         .await
         .map_err(|e| -> Error { Box::new(e) })?;
 
-        let Some((channel_id, alert_key)) = row else {
+        let Some((channel_id, alert_key, existing_details_json)) = row else {
             return json_response(
                 StatusCode::NOT_FOUND,
                 serde_json::json!({"ok": false, "error": "not_found", "message": "alert not found"}),
             );
         };
 
+        let note = parsed
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| truncate_string(v, 600));
+
+        let handled_at = Utc::now().to_rfc3339();
+        let updated_details_json = {
+            let mut details_val = existing_details_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            if !details_val.is_object() {
+                details_val = serde_json::json!({ "evidence": details_val });
+            }
+
+            if let Some(obj) = details_val.as_object_mut() {
+                let mut handled = serde_json::Map::new();
+                handled.insert("at".to_string(), serde_json::Value::String(handled_at.clone()));
+                if let Some(n) = note.as_deref() {
+                    handled.insert("note".to_string(), serde_json::Value::String(n.to_string()));
+                }
+                obj.insert("handled".to_string(), serde_json::Value::Object(handled));
+            }
+
+            serde_json::to_string(&details_val).ok()
+        };
+
+        let details_json_to_write = updated_details_json
+            .as_deref()
+            .or(existing_details_json.as_deref());
+
         let updated = sqlx::query(
             r#"
         UPDATE yt_alerts
         SET resolved_at = CURRENT_TIMESTAMP(3),
+            details_json = ?,
             updated_at = CURRENT_TIMESTAMP(3)
         WHERE id = ? AND tenant_id = ?;
       "#,
         )
+        .bind(details_json_to_write)
         .bind(alert_id)
         .bind(parsed.tenant_id.trim())
         .execute(pool)
@@ -3267,12 +3305,15 @@ async fn handle_youtube_alerts(
             let meta_json = serde_json::json!({
               "alert_id": parsed.id,
               "alert_key": alert_key,
+              "handled_at": handled_at,
+              "note": note,
             })
             .to_string();
+            let action_type = format!("resolve_alert:{alert_id}");
             let _ = sqlx::query(
                 r#"
             INSERT INTO observed_actions (tenant_id, channel_id, dt, action_type, action_meta_json)
-            VALUES (?, ?, ?, 'resolve_alert', ?)
+            VALUES (?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
               action_meta_json = VALUES(action_meta_json);
           "#,
@@ -3280,6 +3321,7 @@ async fn handle_youtube_alerts(
             .bind(parsed.tenant_id.trim())
             .bind(channel_id)
             .bind(dt)
+            .bind(action_type)
             .bind(meta_json)
             .execute(pool)
             .await;
