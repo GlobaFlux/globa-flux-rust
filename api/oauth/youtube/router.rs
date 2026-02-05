@@ -2635,6 +2635,71 @@ async fn evaluate_alerts(
     };
     let can_compute_concentration = top1_concentration_7d.is_some() && total_rev_7d.is_some();
 
+    let mut daily_totals = sqlx::query_as::<_, (NaiveDate, f64)>(
+        r#"
+      SELECT dt, CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS rev
+      FROM video_daily_metrics
+      WHERE tenant_id = ?
+        AND channel_id = ?
+        AND dt BETWEEN ? AND ?
+        AND video_id = '__CHANNEL_TOTAL__'
+      GROUP BY dt
+      ORDER BY dt ASC;
+    "#,
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(current_start)
+    .bind(current_end)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    if daily_totals.is_empty() {
+        daily_totals = sqlx::query_as::<_, (NaiveDate, f64)>(
+            r#"
+        SELECT dt, CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS rev
+        FROM video_daily_metrics
+        WHERE tenant_id = ?
+          AND channel_id = ?
+          AND dt BETWEEN ? AND ?
+          AND video_id <> '__CHANNEL_TOTAL__'
+        GROUP BY dt
+        ORDER BY dt ASC;
+      "#,
+        )
+        .bind(tenant_id)
+        .bind(channel_id)
+        .bind(current_start)
+        .bind(current_end)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+    }
+
+    let daily_revs: Vec<f64> = daily_totals
+        .iter()
+        .map(|(_, rev)| *rev)
+        .filter(|rev| rev.is_finite())
+        .collect();
+
+    let (rev_mean_7d, rev_stddev_7d) = if daily_revs.len() >= 5 {
+        let n = daily_revs.len() as f64;
+        let mean = daily_revs.iter().sum::<f64>() / n;
+        let var = daily_revs
+            .iter()
+            .map(|v| {
+                let d = v - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n;
+        (Some(mean), Some(var.sqrt()))
+    } else {
+        (None, None)
+    };
+    let can_compute_volatility = rev_mean_7d.is_some() && rev_stddev_7d.is_some();
+
     let base_rpm = if base_views > 0 {
         (base_rev / (base_views as f64)) * 1000.0
     } else {
@@ -2669,6 +2734,8 @@ async fn evaluate_alerts(
         max_metric_dt: max_dt,
         top1_concentration_7d,
         total_revenue_usd_7d: total_rev_7d,
+        revenue_mean_usd_7d: rev_mean_7d,
+        revenue_stddev_usd_7d: rev_stddev_7d,
     };
 
     let desired = evaluate_guardrails(&input);
@@ -2697,6 +2764,10 @@ async fn evaluate_alerts(
 
     if can_compute_concentration && !desired_keys.contains("rev_concentration_top1_7d") {
         auto_resolve_alert(pool, tenant_id, channel_id, "rev_concentration_top1_7d").await?;
+    }
+
+    if can_compute_volatility && !desired_keys.contains("rev_volatility_7d") {
+        auto_resolve_alert(pool, tenant_id, channel_id, "rev_volatility_7d").await?;
     }
 
     Ok(())

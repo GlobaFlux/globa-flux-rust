@@ -14,6 +14,8 @@ pub struct GuardrailInput {
   pub max_metric_dt: Option<NaiveDate>,
   pub top1_concentration_7d: Option<f64>,
   pub total_revenue_usd_7d: Option<f64>,
+  pub revenue_mean_usd_7d: Option<f64>,
+  pub revenue_stddev_usd_7d: Option<f64>,
 }
 
 impl GuardrailInput {
@@ -31,6 +33,8 @@ impl GuardrailInput {
       max_metric_dt: Some(max_metric_dt),
       top1_concentration_7d: None,
       total_revenue_usd_7d: None,
+      revenue_mean_usd_7d: None,
+      revenue_stddev_usd_7d: None,
     }
   }
 }
@@ -127,6 +131,20 @@ pub fn evaluate_guardrails(input: &GuardrailInput) -> Vec<GuardrailAlert> {
     }
   }
 
+  if let (Some(mean), Some(stddev)) = (input.revenue_mean_usd_7d, input.revenue_stddev_usd_7d) {
+    if mean >= 10.0 && stddev >= 0.4 * mean {
+      out.push(GuardrailAlert {
+        key: "rev_volatility_7d",
+        kind: "Revenue volatility",
+        severity: "warning",
+        message: format!(
+          "Revenue is volatile (7d stddev ${:.2} vs mean ${:.2}).",
+          stddev, mean
+        ),
+      });
+    }
+  }
+
   out
 }
 
@@ -149,6 +167,8 @@ mod tests {
       today: NaiveDate::from_ymd_opt(2026, 2, 5).unwrap(),
       top1_concentration_7d: None,
       total_revenue_usd_7d: None,
+      revenue_mean_usd_7d: None,
+      revenue_stddev_usd_7d: None,
     };
 
     let alerts = evaluate_guardrails(&input);
@@ -170,6 +190,8 @@ mod tests {
       today: NaiveDate::from_ymd_opt(2026, 2, 5).unwrap(),
       top1_concentration_7d: None,
       total_revenue_usd_7d: None,
+      revenue_mean_usd_7d: None,
+      revenue_stddev_usd_7d: None,
     };
 
     let alerts = evaluate_guardrails(&input);
@@ -188,5 +210,17 @@ mod tests {
     assert!(alerts
       .iter()
       .any(|a| a.key == "rev_concentration_top1_7d"));
+  }
+
+  #[test]
+  fn volatility_triggers_when_stddev_high() {
+    let mut input = GuardrailInput::minimal(
+      NaiveDate::from_ymd_opt(2026, 2, 5).unwrap(),
+      NaiveDate::from_ymd_opt(2026, 2, 4).unwrap(),
+    );
+    input.revenue_stddev_usd_7d = Some(30.0);
+    input.revenue_mean_usd_7d = Some(50.0);
+    let alerts = evaluate_guardrails(&input);
+    assert!(alerts.iter().any(|a| a.key == "rev_volatility_7d"));
   }
 }
