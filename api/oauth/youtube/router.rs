@@ -2946,6 +2946,27 @@ async fn handle_youtube_alerts(
         };
 
         let pool = get_pool().await?;
+        let row = sqlx::query_as::<_, (String, String)>(
+            r#"
+        SELECT channel_id, alert_key
+        FROM yt_alerts
+        WHERE id = ? AND tenant_id = ?
+        LIMIT 1;
+      "#,
+        )
+        .bind(alert_id)
+        .bind(parsed.tenant_id.trim())
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+
+        let Some((channel_id, alert_key)) = row else {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"ok": false, "error": "not_found", "message": "alert not found"}),
+            );
+        };
+
         let updated = sqlx::query(
             r#"
         UPDATE yt_alerts
@@ -2959,6 +2980,29 @@ async fn handle_youtube_alerts(
         .execute(pool)
         .await
         .map_err(|e| -> Error { Box::new(e) })?;
+
+        if updated.rows_affected() > 0 {
+            let dt = Utc::now().date_naive();
+            let meta_json = serde_json::json!({
+              "alert_id": parsed.id,
+              "alert_key": alert_key,
+            })
+            .to_string();
+            let _ = sqlx::query(
+                r#"
+            INSERT INTO observed_actions (tenant_id, channel_id, dt, action_type, action_meta_json)
+            VALUES (?, ?, ?, 'resolve_alert', ?)
+            ON DUPLICATE KEY UPDATE
+              action_meta_json = VALUES(action_meta_json);
+          "#,
+            )
+            .bind(parsed.tenant_id.trim())
+            .bind(channel_id)
+            .bind(dt)
+            .bind(meta_json)
+            .execute(pool)
+            .await;
+        }
 
         return json_response(
             StatusCode::OK,
