@@ -672,6 +672,16 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
+  sqlx::query(
+    r#"
+      ALTER TABLE yt_alerts
+      ADD COLUMN IF NOT EXISTS details_json TEXT NULL;
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
   Ok(())
 }
 

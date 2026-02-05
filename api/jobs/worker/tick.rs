@@ -217,19 +217,21 @@ async fn upsert_alert(
   kind: &str,
   severity: &str,
   message: &str,
+  details_json: Option<&str>,
 ) -> Result<(), Error> {
   sqlx::query(
     r#"
       INSERT INTO yt_alerts (
         tenant_id, channel_id, alert_key,
-        kind, severity, message,
+        kind, severity, message, details_json,
         detected_at, resolved_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3), NULL)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3), NULL)
       ON DUPLICATE KEY UPDATE
         kind = VALUES(kind),
         severity = VALUES(severity),
         message = VALUES(message),
+        details_json = COALESCE(VALUES(details_json), details_json),
         detected_at = CURRENT_TIMESTAMP(3),
         resolved_at = NULL,
         updated_at = CURRENT_TIMESTAMP(3);
@@ -241,6 +243,7 @@ async fn upsert_alert(
   .bind(kind)
   .bind(severity)
   .bind(message)
+  .bind(details_json)
   .execute(pool)
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
@@ -458,6 +461,7 @@ async fn evaluate_running_experiments_for_channel(
           "Experiment stop-loss",
           severity,
           &msg,
+          None,
         )
         .await;
       } else {
@@ -600,6 +604,7 @@ async fn evaluate_running_experiments_for_channel(
             "Experiment result",
             severity,
             &msg,
+            None,
           )
           .await;
         } else {

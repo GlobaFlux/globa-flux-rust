@@ -2481,19 +2481,21 @@ async fn upsert_alert(
     kind: &str,
     severity: &str,
     message: &str,
+    details_json: Option<&str>,
 ) -> Result<(), Error> {
     sqlx::query(
         r#"
       INSERT INTO yt_alerts (
         tenant_id, channel_id, alert_key,
-        kind, severity, message,
+        kind, severity, message, details_json,
         detected_at, resolved_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3), NULL)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3), NULL)
       ON DUPLICATE KEY UPDATE
         kind = VALUES(kind),
         severity = VALUES(severity),
         message = VALUES(message),
+        details_json = COALESCE(VALUES(details_json), details_json),
         detected_at = CURRENT_TIMESTAMP(3),
         resolved_at = NULL,
         updated_at = CURRENT_TIMESTAMP(3);
@@ -2505,6 +2507,7 @@ async fn upsert_alert(
     .bind(kind)
     .bind(severity)
     .bind(message)
+    .bind(details_json)
     .execute(pool)
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
@@ -2750,6 +2753,7 @@ async fn evaluate_alerts(
             alert.kind,
             alert.severity,
             &alert.message,
+            None,
         )
         .await?;
     }
@@ -2779,6 +2783,7 @@ struct AlertItem {
     kind: String,
     severity: String,
     message: String,
+    details: Option<serde_json::Value>,
     detected_at: String,
     resolved_at: Option<String>,
 }
@@ -2860,10 +2865,11 @@ async fn handle_youtube_alerts(
                 String,
                 DateTime<Utc>,
                 Option<DateTime<Utc>>,
+                Option<String>,
             ),
         >(
             r#"
-          SELECT id, kind, severity, message, detected_at, resolved_at
+          SELECT id, kind, severity, message, detected_at, resolved_at, details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
           ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
@@ -2893,11 +2899,14 @@ async fn handle_youtube_alerts(
         let items: Vec<AlertItem> = rows
             .into_iter()
             .map(
-                |(id, kind, severity, message, detected_at, resolved_at)| AlertItem {
+                |(id, kind, severity, message, detected_at, resolved_at, details_json)| AlertItem {
                     id: format!("alert_{id}"),
                     kind,
                     severity,
                     message,
+                    details: details_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
                     detected_at: detected_at.to_rfc3339(),
                     resolved_at: resolved_at.map(|dt| dt.to_rfc3339()),
                 },
