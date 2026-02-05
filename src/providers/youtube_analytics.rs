@@ -386,7 +386,19 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
   // so we fall back to day-level aggregation to at least populate the pipeline.
   let video_url = build_reports_url_with_ids(base_url, ids_value, start_dt, end_dt);
   let rows = match fetch_report_json_by_url(access_token, &video_url).await {
-    Ok(json) => parse_rows(&json),
+    Ok(json) => {
+      let rows = parse_rows(&json);
+      if !rows.is_empty() {
+        rows
+      } else {
+        let video_url = build_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
+        match fetch_report_json_by_url(access_token, &video_url).await {
+          Ok(json) => parse_rows(&json),
+          Err(err) if should_fallback_to_views_only(&err) => vec![],
+          Err(err) => return Err(err),
+        }
+      }
+    }
     Err(err) if should_fallback_to_views_only(&err) => {
       let video_url = build_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
       match fetch_report_json_by_url(access_token, &video_url).await {
@@ -740,6 +752,95 @@ mod tests {
         .await
         .unwrap();
     }
+  }
+
+  async fn serve_reports_empty_rows(listener: TcpListener, max_connections: usize) {
+    for _ in 0..max_connections {
+      let (stream, _) = listener.accept().await.unwrap();
+      let io = TokioIo::new(stream);
+      http1::Builder::new()
+        .serve_connection(
+          io,
+          service_fn(|req: Request<Incoming>| async move {
+            let query = req.uri().query().unwrap_or("");
+            if query.contains("dimensions=day,video") && query.contains("metrics=estimatedRevenue,views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"video","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"estimatedRevenue","columnType":"METRIC","dataType":"FLOAT"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": []
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            if query.contains("dimensions=day,video") && query.contains("metrics=views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"video","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": [
+                    ["2026-01-02","vid1", 200]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            Ok::<_, hyper::Error>(
+              Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from_static(b"not found")))
+                .unwrap(),
+            )
+          }),
+        )
+        .await
+        .unwrap();
+    }
+  }
+
+  #[tokio::test]
+  async fn falls_back_to_views_only_video_report_when_video_rows_empty() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}/", addr);
+
+    let task = tokio::spawn(serve_reports_empty_rows(listener, 2));
+
+    let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
+    let rows =
+      fetch_video_daily_metrics_for_channel_with_base_url("token123", &base_url, "UC123", start_dt, end_dt)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    assert_eq!(rows[0].video_id, "vid1");
+    assert_eq!(rows[0].views, 200);
+    assert_eq!(rows[0].estimated_revenue_usd, 0.0);
+
+    task.await.unwrap();
   }
 
   #[tokio::test]
