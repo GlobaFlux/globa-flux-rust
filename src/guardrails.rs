@@ -12,6 +12,27 @@ pub struct GuardrailInput {
   pub current: WindowAgg,
   pub baseline: WindowAgg,
   pub max_metric_dt: Option<NaiveDate>,
+  pub top1_concentration_7d: Option<f64>,
+  pub total_revenue_usd_7d: Option<f64>,
+}
+
+impl GuardrailInput {
+  pub fn minimal(today: NaiveDate, max_metric_dt: NaiveDate) -> Self {
+    GuardrailInput {
+      today,
+      current: WindowAgg {
+        revenue_usd: 0.0,
+        views: 0,
+      },
+      baseline: WindowAgg {
+        revenue_usd: 0.0,
+        views: 0,
+      },
+      max_metric_dt: Some(max_metric_dt),
+      top1_concentration_7d: None,
+      total_revenue_usd_7d: None,
+    }
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +110,23 @@ pub fn evaluate_guardrails(input: &GuardrailInput) -> Vec<GuardrailAlert> {
     }
   }
 
+  if let (Some(concentration), Some(total_rev)) =
+    (input.top1_concentration_7d, input.total_revenue_usd_7d)
+  {
+    if total_rev >= 20.0 && concentration >= 0.50 {
+      out.push(GuardrailAlert {
+        key: "rev_concentration_top1_7d",
+        kind: "Revenue concentration",
+        severity: "warning",
+        message: format!(
+          "Revenue is concentrated: top video is {:.0}% of total revenue (7d total ${:.2}).",
+          concentration * 100.0,
+          total_rev
+        ),
+      });
+    }
+  }
+
   out
 }
 
@@ -109,6 +147,8 @@ mod tests {
       },
       max_metric_dt: Some(NaiveDate::from_ymd_opt(2026, 2, 4).unwrap()),
       today: NaiveDate::from_ymd_opt(2026, 2, 5).unwrap(),
+      top1_concentration_7d: None,
+      total_revenue_usd_7d: None,
     };
 
     let alerts = evaluate_guardrails(&input);
@@ -128,9 +168,25 @@ mod tests {
       },
       max_metric_dt: Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
       today: NaiveDate::from_ymd_opt(2026, 2, 5).unwrap(),
+      top1_concentration_7d: None,
+      total_revenue_usd_7d: None,
     };
 
     let alerts = evaluate_guardrails(&input);
     assert!(alerts.iter().any(|a| a.key == "metrics_stale"));
+  }
+
+  #[test]
+  fn concentration_triggers_when_top1_over_50pct() {
+    let mut input = GuardrailInput::minimal(
+      NaiveDate::from_ymd_opt(2026, 2, 5).unwrap(),
+      NaiveDate::from_ymd_opt(2026, 2, 4).unwrap(),
+    );
+    input.top1_concentration_7d = Some(0.55);
+    input.total_revenue_usd_7d = Some(100.0);
+    let alerts = evaluate_guardrails(&input);
+    assert!(alerts
+      .iter()
+      .any(|a| a.key == "rev_concentration_top1_7d"));
   }
 }

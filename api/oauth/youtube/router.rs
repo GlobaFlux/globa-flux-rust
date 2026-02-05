@@ -2588,6 +2588,53 @@ async fn evaluate_alerts(
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
 
+    let total_rev_7d = sqlx::query_scalar::<_, Option<f64>>(
+        r#"
+      SELECT CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS total_rev
+      FROM video_daily_metrics
+      WHERE tenant_id = ?
+        AND channel_id = ?
+        AND dt BETWEEN ? AND ?
+        AND video_id <> '__CHANNEL_TOTAL__';
+    "#,
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(current_start)
+    .bind(current_end)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    let top_rev_7d = sqlx::query_scalar::<_, f64>(
+        r#"
+      SELECT CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS rev
+      FROM video_daily_metrics
+      WHERE tenant_id = ?
+        AND channel_id = ?
+        AND dt BETWEEN ? AND ?
+        AND video_id <> '__CHANNEL_TOTAL__'
+      GROUP BY video_id
+      ORDER BY rev DESC
+      LIMIT 1;
+    "#,
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(current_start)
+    .bind(current_end)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    let top1_concentration_7d = match (top_rev_7d, total_rev_7d) {
+        (Some(top_rev), Some(total_rev)) if total_rev > 0.0 => {
+            Some((top_rev / total_rev).clamp(0.0, 1.0))
+        }
+        _ => None,
+    };
+    let can_compute_concentration = top1_concentration_7d.is_some() && total_rev_7d.is_some();
+
     let base_rpm = if base_views > 0 {
         (base_rev / (base_views as f64)) * 1000.0
     } else {
@@ -2620,6 +2667,8 @@ async fn evaluate_alerts(
             views: base_views,
         },
         max_metric_dt: max_dt,
+        top1_concentration_7d,
+        total_revenue_usd_7d: total_rev_7d,
     };
 
     let desired = evaluate_guardrails(&input);
@@ -2644,6 +2693,10 @@ async fn evaluate_alerts(
 
     if can_compare && !desired_keys.contains("rpm_drop_7d") {
         auto_resolve_alert(pool, tenant_id, channel_id, "rpm_drop_7d").await?;
+    }
+
+    if can_compute_concentration && !desired_keys.contains("rev_concentration_top1_7d") {
+        auto_resolve_alert(pool, tenant_id, channel_id, "rev_concentration_top1_7d").await?;
     }
 
     Ok(())
