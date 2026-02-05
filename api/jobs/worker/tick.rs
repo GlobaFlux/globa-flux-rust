@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use chrono::{Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use http_body_util::BodyExt;
 use hyper::{HeaderMap, Method, StatusCode};
 use serde::Deserialize;
@@ -268,8 +268,8 @@ async fn evaluate_running_experiments_for_channel(
       String,
       Option<f64>,
       Option<i64>,
-      Option<chrono::NaiveDateTime>,
-      Option<chrono::NaiveDateTime>,
+      Option<DateTime<Utc>>,
+      Option<DateTime<Utc>>,
     ),
   >(
     r#"
@@ -301,10 +301,10 @@ async fn evaluate_running_experiments_for_channel(
     }
     let primary_video_id = video_ids[0].trim().to_string();
 
-    let start_dt = started_at.date();
+    let start_dt = started_at.date_naive();
     let baseline_start_dt = start_dt - Duration::days(7);
     let baseline_end_dt = start_dt - Duration::days(1);
-    let ended_dt = ended_at.map(|dt| dt.date());
+    let ended_dt = ended_at.map(|dt| dt.date_naive());
     let current_end_dt = ended_dt.unwrap_or(last_complete_dt).min(last_complete_dt);
 
     let baseline = aggregate_metrics_for_videos(
