@@ -707,6 +707,27 @@ mod tests {
               );
             }
 
+            // Views-only video-level request also returns no rows (forces channel-level fallback).
+            if query.contains("dimensions=day,video") && query.contains("metrics=views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"video","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": []
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
             // Channel-level request with revenue is forbidden.
             if query.contains("dimensions=day") && query.contains("metrics=estimatedRevenue,views") {
               let body = r#"{ "error": { "code": 403, "message": "Forbidden", "errors": [ { "message": "Forbidden", "domain": "global", "reason": "forbidden" } ] } }"#;
@@ -849,7 +870,7 @@ mod tests {
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{}/", addr);
 
-    let task = tokio::spawn(serve_reports_forbidden(listener, 3));
+    let task = tokio::spawn(serve_reports_forbidden(listener, 4));
 
     let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
