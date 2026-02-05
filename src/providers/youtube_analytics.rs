@@ -384,17 +384,26 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
 ) -> Result<Vec<VideoDailyMetricRow>, YoutubeAnalyticsError> {
   // Prefer video-level report. Some channels/projects return 0 rows for `dimensions=day,video`,
   // so we fall back to day-level aggregation to at least populate the pipeline.
+  let mut video_rows: Vec<VideoDailyMetricRow> = Vec::new();
+  let mut video_rows_views_only = false;
+
   let video_url = build_reports_url_with_ids(base_url, ids_value, start_dt, end_dt);
-  let rows = match fetch_report_json_by_url(access_token, &video_url).await {
+  match fetch_report_json_by_url(access_token, &video_url).await {
     Ok(json) => {
-      let rows = parse_rows(&json);
-      if !rows.is_empty() {
-        rows
+      let parsed = parse_rows(&json);
+      if !parsed.is_empty() {
+        video_rows = parsed;
       } else {
         let video_url = build_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
         match fetch_report_json_by_url(access_token, &video_url).await {
-          Ok(json) => parse_rows(&json),
-          Err(err) if should_fallback_to_views_only(&err) => vec![],
+          Ok(json) => {
+            let parsed = parse_rows(&json);
+            if !parsed.is_empty() {
+              video_rows = parsed;
+              video_rows_views_only = true;
+            }
+          }
+          Err(err) if should_fallback_to_views_only(&err) => {}
           Err(err) => return Err(err),
         }
       }
@@ -402,22 +411,45 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
     Err(err) if should_fallback_to_views_only(&err) => {
       let video_url = build_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
       match fetch_report_json_by_url(access_token, &video_url).await {
-        Ok(json) => parse_rows(&json),
-        Err(err) if should_fallback_to_views_only(&err) => vec![],
+        Ok(json) => {
+          let parsed = parse_rows(&json);
+          if !parsed.is_empty() {
+            video_rows = parsed;
+            video_rows_views_only = true;
+          }
+        }
+        Err(err) if should_fallback_to_views_only(&err) => {}
         Err(err) => return Err(err),
       }
     }
     Err(err) => return Err(err),
   };
-  if !rows.is_empty() {
-    return Ok(rows);
+
+  if !video_rows.is_empty() {
+    // If we only have views-only per-video data, we still want channel-level totals so revenue/RPM guardrails work.
+    if video_rows_views_only {
+      let channel_url = build_channel_reports_url_with_ids(base_url, ids_value, start_dt, end_dt);
+      let totals_rows = match fetch_report_json_by_url(access_token, &channel_url).await {
+        Ok(json) => parse_rows_channel(&json),
+        Err(err) if should_fallback_to_views_only(&err) => {
+          let channel_url =
+            build_channel_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
+          let json = fetch_report_json_by_url(access_token, &channel_url).await?;
+          parse_rows_channel(&json)
+        }
+        Err(err) => return Err(err),
+      };
+      video_rows.extend(totals_rows);
+    }
+    return Ok(video_rows);
   }
 
   let channel_url = build_channel_reports_url_with_ids(base_url, ids_value, start_dt, end_dt);
   match fetch_report_json_by_url(access_token, &channel_url).await {
     Ok(json) => Ok(parse_rows_channel(&json)),
     Err(err) if should_fallback_to_views_only(&err) => {
-      let channel_url = build_channel_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
+      let channel_url =
+        build_channel_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
       let json = fetch_report_json_by_url(access_token, &channel_url).await?;
       Ok(parse_rows_channel(&json))
     }
@@ -639,6 +671,28 @@ mod tests {
               );
             }
 
+            if query.contains("dimensions=day") && query.contains("metrics=estimatedRevenue,views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"estimatedRevenue","columnType":"METRIC","dataType":"FLOAT"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": [
+                    ["2026-01-02", 1.25, 200]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
             Ok::<_, hyper::Error>(
               Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -658,7 +712,7 @@ mod tests {
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{}/", addr);
 
-    let task = tokio::spawn(serve_reports(listener, 2));
+    let task = tokio::spawn(serve_reports(listener, 3));
 
     let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
@@ -667,10 +721,19 @@ mod tests {
         .await
         .unwrap();
 
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
-    assert_eq!(rows[0].video_id, "vid1");
-    assert_eq!(rows[0].views, 200);
+    assert_eq!(rows.len(), 2);
+    let video = rows.iter().find(|r| r.video_id == "vid1").unwrap();
+    assert_eq!(video.dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    assert_eq!(video.views, 200);
+    assert_eq!(video.estimated_revenue_usd, 0.0);
+
+    let total = rows
+      .iter()
+      .find(|r| r.video_id == FALLBACK_CHANNEL_VIDEO_ID)
+      .unwrap();
+    assert_eq!(total.dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    assert_eq!(total.views, 200);
+    assert_eq!(total.estimated_revenue_usd, 1.25);
 
     task.await.unwrap();
   }
@@ -827,6 +890,28 @@ mod tests {
               );
             }
 
+            if query.contains("dimensions=day") && query.contains("metrics=estimatedRevenue,views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"estimatedRevenue","columnType":"METRIC","dataType":"FLOAT"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": [
+                    ["2026-01-02", 1.25, 200]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
             Ok::<_, hyper::Error>(
               Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -846,7 +931,7 @@ mod tests {
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{}/", addr);
 
-    let task = tokio::spawn(serve_reports_empty_rows(listener, 2));
+    let task = tokio::spawn(serve_reports_empty_rows(listener, 3));
 
     let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
@@ -855,11 +940,19 @@ mod tests {
         .await
         .unwrap();
 
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
-    assert_eq!(rows[0].video_id, "vid1");
-    assert_eq!(rows[0].views, 200);
-    assert_eq!(rows[0].estimated_revenue_usd, 0.0);
+    assert_eq!(rows.len(), 2);
+    let video = rows.iter().find(|r| r.video_id == "vid1").unwrap();
+    assert_eq!(video.dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    assert_eq!(video.views, 200);
+    assert_eq!(video.estimated_revenue_usd, 0.0);
+
+    let total = rows
+      .iter()
+      .find(|r| r.video_id == FALLBACK_CHANNEL_VIDEO_ID)
+      .unwrap();
+    assert_eq!(total.dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    assert_eq!(total.views, 200);
+    assert_eq!(total.estimated_revenue_usd, 1.25);
 
     task.await.unwrap();
   }
