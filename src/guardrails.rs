@@ -69,6 +69,26 @@ pub fn evaluate_guardrails(input: &GuardrailInput) -> Vec<GuardrailAlert> {
     }
   }
 
+  match input.max_metric_dt {
+    None => out.push(GuardrailAlert {
+      key: "metrics_stale",
+      kind: "Data missing",
+      severity: "info",
+      message: "No metrics found yet. Upload CSV or wait for the first sync.".to_string(),
+    }),
+    Some(dt) => {
+      let age_days = (input.today - dt).num_days();
+      if age_days >= 3 {
+        out.push(GuardrailAlert {
+          key: "metrics_stale",
+          kind: "Data stale",
+          severity: "warning",
+          message: format!("Metrics look stale (latest day {}). Upload CSV or run a sync.", dt),
+        });
+      }
+    }
+  }
+
   out
 }
 
@@ -94,5 +114,23 @@ mod tests {
     let alerts = evaluate_guardrails(&input);
     assert!(alerts.iter().any(|a| a.key == "rpm_drop_7d"));
   }
-}
 
+  #[test]
+  fn stale_metrics_triggers_alert() {
+    let input = GuardrailInput {
+      current: WindowAgg {
+        revenue_usd: 0.0,
+        views: 0,
+      },
+      baseline: WindowAgg {
+        revenue_usd: 0.0,
+        views: 0,
+      },
+      max_metric_dt: Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+      today: NaiveDate::from_ymd_opt(2026, 2, 5).unwrap(),
+    };
+
+    let alerts = evaluate_guardrails(&input);
+    assert!(alerts.iter().any(|a| a.key == "metrics_stale"));
+  }
+}

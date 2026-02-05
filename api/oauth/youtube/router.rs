@@ -14,6 +14,7 @@ use globa_flux_rust::db::{
     upsert_youtube_oauth_app_config,
 };
 use globa_flux_rust::decision_engine::{compute_decision, DecisionEngineConfig};
+use globa_flux_rust::guardrails::{evaluate_guardrails, GuardrailInput, WindowAgg};
 use globa_flux_rust::providers::youtube::{
     build_authorize_url, exchange_code_for_tokens, refresh_tokens, youtube_oauth_client_from_config,
 };
@@ -2472,16 +2473,6 @@ async fn handle_youtube_upload_csv(
     )
 }
 
-fn severity_for_drop(drop_pct: f64) -> &'static str {
-    if drop_pct >= 0.30 {
-        "critical"
-    } else if drop_pct >= 0.20 {
-        "error"
-    } else {
-        "warning"
-    }
-}
-
 async fn upsert_alert(
     pool: &sqlx::MySqlPool,
     tenant_id: &str,
@@ -2553,6 +2544,8 @@ async fn evaluate_alerts(
     tenant_id: &str,
     channel_id: &str,
 ) -> Result<(), Error> {
+    use std::collections::HashSet;
+
     let today = Utc::now().date_naive();
     let current_start = today - Duration::days(7);
     let current_end = today - Duration::days(1);
@@ -2595,11 +2588,6 @@ async fn evaluate_alerts(
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
 
-    let cur_rpm = if cur_views > 0 {
-        (cur_rev / (cur_views as f64)) * 1000.0
-    } else {
-        0.0
-    };
     let base_rpm = if base_views > 0 {
         (base_rev / (base_views as f64)) * 1000.0
     } else {
@@ -2607,30 +2595,6 @@ async fn evaluate_alerts(
     };
 
     let can_compare = cur_views >= 1000 && base_views >= 1000 && base_rpm > 0.0;
-    if can_compare {
-        let drop_pct = ((base_rpm - cur_rpm) / base_rpm).max(-1.0);
-        if drop_pct >= 0.10 {
-            let severity = severity_for_drop(drop_pct);
-            let msg = format!(
-                "Revenue per mille dropped {:.0}% vs previous 7d (current ${:.2}, prev ${:.2}).",
-                drop_pct * 100.0,
-                cur_rpm,
-                base_rpm
-            );
-            upsert_alert(
-                pool,
-                tenant_id,
-                channel_id,
-                "rpm_drop_7d",
-                "RPM drop",
-                severity,
-                &msg,
-            )
-            .await?;
-        } else {
-            auto_resolve_alert(pool, tenant_id, channel_id, "rpm_drop_7d").await?;
-        }
-    }
 
     let max_dt = sqlx::query_scalar::<_, Option<NaiveDate>>(
         r#"
@@ -2645,40 +2609,41 @@ async fn evaluate_alerts(
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
 
-    match max_dt {
-        None => {
-            upsert_alert(
-                pool,
-                tenant_id,
-                channel_id,
-                "metrics_stale",
-                "Data missing",
-                "info",
-                "No metrics found yet. Upload CSV or wait for the first sync.",
-            )
-            .await?;
-        }
-        Some(dt) => {
-            let age_days = (today - dt).num_days();
-            if age_days >= 3 {
-                let msg = format!(
-                    "Metrics look stale (latest day {}). Upload CSV or run a sync.",
-                    dt.to_string()
-                );
-                upsert_alert(
-                    pool,
-                    tenant_id,
-                    channel_id,
-                    "metrics_stale",
-                    "Data stale",
-                    "warning",
-                    &msg,
-                )
-                .await?;
-            } else {
-                auto_resolve_alert(pool, tenant_id, channel_id, "metrics_stale").await?;
-            }
-        }
+    let input = GuardrailInput {
+        today,
+        current: WindowAgg {
+            revenue_usd: cur_rev,
+            views: cur_views,
+        },
+        baseline: WindowAgg {
+            revenue_usd: base_rev,
+            views: base_views,
+        },
+        max_metric_dt: max_dt,
+    };
+
+    let desired = evaluate_guardrails(&input);
+    let desired_keys: HashSet<&str> = desired.iter().map(|a| a.key).collect();
+
+    for alert in desired.iter() {
+        upsert_alert(
+            pool,
+            tenant_id,
+            channel_id,
+            alert.key,
+            alert.kind,
+            alert.severity,
+            &alert.message,
+        )
+        .await?;
+    }
+
+    if !desired_keys.contains("metrics_stale") {
+        auto_resolve_alert(pool, tenant_id, channel_id, "metrics_stale").await?;
+    }
+
+    if can_compare && !desired_keys.contains("rpm_drop_7d") {
+        auto_resolve_alert(pool, tenant_id, channel_id, "rpm_drop_7d").await?;
     }
 
     Ok(())
