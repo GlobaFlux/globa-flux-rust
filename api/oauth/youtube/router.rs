@@ -14,7 +14,7 @@ use globa_flux_rust::db::{
     upsert_youtube_oauth_app_config,
 };
 use globa_flux_rust::decision_engine::{compute_decision, DecisionEngineConfig};
-use globa_flux_rust::guardrails::{evaluate_guardrails, GuardrailInput, WindowAgg};
+use globa_flux_rust::guardrails::{evaluate_guardrails, GuardrailAlert, GuardrailInput, WindowAgg};
 use globa_flux_rust::providers::youtube::{
     build_authorize_url, exchange_code_for_tokens, refresh_tokens, youtube_oauth_client_from_config,
 };
@@ -1163,16 +1163,29 @@ async fn handle_youtube_metrics_daily(
         .await
         .map_err(|e| -> Error { Box::new(e) })?
     } else {
-        sqlx::query_as::<_, (NaiveDate, f64, i64, i64)>(
+        let totals = sqlx::query_as::<_, (NaiveDate, f64, i64, i64)>(
             r#"
         SELECT dt,
-               CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS revenue_usd,
-               CAST(SUM(impressions) AS SIGNED) AS impressions,
-               CAST(SUM(views) AS SIGNED) AS views
+               CAST(COALESCE(
+                 SUM(CASE WHEN video_id='csv_channel_total' THEN estimated_revenue_usd END),
+                 SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' THEN estimated_revenue_usd END),
+                 0
+               ) AS DOUBLE) AS revenue_usd,
+               CAST(COALESCE(
+                 SUM(CASE WHEN video_id='csv_channel_total' THEN impressions END),
+                 SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' THEN impressions END),
+                 0
+               ) AS SIGNED) AS impressions,
+               CAST(COALESCE(
+                 SUM(CASE WHEN video_id='csv_channel_total' THEN views END),
+                 SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' THEN views END),
+                 0
+               ) AS SIGNED) AS views
         FROM video_daily_metrics
         WHERE tenant_id = ?
           AND channel_id = ?
           AND dt BETWEEN ? AND ?
+          AND video_id IN ('__CHANNEL_TOTAL__','csv_channel_total')
         GROUP BY dt
         ORDER BY dt ASC;
       "#,
@@ -1183,7 +1196,34 @@ async fn handle_youtube_metrics_daily(
         .bind(end_dt)
         .fetch_all(pool)
         .await
-        .map_err(|e| -> Error { Box::new(e) })?
+        .map_err(|e| -> Error { Box::new(e) })?;
+
+        if !totals.is_empty() {
+            totals
+        } else {
+            sqlx::query_as::<_, (NaiveDate, f64, i64, i64)>(
+                r#"
+          SELECT dt,
+                 CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS revenue_usd,
+                 CAST(SUM(impressions) AS SIGNED) AS impressions,
+                 CAST(SUM(views) AS SIGNED) AS views
+          FROM video_daily_metrics
+          WHERE tenant_id = ?
+            AND channel_id = ?
+            AND dt BETWEEN ? AND ?
+            AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total')
+          GROUP BY dt
+          ORDER BY dt ASC;
+        "#,
+            )
+            .bind(tenant_id.trim())
+            .bind(channel_id.trim())
+            .bind(start_dt)
+            .bind(end_dt)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?
+        }
     };
 
     let video_id_out = video_id_filter.unwrap_or_else(|| "channel_total".to_string());
@@ -1301,6 +1341,7 @@ async fn handle_youtube_sponsor_quote_defaults(
       WHERE tenant_id = ?
         AND channel_id = ?
         AND dt BETWEEN ? AND ?
+        AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total')
       GROUP BY video_id
       ORDER BY views_28d DESC
       LIMIT 10;
@@ -1425,6 +1466,7 @@ async fn handle_youtube_sponsor_quote(
       WHERE tenant_id = ?
         AND channel_id = ?
         AND dt BETWEEN ? AND ?
+        AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total')
       GROUP BY video_id
       ORDER BY views_28d DESC
       LIMIT 10;
@@ -1452,30 +1494,51 @@ async fn handle_youtube_sponsor_quote(
     let rpm_base = if let Some(hint) = parsed.rpm_hint.filter(|v| *v > 0.0) {
         hint
     } else {
-        let rpm_row = sqlx::query_as::<_, (f64, i64)>(
+        let (total_rows, total_rev, total_views) = sqlx::query_as::<_, (i64, f64, i64)>(
             r#"
-        SELECT CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
+        SELECT CAST(COUNT(*) AS SIGNED) AS rows_n,
+               CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
                CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views
         FROM video_daily_metrics
         WHERE tenant_id = ?
           AND channel_id = ?
-          AND dt BETWEEN ? AND ?;
+          AND dt BETWEEN ? AND ?
+          AND video_id IN ('__CHANNEL_TOTAL__','csv_channel_total');
       "#,
         )
         .bind(parsed.tenant_id.trim())
         .bind(channel_id.trim())
         .bind(start_dt)
         .bind(end_dt)
-        .fetch_optional(pool)
+        .fetch_one(pool)
         .await
         .map_err(|e| -> Error { Box::new(e) })?;
 
-        if let Some((revenue, views)) = rpm_row {
-            if views > 0 && revenue > 0.0 {
-                (revenue / (views as f64)) * 1000.0
-            } else {
-                12.0
-            }
+        let (revenue, views) = if total_rows > 0 {
+            (total_rev, total_views)
+        } else {
+            sqlx::query_as::<_, (f64, i64)>(
+                r#"
+          SELECT CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
+                 CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views
+          FROM video_daily_metrics
+          WHERE tenant_id = ?
+            AND channel_id = ?
+            AND dt BETWEEN ? AND ?
+            AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total');
+        "#,
+            )
+            .bind(parsed.tenant_id.trim())
+            .bind(channel_id.trim())
+            .bind(start_dt)
+            .bind(end_dt)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?
+        };
+
+        if views > 0 && revenue > 0.0 {
+            (revenue / (views as f64)) * 1000.0
         } else {
             12.0
         }
@@ -2548,6 +2611,60 @@ async fn evaluate_alerts(
     channel_id: &str,
 ) -> Result<(), Error> {
     use std::collections::HashSet;
+    use std::collections::HashMap;
+
+    async fn sum_rev_views_window(
+        pool: &sqlx::MySqlPool,
+        tenant_id: &str,
+        channel_id: &str,
+        start_dt: NaiveDate,
+        end_dt: NaiveDate,
+    ) -> Result<(f64, i64, &'static str), Error> {
+        let (rows_n, rev, views) = sqlx::query_as::<_, (i64, f64, i64)>(
+            r#"
+          SELECT CAST(COUNT(*) AS SIGNED) AS rows_n,
+                 CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
+                 CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views
+          FROM video_daily_metrics
+          WHERE tenant_id = ?
+            AND channel_id = ?
+            AND dt BETWEEN ? AND ?
+            AND video_id IN ('__CHANNEL_TOTAL__','csv_channel_total');
+        "#,
+        )
+        .bind(tenant_id)
+        .bind(channel_id)
+        .bind(start_dt)
+        .bind(end_dt)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+
+        if rows_n > 0 {
+            return Ok((rev, views, "channel_total"));
+        }
+
+        let (rev, views) = sqlx::query_as::<_, (f64, i64)>(
+            r#"
+          SELECT CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
+                 CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views
+          FROM video_daily_metrics
+          WHERE tenant_id = ?
+            AND channel_id = ?
+            AND dt BETWEEN ? AND ?
+            AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total');
+        "#,
+        )
+        .bind(tenant_id)
+        .bind(channel_id)
+        .bind(start_dt)
+        .bind(end_dt)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+
+        Ok((rev, views, "video_sum"))
+    }
 
     let today = Utc::now().date_naive();
     let current_start = today - Duration::days(7);
@@ -2555,41 +2672,10 @@ async fn evaluate_alerts(
     let baseline_start = today - Duration::days(14);
     let baseline_end = today - Duration::days(8);
 
-    let (cur_rev, cur_views) = sqlx::query_as::<_, (f64, i64)>(
-        r#"
-      SELECT CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
-             CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views
-      FROM video_daily_metrics
-      WHERE tenant_id = ?
-        AND channel_id = ?
-        AND dt BETWEEN ? AND ?;
-    "#,
-    )
-    .bind(tenant_id)
-    .bind(channel_id)
-    .bind(current_start)
-    .bind(current_end)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
-
-    let (base_rev, base_views) = sqlx::query_as::<_, (f64, i64)>(
-        r#"
-      SELECT CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
-             CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views
-      FROM video_daily_metrics
-      WHERE tenant_id = ?
-        AND channel_id = ?
-        AND dt BETWEEN ? AND ?;
-    "#,
-    )
-    .bind(tenant_id)
-    .bind(channel_id)
-    .bind(baseline_start)
-    .bind(baseline_end)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
+    let (cur_rev, cur_views, cur_source) =
+        sum_rev_views_window(pool, tenant_id, channel_id, current_start, current_end).await?;
+    let (base_rev, base_views, base_source) =
+        sum_rev_views_window(pool, tenant_id, channel_id, baseline_start, baseline_end).await?;
 
     let total_rev_7d = sqlx::query_scalar::<_, Option<f64>>(
         r#"
@@ -2598,7 +2684,7 @@ async fn evaluate_alerts(
       WHERE tenant_id = ?
         AND channel_id = ?
         AND dt BETWEEN ? AND ?
-        AND video_id <> '__CHANNEL_TOTAL__';
+        AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total');
     "#,
     )
     .bind(tenant_id)
@@ -2609,14 +2695,14 @@ async fn evaluate_alerts(
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
 
-    let top_rev_7d = sqlx::query_scalar::<_, f64>(
+    let top_video_7d = sqlx::query_as::<_, (String, f64)>(
         r#"
-      SELECT CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS rev
+      SELECT video_id, CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS rev
       FROM video_daily_metrics
       WHERE tenant_id = ?
         AND channel_id = ?
         AND dt BETWEEN ? AND ?
-        AND video_id <> '__CHANNEL_TOTAL__'
+        AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total')
       GROUP BY video_id
       ORDER BY rev DESC
       LIMIT 1;
@@ -2630,9 +2716,9 @@ async fn evaluate_alerts(
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
 
-    let top1_concentration_7d = match (top_rev_7d, total_rev_7d) {
-        (Some(top_rev), Some(total_rev)) if total_rev > 0.0 => {
-            Some((top_rev / total_rev).clamp(0.0, 1.0))
+    let top1_concentration_7d = match (top_video_7d.as_ref(), total_rev_7d) {
+        (Some((_video_id, top_rev)), Some(total_rev)) if total_rev > 0.0 => {
+            Some((*top_rev / total_rev).clamp(0.0, 1.0))
         }
         _ => None,
     };
@@ -2640,12 +2726,17 @@ async fn evaluate_alerts(
 
     let mut daily_totals = sqlx::query_as::<_, (NaiveDate, f64)>(
         r#"
-      SELECT dt, CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS rev
+      SELECT dt,
+             CAST(COALESCE(
+               SUM(CASE WHEN video_id='csv_channel_total' THEN estimated_revenue_usd END),
+               SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' THEN estimated_revenue_usd END),
+               0
+             ) AS DOUBLE) AS rev
       FROM video_daily_metrics
       WHERE tenant_id = ?
         AND channel_id = ?
         AND dt BETWEEN ? AND ?
-        AND video_id = '__CHANNEL_TOTAL__'
+        AND video_id IN ('__CHANNEL_TOTAL__','csv_channel_total')
       GROUP BY dt
       ORDER BY dt ASC;
     "#,
@@ -2666,7 +2757,7 @@ async fn evaluate_alerts(
         WHERE tenant_id = ?
           AND channel_id = ?
           AND dt BETWEEN ? AND ?
-          AND video_id <> '__CHANNEL_TOTAL__'
+          AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total')
         GROUP BY dt
         ORDER BY dt ASC;
       "#,
@@ -2741,10 +2832,182 @@ async fn evaluate_alerts(
         revenue_stddev_usd_7d: rev_stddev_7d,
     };
 
-    let desired = evaluate_guardrails(&input);
+    let mut desired = evaluate_guardrails(&input);
+
+    let latest_job = sqlx::query_as::<_, (String, Option<NaiveDate>, i32, i32, Option<String>)>(
+        r#"
+      SELECT status, run_for_dt, attempt, max_attempt, last_error
+      FROM job_tasks
+      WHERE tenant_id = ?
+        AND channel_id = ?
+        AND job_type = 'daily_channel'
+        AND run_for_dt IS NOT NULL
+      ORDER BY run_for_dt DESC, id DESC
+      LIMIT 1;
+    "#,
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    let mut forbidden = false;
+    let mut unsupported = false;
+    let mut latest_job_details: Option<serde_json::Value> = None;
+    if let Some((status, run_for_dt, attempt, max_attempt, last_error)) = latest_job.as_ref() {
+        latest_job_details = Some(serde_json::json!({
+          "job_type": "daily_channel",
+          "status": status,
+          "run_for_dt": run_for_dt.map(|d| d.to_string()),
+          "attempt": attempt,
+          "max_attempt": max_attempt,
+          "last_error": last_error.as_deref().map(|v| truncate_string(v, 600)),
+        }));
+
+        if status != "succeeded" {
+            if let Some(err) = last_error.as_deref() {
+                let msg = err.to_ascii_lowercase();
+                forbidden = msg.contains("status 403") || msg.contains("reason\": \"forbidden\"");
+                unsupported = msg.contains("status 400") && msg.contains("not supported");
+
+                if forbidden {
+                    desired.push(GuardrailAlert {
+                        key: "youtube_analytics_forbidden",
+                        kind: "YouTube Analytics",
+                        severity: "warning",
+                        message: "YouTube Analytics blocked revenue metrics (403 Forbidden). Reconnect YouTube or upload CSV for revenue/RPM guardrails.".to_string(),
+                    });
+                }
+
+                if unsupported {
+                    desired.push(GuardrailAlert {
+                        key: "youtube_analytics_query_unsupported",
+                        kind: "YouTube Analytics",
+                        severity: "info",
+                        message: "YouTube Analytics does not support this report for your channel (400). We'll sync views-only; upload CSV for revenue/RPM.".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let revenue_missing = !forbidden && !unsupported && cur_views >= 10_000 && cur_rev <= 0.01;
+    if revenue_missing {
+        desired.push(GuardrailAlert {
+            key: "revenue_missing_7d",
+            kind: "Revenue missing",
+            severity: "info",
+            message: "Views are present but revenue is zero (last 7d). Channel may not be monetized or monetary Analytics access is unavailable; upload CSV if you need revenue/RPM.".to_string(),
+        });
+    }
+
+    let cur_rpm = if cur_views > 0 {
+        (cur_rev / (cur_views as f64)) * 1000.0
+    } else {
+        0.0
+    };
+    let base_rpm = if base_views > 0 {
+        (base_rev / (base_views as f64)) * 1000.0
+    } else {
+        0.0
+    };
+    let rpm_drop_pct = if base_rpm > 0.0 {
+        ((base_rpm - cur_rpm) / base_rpm).max(-1.0)
+    } else {
+        0.0
+    };
+
+    let mut details_by_key: HashMap<&'static str, String> = HashMap::new();
+
+    details_by_key.insert(
+        "rpm_drop_7d",
+        serde_json::json!({
+          "window": {
+            "current": { "start_dt": current_start.to_string(), "end_dt": current_end.to_string(), "revenue_usd": round2(cur_rev), "views": cur_views, "rpm": round2(cur_rpm), "source": cur_source },
+            "baseline": { "start_dt": baseline_start.to_string(), "end_dt": baseline_end.to_string(), "revenue_usd": round2(base_rev), "views": base_views, "rpm": round2(base_rpm), "source": base_source },
+          },
+          "rpm_drop_pct": (rpm_drop_pct * 10000.0).round() / 10000.0,
+        })
+        .to_string(),
+    );
+
+    let stale_age_days = max_dt.map(|dt| (today - dt).num_days());
+    details_by_key.insert(
+        "metrics_stale",
+        serde_json::json!({
+          "today": today.to_string(),
+          "max_metric_dt": max_dt.map(|d| d.to_string()),
+          "age_days": stale_age_days,
+        })
+        .to_string(),
+    );
+
+    if can_compute_concentration {
+        details_by_key.insert(
+            "rev_concentration_top1_7d",
+            serde_json::json!({
+              "window": { "start_dt": current_start.to_string(), "end_dt": current_end.to_string() },
+              "total_revenue_usd_7d": total_rev_7d.map(round2),
+              "top_video": top_video_7d.as_ref().map(|(video_id, rev)| serde_json::json!({"video_id": video_id, "revenue_usd": round2(*rev)})),
+              "top1_concentration_7d": top1_concentration_7d,
+            })
+            .to_string(),
+        );
+    }
+
+    if can_compute_volatility {
+        let daily: Vec<serde_json::Value> = daily_totals
+            .iter()
+            .map(|(dt, rev)| {
+                serde_json::json!({"dt": dt.to_string(), "revenue_usd": round2(*rev)})
+            })
+            .collect();
+        details_by_key.insert(
+            "rev_volatility_7d",
+            serde_json::json!({
+              "window": { "start_dt": current_start.to_string(), "end_dt": current_end.to_string() },
+              "revenue_mean_usd_7d": rev_mean_7d.map(round2),
+              "revenue_stddev_usd_7d": rev_stddev_7d.map(round2),
+              "daily_revenue_usd": daily,
+            })
+            .to_string(),
+        );
+    }
+
+    if let Some(job) = latest_job_details.as_ref() {
+        if forbidden {
+            details_by_key.insert(
+                "youtube_analytics_forbidden",
+                serde_json::json!({"job": job}).to_string(),
+            );
+        }
+        if unsupported {
+            details_by_key.insert(
+                "youtube_analytics_query_unsupported",
+                serde_json::json!({"job": job}).to_string(),
+            );
+        }
+    }
+
+    if revenue_missing {
+        details_by_key.insert(
+            "revenue_missing_7d",
+            serde_json::json!({
+              "window": { "start_dt": current_start.to_string(), "end_dt": current_end.to_string() },
+              "revenue_usd": round2(cur_rev),
+              "views": cur_views,
+              "rpm": round2(cur_rpm),
+              "source": cur_source,
+              "threshold": { "views": 10_000, "revenue_usd": 0.01 },
+            })
+            .to_string(),
+        );
+    }
     let desired_keys: HashSet<&str> = desired.iter().map(|a| a.key).collect();
 
     for alert in desired.iter() {
+        let details_json = details_by_key.get(alert.key).map(|v| v.as_str());
         upsert_alert(
             pool,
             tenant_id,
@@ -2753,7 +3016,7 @@ async fn evaluate_alerts(
             alert.kind,
             alert.severity,
             &alert.message,
-            None,
+            details_json,
         )
         .await?;
     }
@@ -2772,6 +3035,24 @@ async fn evaluate_alerts(
 
     if can_compute_volatility && !desired_keys.contains("rev_volatility_7d") {
         auto_resolve_alert(pool, tenant_id, channel_id, "rev_volatility_7d").await?;
+    }
+
+    if !desired_keys.contains("youtube_analytics_forbidden") {
+        auto_resolve_alert(pool, tenant_id, channel_id, "youtube_analytics_forbidden").await?;
+    }
+
+    if !desired_keys.contains("youtube_analytics_query_unsupported") {
+        auto_resolve_alert(
+            pool,
+            tenant_id,
+            channel_id,
+            "youtube_analytics_query_unsupported",
+        )
+        .await?;
+    }
+
+    if !desired_keys.contains("revenue_missing_7d") {
+        auto_resolve_alert(pool, tenant_id, channel_id, "revenue_missing_7d").await?;
     }
 
     Ok(())

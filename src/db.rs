@@ -1300,6 +1300,7 @@ pub async fn fetch_new_video_publish_counts_by_dt(
         FROM video_daily_metrics
         WHERE tenant_id = ?
           AND channel_id = ?
+          AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total')
         GROUP BY video_id
       ) AS v
       WHERE first_dt BETWEEN ? AND ?
@@ -1381,13 +1382,37 @@ pub async fn fetch_revenue_sum_usd_7d(
   start_dt: chrono::NaiveDate,
   end_dt: chrono::NaiveDate,
 ) -> Result<f64, Error> {
+  let (total_rows, total_sum_usd): (i64, f64) = sqlx::query_as(
+    r#"
+      SELECT CAST(COUNT(*) AS SIGNED) AS rows_n,
+             COALESCE(SUM(CAST(estimated_revenue_usd AS DOUBLE)), 0) AS revenue_sum_usd
+      FROM video_daily_metrics
+      WHERE tenant_id = ?
+        AND channel_id = ?
+        AND dt BETWEEN ? AND ?
+        AND video_id IN ('__CHANNEL_TOTAL__','csv_channel_total');
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(channel_id)
+  .bind(start_dt)
+  .bind(end_dt)
+  .fetch_one(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  if total_rows > 0 {
+    return Ok(total_sum_usd);
+  }
+
   let (sum_usd,): (f64,) = sqlx::query_as(
     r#"
       SELECT COALESCE(SUM(CAST(estimated_revenue_usd AS DOUBLE)), 0) AS revenue_sum_usd
       FROM video_daily_metrics
       WHERE tenant_id = ?
         AND channel_id = ?
-        AND dt BETWEEN ? AND ?;
+        AND dt BETWEEN ? AND ?
+        AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total');
     "#,
   )
   .bind(tenant_id)
@@ -1417,6 +1442,7 @@ pub async fn fetch_top_video_ids_by_revenue(
       WHERE tenant_id = ?
         AND channel_id = ?
         AND dt BETWEEN ? AND ?
+        AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total')
       GROUP BY video_id
       ORDER BY SUM(CAST(estimated_revenue_usd AS DOUBLE)) DESC
       LIMIT ?;
