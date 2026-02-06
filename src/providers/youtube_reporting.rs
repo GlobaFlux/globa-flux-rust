@@ -52,9 +52,27 @@ pub fn build_report_types_list_url(base_url: &str, content_owner_id: &str) -> St
   format!("{base}/reportTypes?onBehalfOfContentOwner={content_owner_id}")
 }
 
+pub fn build_report_types_list_url_channel(base_url: &str, include_system_managed: bool) -> String {
+  let base = base_url.trim_end_matches('/');
+  let mut url = format!("{base}/reportTypes");
+  if include_system_managed {
+    url.push_str("?includeSystemManaged=true");
+  }
+  url
+}
+
 pub fn build_jobs_list_url(base_url: &str, content_owner_id: &str) -> String {
   let base = base_url.trim_end_matches('/');
   format!("{base}/jobs?onBehalfOfContentOwner={content_owner_id}")
+}
+
+pub fn build_jobs_list_url_channel(base_url: &str, include_system_managed: bool) -> String {
+  let base = base_url.trim_end_matches('/');
+  let mut url = format!("{base}/jobs");
+  if include_system_managed {
+    url.push_str("?includeSystemManaged=true");
+  }
+  url
 }
 
 pub fn build_reports_list_url(
@@ -69,6 +87,20 @@ pub fn build_reports_list_url(
   );
   if let Some(created_after) = created_after {
     url.push_str("&createdAfter=");
+    url.push_str(created_after);
+  }
+  url
+}
+
+pub fn build_reports_list_url_channel(
+  base_url: &str,
+  job_id: &str,
+  created_after: Option<&str>,
+) -> String {
+  let base = base_url.trim_end_matches('/');
+  let mut url = format!("{base}/jobs/{job_id}/reports");
+  if let Some(created_after) = created_after {
+    url.push_str("?createdAfter=");
     url.push_str(created_after);
   }
   url
@@ -393,6 +425,29 @@ pub async fn create_job_for_report_type_with_base_url(
   Ok(job_id)
 }
 
+pub async fn create_job_for_report_type_channel_with_base_url(
+  access_token: &str,
+  report_type_id: &str,
+  base_url: &str,
+) -> Result<String, YoutubeReportingError> {
+  let url = build_jobs_list_url_channel(base_url, false);
+  let body = serde_json::json!({
+    "reportTypeId": report_type_id,
+    "name": report_type_id
+  });
+
+  let json = request_json(access_token, Method::POST, &url, Some(body)).await?;
+  let job_id = json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+  if job_id.is_empty() {
+    return Err(YoutubeReportingError {
+      status: None,
+      message: "Missing job id in response".to_string(),
+    });
+  }
+
+  Ok(job_id)
+}
+
 pub async fn ensure_job_for_report_type_with_base_url(
   access_token: &str,
   content_owner_id: &str,
@@ -410,12 +465,35 @@ pub async fn ensure_job_for_report_type_with_base_url(
   create_job_for_report_type_with_base_url(access_token, content_owner_id, report_type_id, base_url).await
 }
 
+pub async fn ensure_job_for_report_type_channel_with_base_url(
+  access_token: &str,
+  report_type_id: &str,
+  base_url: &str,
+) -> Result<String, YoutubeReportingError> {
+  let jobs = list_jobs_channel_with_base_url(access_token, base_url, true).await?;
+  if let Some(job) = jobs
+    .into_iter()
+    .find(|j| j.report_type_id.as_deref() == Some(report_type_id))
+  {
+    return Ok(job.job_id);
+  }
+
+  create_job_for_report_type_channel_with_base_url(access_token, report_type_id, base_url).await
+}
+
 pub async fn ensure_job_for_report_type(
   access_token: &str,
   content_owner_id: &str,
   report_type_id: &str,
 ) -> Result<String, YoutubeReportingError> {
   ensure_job_for_report_type_with_base_url(access_token, content_owner_id, report_type_id, DEFAULT_BASE_URL).await
+}
+
+pub async fn ensure_job_for_report_type_channel(
+  access_token: &str,
+  report_type_id: &str,
+) -> Result<String, YoutubeReportingError> {
+  ensure_job_for_report_type_channel_with_base_url(access_token, report_type_id, DEFAULT_BASE_URL).await
 }
 
 pub async fn list_report_types_with_base_url(
@@ -435,6 +513,23 @@ pub async fn list_report_types(
   list_report_types_with_base_url(access_token, content_owner_id, DEFAULT_BASE_URL).await
 }
 
+pub async fn list_report_types_channel_with_base_url(
+  access_token: &str,
+  base_url: &str,
+  include_system_managed: bool,
+) -> Result<Vec<YoutubeReportingReportType>, YoutubeReportingError> {
+  let url = build_report_types_list_url_channel(base_url, include_system_managed);
+  let json = fetch_json_by_url(access_token, &url).await?;
+  Ok(parse_report_types(&json))
+}
+
+pub async fn list_report_types_channel(
+  access_token: &str,
+  include_system_managed: bool,
+) -> Result<Vec<YoutubeReportingReportType>, YoutubeReportingError> {
+  list_report_types_channel_with_base_url(access_token, DEFAULT_BASE_URL, include_system_managed).await
+}
+
 pub async fn list_jobs_with_base_url(
   access_token: &str,
   content_owner_id: &str,
@@ -450,6 +545,23 @@ pub async fn list_jobs(
   content_owner_id: &str,
 ) -> Result<Vec<YoutubeReportingJob>, YoutubeReportingError> {
   list_jobs_with_base_url(access_token, content_owner_id, DEFAULT_BASE_URL).await
+}
+
+pub async fn list_jobs_channel_with_base_url(
+  access_token: &str,
+  base_url: &str,
+  include_system_managed: bool,
+) -> Result<Vec<YoutubeReportingJob>, YoutubeReportingError> {
+  let url = build_jobs_list_url_channel(base_url, include_system_managed);
+  let json = fetch_json_by_url(access_token, &url).await?;
+  Ok(parse_jobs(&json))
+}
+
+pub async fn list_jobs_channel(
+  access_token: &str,
+  include_system_managed: bool,
+) -> Result<Vec<YoutubeReportingJob>, YoutubeReportingError> {
+  list_jobs_channel_with_base_url(access_token, DEFAULT_BASE_URL, include_system_managed).await
 }
 
 pub async fn list_reports_with_base_url(
@@ -471,6 +583,25 @@ pub async fn list_reports(
   created_after: Option<&str>,
 ) -> Result<Vec<YoutubeReportingReport>, YoutubeReportingError> {
   list_reports_with_base_url(access_token, job_id, content_owner_id, DEFAULT_BASE_URL, created_after).await
+}
+
+pub async fn list_reports_channel_with_base_url(
+  access_token: &str,
+  job_id: &str,
+  base_url: &str,
+  created_after: Option<&str>,
+) -> Result<Vec<YoutubeReportingReport>, YoutubeReportingError> {
+  let url = build_reports_list_url_channel(base_url, job_id, created_after);
+  let json = fetch_json_by_url(access_token, &url).await?;
+  Ok(parse_reports(&json))
+}
+
+pub async fn list_reports_channel(
+  access_token: &str,
+  job_id: &str,
+  created_after: Option<&str>,
+) -> Result<Vec<YoutubeReportingReport>, YoutubeReportingError> {
+  list_reports_channel_with_base_url(access_token, job_id, DEFAULT_BASE_URL, created_after).await
 }
 
 #[cfg(test)]
@@ -501,6 +632,37 @@ mod tests {
     assert_eq!(
       url,
       "https://youtubereporting.googleapis.com/v1/jobs?onBehalfOfContentOwner=CMS123"
+    );
+  }
+
+  #[test]
+  fn builds_report_types_list_url_for_channel() {
+    let url = build_report_types_list_url_channel("https://youtubereporting.googleapis.com/v1/", true);
+    assert_eq!(
+      url,
+      "https://youtubereporting.googleapis.com/v1/reportTypes?includeSystemManaged=true"
+    );
+  }
+
+  #[test]
+  fn builds_jobs_list_url_for_channel() {
+    let url = build_jobs_list_url_channel("https://youtubereporting.googleapis.com/v1", true);
+    assert_eq!(
+      url,
+      "https://youtubereporting.googleapis.com/v1/jobs?includeSystemManaged=true"
+    );
+  }
+
+  #[test]
+  fn builds_reports_list_url_for_channel() {
+    let url = build_reports_list_url_channel(
+      "https://youtubereporting.googleapis.com/v1/",
+      "job_1",
+      Some("2026-01-01T00:00:00Z"),
+    );
+    assert_eq!(
+      url,
+      "https://youtubereporting.googleapis.com/v1/jobs/job_1/reports?createdAfter=2026-01-01T00:00:00Z"
     );
   }
 

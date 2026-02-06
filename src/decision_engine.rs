@@ -257,6 +257,7 @@ mod tests {
       video_id: video_id.to_string(),
       estimated_revenue_usd: revenue,
       impressions: 0,
+      impressions_ctr: None,
       views: 0,
     }
   }
@@ -303,4 +304,3 @@ mod tests {
     assert_eq!(decision.direction, "PROTECT");
   }
 }
-

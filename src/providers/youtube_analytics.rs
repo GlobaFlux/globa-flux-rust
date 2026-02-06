@@ -12,6 +12,7 @@ pub struct VideoDailyMetricRow {
   pub video_id: String,
   pub estimated_revenue_usd: f64,
   pub impressions: i64,
+  pub impressions_ctr: Option<f64>,
   pub views: i64,
 }
 
@@ -91,7 +92,13 @@ fn build_reports_url_with_ids_impressions(
   start_dt: NaiveDate,
   end_dt: NaiveDate,
 ) -> String {
-  build_reports_url_with_ids_and_metrics(base_url, ids_value, start_dt, end_dt, "impressions,views")
+  build_reports_url_with_ids_and_metrics(
+    base_url,
+    ids_value,
+    start_dt,
+    end_dt,
+    "videoThumbnailImpressions,videoThumbnailImpressionsClickRate",
+  )
 }
 
 pub fn build_reports_url(base_url: &str, start_dt: NaiveDate, end_dt: NaiveDate) -> String {
@@ -149,7 +156,13 @@ fn build_channel_reports_url_with_ids_impressions(
   start_dt: NaiveDate,
   end_dt: NaiveDate,
 ) -> String {
-  build_channel_reports_url_with_ids_and_metrics(base_url, ids_value, start_dt, end_dt, "impressions,views")
+  build_channel_reports_url_with_ids_and_metrics(
+    base_url,
+    ids_value,
+    start_dt,
+    end_dt,
+    "videoThumbnailImpressions,videoThumbnailImpressionsClickRate",
+  )
 }
 
 fn build_channel_reports_url(base_url: &str, start_dt: NaiveDate, end_dt: NaiveDate) -> String {
@@ -185,6 +198,7 @@ fn parse_rows(json: &Value) -> Vec<VideoDailyMetricRow> {
   let mut idx_video: Option<usize> = None;
   let mut idx_rev: Option<usize> = None;
   let mut idx_impr: Option<usize> = None;
+  let mut idx_ctr: Option<usize> = None;
   let mut idx_views: Option<usize> = None;
 
   for (i, h) in headers.iter().enumerate() {
@@ -193,7 +207,8 @@ fn parse_rows(json: &Value) -> Vec<VideoDailyMetricRow> {
       "day" => idx_day = Some(i),
       "video" => idx_video = Some(i),
       "estimatedRevenue" => idx_rev = Some(i),
-      "impressions" => idx_impr = Some(i),
+      "impressions" | "videoThumbnailImpressions" => idx_impr = Some(i),
+      "videoThumbnailImpressionsClickRate" => idx_ctr = Some(i),
       "views" => idx_views = Some(i),
       _ => {}
     }
@@ -243,6 +258,10 @@ fn parse_rows(json: &Value) -> Vec<VideoDailyMetricRow> {
       .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|n| n as i64)))
       .unwrap_or(0);
 
+    let impressions_ctr = idx_ctr
+      .and_then(|i| arr.get(i))
+      .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+
     let views = idx_views
       .and_then(|i| arr.get(i))
       .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|n| n as i64)))
@@ -253,6 +272,7 @@ fn parse_rows(json: &Value) -> Vec<VideoDailyMetricRow> {
       video_id,
       estimated_revenue_usd,
       impressions,
+      impressions_ctr,
       views,
     });
   }
@@ -270,6 +290,7 @@ fn parse_rows_channel(json: &Value) -> Vec<VideoDailyMetricRow> {
   let mut idx_day: Option<usize> = None;
   let mut idx_rev: Option<usize> = None;
   let mut idx_impr: Option<usize> = None;
+  let mut idx_ctr: Option<usize> = None;
   let mut idx_views: Option<usize> = None;
 
   for (i, h) in headers.iter().enumerate() {
@@ -277,7 +298,8 @@ fn parse_rows_channel(json: &Value) -> Vec<VideoDailyMetricRow> {
     match name {
       "day" => idx_day = Some(i),
       "estimatedRevenue" => idx_rev = Some(i),
-      "impressions" => idx_impr = Some(i),
+      "impressions" | "videoThumbnailImpressions" => idx_impr = Some(i),
+      "videoThumbnailImpressionsClickRate" => idx_ctr = Some(i),
       "views" => idx_views = Some(i),
       _ => {}
     }
@@ -318,6 +340,10 @@ fn parse_rows_channel(json: &Value) -> Vec<VideoDailyMetricRow> {
       .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|n| n as i64)))
       .unwrap_or(0);
 
+    let impressions_ctr = idx_ctr
+      .and_then(|i| arr.get(i))
+      .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+
     let views = idx_views
       .and_then(|i| arr.get(i))
       .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|n| n as i64)))
@@ -328,6 +354,7 @@ fn parse_rows_channel(json: &Value) -> Vec<VideoDailyMetricRow> {
       video_id: FALLBACK_CHANNEL_VIDEO_ID.to_string(),
       estimated_revenue_usd,
       impressions,
+      impressions_ctr,
       views,
     });
   }
@@ -413,25 +440,39 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
   fn compute_channel_totals_from_video_rows(rows: &[VideoDailyMetricRow]) -> Vec<VideoDailyMetricRow> {
     use std::collections::BTreeMap;
 
-    let mut by_day: BTreeMap<NaiveDate, (f64, i64, i64)> = BTreeMap::new();
+    let mut by_day: BTreeMap<NaiveDate, (f64, i64, i64, f64, i64)> = BTreeMap::new();
     for row in rows.iter() {
       if row.video_id == FALLBACK_CHANNEL_VIDEO_ID {
         continue;
       }
-      let entry = by_day.entry(row.dt).or_insert((0.0, 0, 0));
+      let entry = by_day.entry(row.dt).or_insert((0.0, 0, 0, 0.0, 0));
       entry.0 += row.estimated_revenue_usd;
       entry.1 += row.impressions;
       entry.2 += row.views;
+      if let Some(ctr) = row.impressions_ctr {
+        if row.impressions > 0 {
+          entry.3 += ctr * (row.impressions as f64);
+          entry.4 += row.impressions;
+        }
+      }
     }
 
     by_day
       .into_iter()
-      .map(|(dt, (rev, impressions, views))| VideoDailyMetricRow {
-        dt,
-        video_id: FALLBACK_CHANNEL_VIDEO_ID.to_string(),
-        estimated_revenue_usd: rev,
-        impressions,
-        views,
+      .map(|(dt, (rev, impressions, views, ctr_weighted_sum, ctr_weight_impr))| {
+        let impressions_ctr = if ctr_weight_impr > 0 {
+          Some(ctr_weighted_sum / (ctr_weight_impr as f64))
+        } else {
+          None
+        };
+        VideoDailyMetricRow {
+          dt,
+          video_id: FALLBACK_CHANNEL_VIDEO_ID.to_string(),
+          estimated_revenue_usd: rev,
+          impressions,
+          impressions_ctr,
+          views,
+        }
       })
       .collect()
   }
@@ -491,6 +532,9 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
         for row in parsed.into_iter() {
           if let Some(idx) = index.get(&(row.dt, row.video_id.clone())).copied() {
             video_rows[idx].impressions = row.impressions;
+            if row.impressions_ctr.is_some() {
+              video_rows[idx].impressions_ctr = row.impressions_ctr;
+            }
             if video_rows[idx].views == 0 {
               video_rows[idx].views = row.views;
             }
@@ -525,26 +569,32 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
       // Best-effort: fill impressions via separate channel report.
       let channel_impressions_url =
         build_channel_reports_url_with_ids_impressions(base_url, ids_value, start_dt, end_dt);
-      if let Ok(json) = fetch_report_json_by_url(access_token, &channel_impressions_url).await {
-        let impr_rows = parse_rows_channel(&json);
-        if !impr_rows.is_empty() {
-          use std::collections::HashMap;
-          let mut index: HashMap<NaiveDate, usize> = HashMap::new();
-          for (i, row) in totals_rows.iter().enumerate() {
-            index.insert(row.dt, i);
-          }
+      match fetch_report_json_by_url(access_token, &channel_impressions_url).await {
+        Ok(json) => {
+          let impr_rows = parse_rows_channel(&json);
+          if !impr_rows.is_empty() {
+            use std::collections::HashMap;
+            let mut index: HashMap<NaiveDate, usize> = HashMap::new();
+            for (i, row) in totals_rows.iter().enumerate() {
+              index.insert(row.dt, i);
+            }
 
-          for row in impr_rows.into_iter() {
-            if let Some(idx) = index.get(&row.dt).copied() {
-              totals_rows[idx].impressions = row.impressions;
-              if totals_rows[idx].views == 0 {
-                totals_rows[idx].views = row.views;
+            for row in impr_rows.into_iter() {
+              if let Some(idx) = index.get(&row.dt).copied() {
+                totals_rows[idx].impressions = row.impressions;
+                if row.impressions_ctr.is_some() {
+                  totals_rows[idx].impressions_ctr = row.impressions_ctr;
+                }
+                if totals_rows[idx].views == 0 {
+                  totals_rows[idx].views = row.views;
+                }
+              } else {
+                totals_rows.push(row);
               }
-            } else {
-              totals_rows.push(row);
             }
           }
         }
+        Err(_) => {}
       }
 
       if totals_rows.is_empty() {
@@ -565,26 +615,32 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
 
       let channel_impressions_url =
         build_channel_reports_url_with_ids_impressions(base_url, ids_value, start_dt, end_dt);
-      if let Ok(impr_json) = fetch_report_json_by_url(access_token, &channel_impressions_url).await {
-        let impr_rows = parse_rows_channel(&impr_json);
-        if !impr_rows.is_empty() {
-          use std::collections::HashMap;
-          let mut index: HashMap<NaiveDate, usize> = HashMap::new();
-          for (i, row) in rows.iter().enumerate() {
-            index.insert(row.dt, i);
-          }
+      match fetch_report_json_by_url(access_token, &channel_impressions_url).await {
+        Ok(impr_json) => {
+          let impr_rows = parse_rows_channel(&impr_json);
+          if !impr_rows.is_empty() {
+            use std::collections::HashMap;
+            let mut index: HashMap<NaiveDate, usize> = HashMap::new();
+            for (i, row) in rows.iter().enumerate() {
+              index.insert(row.dt, i);
+            }
 
-          for row in impr_rows.into_iter() {
-            if let Some(idx) = index.get(&row.dt).copied() {
-              rows[idx].impressions = row.impressions;
-              if rows[idx].views == 0 {
-                rows[idx].views = row.views;
+            for row in impr_rows.into_iter() {
+              if let Some(idx) = index.get(&row.dt).copied() {
+                rows[idx].impressions = row.impressions;
+                if row.impressions_ctr.is_some() {
+                  rows[idx].impressions_ctr = row.impressions_ctr;
+                }
+                if rows[idx].views == 0 {
+                  rows[idx].views = row.views;
+                }
+              } else {
+                rows.push(row);
               }
-            } else {
-              rows.push(row);
             }
           }
         }
+        Err(_) => {}
       }
 
       Ok(rows)
@@ -597,26 +653,32 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
 
       let channel_impressions_url =
         build_channel_reports_url_with_ids_impressions(base_url, ids_value, start_dt, end_dt);
-      if let Ok(impr_json) = fetch_report_json_by_url(access_token, &channel_impressions_url).await {
-        let impr_rows = parse_rows_channel(&impr_json);
-        if !impr_rows.is_empty() {
-          use std::collections::HashMap;
-          let mut index: HashMap<NaiveDate, usize> = HashMap::new();
-          for (i, row) in rows.iter().enumerate() {
-            index.insert(row.dt, i);
-          }
+      match fetch_report_json_by_url(access_token, &channel_impressions_url).await {
+        Ok(impr_json) => {
+          let impr_rows = parse_rows_channel(&impr_json);
+          if !impr_rows.is_empty() {
+            use std::collections::HashMap;
+            let mut index: HashMap<NaiveDate, usize> = HashMap::new();
+            for (i, row) in rows.iter().enumerate() {
+              index.insert(row.dt, i);
+            }
 
-          for row in impr_rows.into_iter() {
-            if let Some(idx) = index.get(&row.dt).copied() {
-              rows[idx].impressions = row.impressions;
-              if rows[idx].views == 0 {
-                rows[idx].views = row.views;
+            for row in impr_rows.into_iter() {
+              if let Some(idx) = index.get(&row.dt).copied() {
+                rows[idx].impressions = row.impressions;
+                if row.impressions_ctr.is_some() {
+                  rows[idx].impressions_ctr = row.impressions_ctr;
+                }
+                if rows[idx].views == 0 {
+                  rows[idx].views = row.views;
+                }
+              } else {
+                rows.push(row);
               }
-            } else {
-              rows.push(row);
             }
           }
         }
+        Err(_) => {}
       }
 
       Ok(rows)
@@ -714,6 +776,20 @@ mod tests {
   }
 
   #[test]
+  fn build_reports_url_for_thumbnail_impressions_includes_expected_metrics() {
+    let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
+    let url = build_reports_url_with_ids_impressions(
+      "https://youtubeanalytics.googleapis.com/",
+      "channel==MINE",
+      start_dt,
+      end_dt,
+    );
+
+    assert!(url.contains("metrics=videoThumbnailImpressions,videoThumbnailImpressionsClickRate"));
+  }
+
+  #[test]
   fn build_channel_reports_url_includes_expected_params() {
     let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
@@ -768,6 +844,35 @@ mod tests {
     assert_eq!(rows[0].video_id, "vid1");
     assert_eq!(rows[0].estimated_revenue_usd, 1.25);
     assert_eq!(rows[0].impressions, 1000);
+    assert_eq!(rows[0].views, 200);
+  }
+
+  #[test]
+  fn parse_rows_extracts_video_thumbnail_impressions() {
+    let json: Value = serde_json::from_str(
+      r#"
+      {
+        "columnHeaders": [
+          {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+          {"name":"video","columnType":"DIMENSION","dataType":"STRING"},
+          {"name":"videoThumbnailImpressions","columnType":"METRIC","dataType":"INTEGER"},
+          {"name":"videoThumbnailImpressionsClickRate","columnType":"METRIC","dataType":"FLOAT"},
+          {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+        ],
+        "rows": [
+          ["2026-01-02","vid1", 1000, 0.058, 200]
+        ]
+      }
+    "#,
+    )
+    .unwrap();
+
+    let rows = parse_rows(&json);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].video_id, "vid1");
+    assert_eq!(rows[0].impressions, 1000);
+    let ctr = rows[0].impressions_ctr.unwrap_or(-1.0);
+    assert!((ctr - 0.058).abs() < 1e-9);
     assert_eq!(rows[0].views, 200);
   }
 
@@ -1182,17 +1287,19 @@ mod tests {
               );
             }
 
-            if query.contains("dimensions=day,video") && query.contains("metrics=impressions,views") {
+            if query.contains("dimensions=day,video")
+              && query.contains("metrics=videoThumbnailImpressions,videoThumbnailImpressionsClickRate")
+            {
               let body = r#"
                 {
                   "columnHeaders": [
                     {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
                     {"name":"video","columnType":"DIMENSION","dataType":"STRING"},
-                    {"name":"impressions","columnType":"METRIC","dataType":"INTEGER"},
-                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                    {"name":"videoThumbnailImpressions","columnType":"METRIC","dataType":"INTEGER"},
+                    {"name":"videoThumbnailImpressionsClickRate","columnType":"METRIC","dataType":"FLOAT"}
                   ],
                   "rows": [
-                    ["2026-01-02","vid1", 1000, 200]
+                    ["2026-01-02","vid1", 1000, 0.06]
                   ]
                 }
               "#;
@@ -1227,16 +1334,126 @@ mod tests {
               );
             }
 
-            if query.contains("dimensions=day") && query.contains("metrics=impressions,views") {
+            if query.contains("dimensions=day")
+              && query.contains("metrics=videoThumbnailImpressions,videoThumbnailImpressionsClickRate")
+            {
               let body = r#"
                 {
                   "columnHeaders": [
                     {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
-                    {"name":"impressions","columnType":"METRIC","dataType":"INTEGER"},
+                    {"name":"videoThumbnailImpressions","columnType":"METRIC","dataType":"INTEGER"},
+                    {"name":"videoThumbnailImpressionsClickRate","columnType":"METRIC","dataType":"FLOAT"}
+                  ],
+                  "rows": [
+                    ["2026-01-02", 1000, 0.06]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            Ok::<_, hyper::Error>(
+              Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from_static(b"not found")))
+                .unwrap(),
+            )
+          }),
+        )
+        .await
+        .unwrap();
+    }
+  }
+
+  async fn serve_reports_with_dimensionless_reach_fallback(listener: TcpListener, max_connections: usize) {
+    for _ in 0..max_connections {
+      let (stream, _) = listener.accept().await.unwrap();
+      let io = TokioIo::new(stream);
+      http1::Builder::new()
+        .serve_connection(
+          io,
+          service_fn(|req: Request<Incoming>| async move {
+            let query = req.uri().query().unwrap_or("");
+
+            if query.contains("dimensions=day,video") && query.contains("metrics=estimatedRevenue,views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"video","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"estimatedRevenue","columnType":"METRIC","dataType":"FLOAT"},
                     {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
                   ],
                   "rows": [
-                    ["2026-01-02", 1000, 200]
+                    ["2026-01-02","vid1", 1.25, 200]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            // Reach query not supported for daily breakdown in this mock.
+            if query.contains("metrics=videoThumbnailImpressions,videoThumbnailImpressionsClickRate")
+              && query.contains("dimensions=")
+            {
+              let body = r#"{ "error": { "code": 400, "message": "The query is not supported.", "errors": [ { "message": "The query is not supported.", "domain": "global", "reason": "badRequest" } ] } }"#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::BAD_REQUEST)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            if query.contains("dimensions=day") && query.contains("metrics=estimatedRevenue,views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"estimatedRevenue","columnType":"METRIC","dataType":"FLOAT"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": [
+                    ["2026-01-02", 1.25, 200]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            // Dimensionless reach report for a single day (startDate=endDate).
+            if query.contains("metrics=videoThumbnailImpressions,videoThumbnailImpressionsClickRate")
+              && query.contains("startDate=2026-01-02")
+              && query.contains("endDate=2026-01-02")
+              && !query.contains("dimensions=")
+            {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"videoThumbnailImpressions","columnType":"METRIC","dataType":"INTEGER"},
+                    {"name":"videoThumbnailImpressionsClickRate","columnType":"METRIC","dataType":"FLOAT"}
+                  ],
+                  "rows": [
+                    [1000, 0.06]
                   ]
                 }
               "#;
@@ -1283,6 +1500,8 @@ mod tests {
     assert_eq!(video.dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
     assert_eq!(video.views, 200);
     assert_eq!(video.impressions, 1000);
+    let ctr = video.impressions_ctr.unwrap_or(-1.0);
+    assert!((ctr - 0.06).abs() < 1e-9);
     assert_eq!(video.estimated_revenue_usd, 1.25);
 
     let total = rows
@@ -1292,7 +1511,37 @@ mod tests {
     assert_eq!(total.dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
     assert_eq!(total.views, 200);
     assert_eq!(total.impressions, 1000);
+    let ctr = total.impressions_ctr.unwrap_or(-1.0);
+    assert!((ctr - 0.06).abs() < 1e-9);
     assert_eq!(total.estimated_revenue_usd, 1.25);
+
+    task.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn skips_reach_metrics_when_daily_reach_query_not_supported() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}/", addr);
+
+    // Expect 4 report fetches: video report, video reach (fails), channel totals, channel reach (fails).
+    let task = tokio::spawn(serve_reports_with_dimensionless_reach_fallback(listener, 4));
+
+    let start_dt = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+    let end_dt = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+    let rows =
+      fetch_video_daily_metrics_for_channel_with_base_url("token123", &base_url, "UC123", start_dt, end_dt)
+        .await
+        .unwrap();
+
+    let total = rows
+      .iter()
+      .find(|r| r.video_id == FALLBACK_CHANNEL_VIDEO_ID)
+      .unwrap();
+    // Reach metrics are not reliably supported by the YouTube Analytics API for all accounts.
+    // When the query is not supported, we keep sync fast and treat reach as unavailable.
+    assert_eq!(total.impressions, 0);
+    assert!(total.impressions_ctr.is_none());
 
     task.await.unwrap();
   }

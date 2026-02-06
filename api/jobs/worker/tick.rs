@@ -56,6 +56,7 @@ use globa_flux_rust::{
     parse_string_list_json,
   },
 };
+use globa_flux_rust::reach_reporting::ingest_channel_reach_basic_a1;
 
 fn bearer_token(header_value: Option<&str>) -> Option<&str> {
   let value = header_value?;
@@ -141,12 +142,14 @@ fn json_string_field(payload: &serde_json::Value, key: &str) -> Option<String> {
 struct AggMetrics {
   revenue_usd: f64,
   impressions: i64,
+  ctr_num: f64,
+  ctr_denom: i64,
   views: i64,
 }
 
 fn agg_ctr(m: AggMetrics) -> Option<f64> {
-  if m.impressions > 0 {
-    Some((m.views as f64) / (m.impressions as f64))
+  if m.ctr_denom > 0 {
+    Some(m.ctr_num / (m.ctr_denom as f64))
   } else {
     None
   }
@@ -176,6 +179,8 @@ async fn aggregate_metrics_for_videos(
     r#"
       SELECT CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
              CAST(COALESCE(SUM(impressions), 0) AS SIGNED) AS impressions,
+             CAST(COALESCE(SUM(impressions_ctr * impressions), 0) AS DOUBLE) AS ctr_num,
+             CAST(COALESCE(SUM(CASE WHEN impressions_ctr IS NOT NULL THEN impressions ELSE 0 END), 0) AS SIGNED) AS ctr_denom,
              CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views
       FROM video_daily_metrics
       WHERE tenant_id =
@@ -197,8 +202,8 @@ async fn aggregate_metrics_for_videos(
   }
   qb.push(");");
 
-  let (revenue_usd, impressions, views) = qb
-    .build_query_as::<(f64, i64, i64)>()
+  let (revenue_usd, impressions, ctr_num, ctr_denom, views) = qb
+    .build_query_as::<(f64, i64, f64, i64, i64)>()
     .fetch_one(pool)
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
@@ -206,6 +211,8 @@ async fn aggregate_metrics_for_videos(
   Ok(AggMetrics {
     revenue_usd,
     impressions,
+    ctr_num,
+    ctr_denom,
     views,
   })
 }
@@ -328,9 +335,17 @@ async fn evaluate_running_experiments_for_channel(
         ("RPM", base, cur, ok)
       }
       _ => {
-        let base = agg_ctr(baseline).unwrap_or(0.0);
-        let cur = agg_ctr(current).unwrap_or(0.0);
-        let ok = baseline.impressions >= 5000 && current.impressions >= 5000 && base > 0.0;
+        let base_opt = agg_ctr(baseline);
+        let cur_opt = agg_ctr(current);
+        let base = base_opt.unwrap_or(0.0);
+        let cur = cur_opt.unwrap_or(0.0);
+        let ok = baseline.impressions >= 5000
+          && current.impressions >= 5000
+          && baseline.ctr_denom > 0
+          && current.ctr_denom > 0
+          && base_opt.is_some()
+          && cur_opt.is_some()
+          && base > 0.0;
         ("CTR", base, cur, ok)
       }
     };
@@ -1645,9 +1660,71 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
               &row.video_id,
               row.estimated_revenue_usd,
               row.impressions,
+              row.impressions_ctr,
               row.views,
             )
             .await?;
+          }
+
+          // Reach metrics (impressions/CTR) are only available via the YouTube Reporting API bulk reports.
+          // Best-effort: sync the last window to unlock CTR + impressions guardrails and dashboard verification.
+          if let Err(err) = ingest_channel_reach_basic_a1(
+            pool,
+            tenant_id,
+            channel_id,
+            &tokens.access_token,
+            start_dt,
+            end_dt,
+          )
+          .await
+          {
+            eprintln!(
+              "daily_channel: reach ingest failed tenant_id={} channel_id={} window={}..{} err={}",
+              tenant_id,
+              channel_id,
+              start_dt,
+              end_dt,
+              err
+            );
+
+            let err_text = truncate_string(&err.to_string(), 1400);
+            let (severity, message) = if err_text.contains("YouTube Reporting API has not been used in project")
+              || err_text.contains("is disabled")
+            {
+              (
+                "warning",
+                "Impressions/Impr. CTR unavailable: enable the YouTube Reporting API for this OAuth project, then re-sync.",
+              )
+            } else if err_text.contains("forbidden") || err_text.contains("Forbidden") {
+              (
+                "warning",
+                "Impressions/Impr. CTR unavailable: missing YouTube Reporting permission for this channel/account.",
+              )
+            } else {
+              ("warning", "Impressions/Impr. CTR sync failed (best-effort).")
+            };
+
+            let details_json = serde_json::json!({
+              "window": { "start_dt": start_dt.to_string(), "end_dt": end_dt.to_string() },
+              "error": err_text,
+              "help": {
+                "docs": "https://developers.google.com/youtube/reporting",
+                "gcp_api": "YouTube Reporting API",
+              }
+            })
+            .to_string();
+
+            let _ = upsert_alert(
+              pool,
+              tenant_id,
+              channel_id,
+              "reach_reporting_unavailable",
+              "Data reach",
+              severity,
+              message,
+              Some(&details_json),
+            )
+            .await;
           }
 
           let publish_counts =

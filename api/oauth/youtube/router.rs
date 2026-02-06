@@ -338,6 +338,7 @@ async fn handle_exchange(
             &row.video_id,
             row.estimated_revenue_usd,
             row.impressions,
+            row.impressions_ctr,
             row.views,
         )
         .await?;
@@ -583,6 +584,7 @@ async fn handle_set_active_channel(
             &row.video_id,
             row.estimated_revenue_usd,
             row.impressions,
+            row.impressions_ctr,
             row.views,
         )
         .await?;
@@ -1059,7 +1061,7 @@ struct MetricDailyItem {
     impressions: i64,
     views: i64,
     revenue_usd: f64,
-    ctr: f64,
+    ctr: Option<f64>,
     rpm: f64,
     source: String,
 }
@@ -1138,13 +1140,15 @@ async fn handle_youtube_metrics_daily(
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
-    let rows: Vec<(NaiveDate, f64, i64, i64)> = if let Some(video_id) = video_id_filter.as_deref() {
-        sqlx::query_as::<_, (NaiveDate, f64, i64, i64)>(
+    let rows: Vec<(NaiveDate, f64, i64, i64, f64, i64)> = if let Some(video_id) = video_id_filter.as_deref() {
+        sqlx::query_as::<_, (NaiveDate, f64, i64, i64, f64, i64)>(
             r#"
         SELECT dt,
                CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS revenue_usd,
                CAST(SUM(impressions) AS SIGNED) AS impressions,
-               CAST(SUM(views) AS SIGNED) AS views
+               CAST(SUM(views) AS SIGNED) AS views,
+               CAST(COALESCE(SUM(impressions_ctr * impressions), 0) AS DOUBLE) AS ctr_num,
+               CAST(COALESCE(SUM(CASE WHEN impressions_ctr IS NOT NULL THEN impressions ELSE 0 END), 0) AS SIGNED) AS ctr_denom
         FROM video_daily_metrics
         WHERE tenant_id = ?
           AND channel_id = ?
@@ -1163,7 +1167,7 @@ async fn handle_youtube_metrics_daily(
         .await
         .map_err(|e| -> Error { Box::new(e) })?
     } else {
-        let totals = sqlx::query_as::<_, (NaiveDate, f64, i64, i64)>(
+        let totals = sqlx::query_as::<_, (NaiveDate, f64, i64, i64, f64, i64)>(
             r#"
         SELECT dt,
                CAST(COALESCE(
@@ -1180,7 +1184,9 @@ async fn handle_youtube_metrics_daily(
                  SUM(CASE WHEN video_id='csv_channel_total' THEN views END),
                  SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' THEN views END),
                  0
-               ) AS SIGNED) AS views
+               ) AS SIGNED) AS views,
+               CAST(COALESCE(SUM(impressions_ctr * impressions), 0) AS DOUBLE) AS ctr_num,
+               CAST(COALESCE(SUM(CASE WHEN impressions_ctr IS NOT NULL THEN impressions ELSE 0 END), 0) AS SIGNED) AS ctr_denom
         FROM video_daily_metrics
         WHERE tenant_id = ?
           AND channel_id = ?
@@ -1201,12 +1207,14 @@ async fn handle_youtube_metrics_daily(
         if !totals.is_empty() {
             totals
         } else {
-            sqlx::query_as::<_, (NaiveDate, f64, i64, i64)>(
+            sqlx::query_as::<_, (NaiveDate, f64, i64, i64, f64, i64)>(
                 r#"
           SELECT dt,
                  CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS revenue_usd,
                  CAST(SUM(impressions) AS SIGNED) AS impressions,
-                 CAST(SUM(views) AS SIGNED) AS views
+                 CAST(SUM(views) AS SIGNED) AS views,
+                 CAST(COALESCE(SUM(impressions_ctr * impressions), 0) AS DOUBLE) AS ctr_num,
+                 CAST(COALESCE(SUM(CASE WHEN impressions_ctr IS NOT NULL THEN impressions ELSE 0 END), 0) AS SIGNED) AS ctr_denom
           FROM video_daily_metrics
           WHERE tenant_id = ?
             AND channel_id = ?
@@ -1229,11 +1237,11 @@ async fn handle_youtube_metrics_daily(
     let video_id_out = video_id_filter.unwrap_or_else(|| "channel_total".to_string());
     let items: Vec<MetricDailyItem> = rows
         .into_iter()
-        .map(|(dt, revenue_usd, impressions, views)| {
-            let ctr = if impressions > 0 {
-                (views as f64) / (impressions as f64)
+        .map(|(dt, revenue_usd, impressions, views, ctr_num, ctr_denom)| {
+            let ctr = if ctr_denom > 0 {
+                Some(ctr_num / (ctr_denom as f64))
             } else {
-                0.0
+                None
             };
             let rpm = if views > 0 {
                 (revenue_usd / (views as f64)) * 1000.0
@@ -1246,7 +1254,7 @@ async fn handle_youtube_metrics_daily(
                 impressions,
                 views,
                 revenue_usd: round2(revenue_usd),
-                ctr: (ctr * 10000.0).round() / 10000.0,
+                ctr: ctr.map(|v| (v * 10000.0).round() / 10000.0),
                 rpm: round2(rpm),
                 source: "tidb".to_string(),
             }
@@ -1817,12 +1825,14 @@ async fn handle_youtube_top_videos(
         .and_then(|v| NaiveDate::parse_from_str(v.trim(), "%Y-%m-%d").ok())
         .unwrap_or(today);
 
-    let rows = sqlx::query_as::<_, (String, f64, i64, i64)>(
+    let rows = sqlx::query_as::<_, (String, f64, i64, i64, f64, i64)>(
         r#"
 	      SELECT video_id,
 	             CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
 	             CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views,
-	             CAST(COALESCE(SUM(impressions), 0) AS SIGNED) AS impressions
+	             CAST(COALESCE(SUM(impressions), 0) AS SIGNED) AS impressions,
+	             CAST(COALESCE(SUM(impressions_ctr * impressions), 0) AS DOUBLE) AS ctr_num,
+	             CAST(COALESCE(SUM(CASE WHEN impressions_ctr IS NOT NULL THEN impressions ELSE 0 END), 0) AS SIGNED) AS ctr_denom
 	      FROM video_daily_metrics
 	      WHERE tenant_id = ?
 	        AND channel_id = ?
@@ -1844,9 +1854,9 @@ async fn handle_youtube_top_videos(
 
     let items: Vec<TopVideoItem> = rows
         .into_iter()
-        .map(|(video_id, revenue_usd, views, impressions)| {
-            let ctr = if impressions > 0 {
-                (views as f64) / (impressions as f64)
+        .map(|(video_id, revenue_usd, views, impressions, ctr_num, ctr_denom)| {
+            let ctr = if ctr_denom > 0 {
+                ctr_num / (ctr_denom as f64)
             } else {
                 0.0
             };
@@ -2405,7 +2415,7 @@ async fn handle_youtube_dashboard_bundle(
         }
     };
 
-    let metrics: Vec<MetricDailyItem> = match sqlx::query_as::<_, (NaiveDate, f64, i64, i64)>(
+    let metrics: Vec<MetricDailyItem> = match sqlx::query_as::<_, (NaiveDate, f64, i64, i64, f64, i64)>(
         r#"
       SELECT dt,
              CAST(COALESCE(
@@ -2422,7 +2432,17 @@ async fn handle_youtube_dashboard_bundle(
                SUM(CASE WHEN video_id='csv_channel_total' THEN views END),
                SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' THEN views END),
                0
-             ) AS SIGNED) AS views
+             ) AS SIGNED) AS views,
+             CAST(COALESCE(
+               SUM(CASE WHEN video_id='csv_channel_total' THEN impressions_ctr * impressions END),
+               SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' THEN impressions_ctr * impressions END),
+               0
+             ) AS DOUBLE) AS ctr_num,
+             CAST(COALESCE(
+               SUM(CASE WHEN video_id='csv_channel_total' AND impressions_ctr IS NOT NULL THEN impressions END),
+               SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' AND impressions_ctr IS NOT NULL THEN impressions END),
+               0
+             ) AS SIGNED) AS ctr_denom
       FROM video_daily_metrics
       WHERE tenant_id = ?
         AND channel_id = ?
@@ -2440,15 +2460,17 @@ async fn handle_youtube_dashboard_bundle(
     .await
     {
         Ok(totals) => {
-            let rows: Vec<(NaiveDate, f64, i64, i64)> = if !totals.is_empty() {
+            let rows: Vec<(NaiveDate, f64, i64, i64, f64, i64)> = if !totals.is_empty() {
                 totals
             } else {
-                match sqlx::query_as::<_, (NaiveDate, f64, i64, i64)>(
+                match sqlx::query_as::<_, (NaiveDate, f64, i64, i64, f64, i64)>(
                     r#"
               SELECT dt,
                      CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS revenue_usd,
                      CAST(SUM(impressions) AS SIGNED) AS impressions,
-                     CAST(SUM(views) AS SIGNED) AS views
+                     CAST(SUM(views) AS SIGNED) AS views,
+                     CAST(COALESCE(SUM(impressions_ctr * impressions), 0) AS DOUBLE) AS ctr_num,
+                     CAST(COALESCE(SUM(CASE WHEN impressions_ctr IS NOT NULL THEN impressions ELSE 0 END), 0) AS SIGNED) AS ctr_denom
               FROM video_daily_metrics
               WHERE tenant_id = ?
                 AND channel_id = ?
@@ -2477,11 +2499,11 @@ async fn handle_youtube_dashboard_bundle(
             };
 
             rows.into_iter()
-                .map(|(dt, revenue_usd, impressions, views)| {
-                    let ctr = if impressions > 0 {
-                        (views as f64) / (impressions as f64)
+                .map(|(dt, revenue_usd, impressions, views, ctr_num, ctr_denom)| {
+                    let ctr = if ctr_denom > 0 {
+                        Some(ctr_num / (ctr_denom as f64))
                     } else {
-                        0.0
+                        None
                     };
                     let rpm = if views > 0 {
                         (revenue_usd / (views as f64)) * 1000.0
@@ -2494,7 +2516,7 @@ async fn handle_youtube_dashboard_bundle(
                         impressions,
                         views,
                         revenue_usd: round2(revenue_usd),
-                        ctr: (ctr * 10000.0).round() / 10000.0,
+                        ctr: ctr.map(|v| (v * 10000.0).round() / 10000.0),
                         rpm: round2(rpm),
                         source: "tidb".to_string(),
                     }
@@ -3014,6 +3036,7 @@ struct CsvMetricRow {
     video_id: String,
     estimated_revenue_usd: f64,
     impressions: i64,
+    impressions_ctr: Option<f64>,
     views: i64,
 }
 
@@ -3086,11 +3109,12 @@ fn parse_csv_metrics(csv_text: &str) -> Result<Vec<CsvMetricRow>, String> {
 
         let views_from_field = views_idx.and_then(|i| rec.get(i)).and_then(parse_i64_field);
 
+        let impressions_ctr = ctr_idx
+            .and_then(|i| rec.get(i))
+            .and_then(parse_ctr_field);
+
         let views_from_ctr = match (ctr_idx, impressions) {
-            (Some(i), impr) if impr > 0 => rec
-                .get(i)
-                .and_then(parse_ctr_field)
-                .map(|ctr| ((impr as f64) * ctr).round() as i64),
+            (Some(_i), impr) if impr > 0 => impressions_ctr.map(|ctr| ((impr as f64) * ctr).round() as i64),
             _ => None,
         };
 
@@ -3123,6 +3147,7 @@ fn parse_csv_metrics(csv_text: &str) -> Result<Vec<CsvMetricRow>, String> {
             video_id,
             estimated_revenue_usd: revenue,
             impressions,
+            impressions_ctr,
             views,
         });
     }
@@ -3264,6 +3289,7 @@ async fn handle_youtube_upload_csv(
             &row.video_id,
             row.estimated_revenue_usd,
             row.impressions,
+            row.impressions_ctr,
             row.views,
         )
         .await?;
@@ -3328,6 +3354,10 @@ fn naive_datetime_to_rfc3339_utc(dt: NaiveDateTime) -> String {
     DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()
 }
 
+fn datetime_to_rfc3339_utc(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339()
+}
+
 async fn handle_youtube_alerts(
     method: &Method,
     headers: &HeaderMap,
@@ -3388,15 +3418,15 @@ async fn handle_youtube_alerts(
                 String,
                 String,
                 String,
-                NaiveDateTime,
-                Option<NaiveDateTime>,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
                 Option<String>,
             ),
         >(
             r#"
           SELECT id, kind, severity, message,
-                 CAST(detected_at AS DATETIME(3)) AS detected_at,
-                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
+                 detected_at,
+                 resolved_at,
                  details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
@@ -3435,8 +3465,8 @@ async fn handle_youtube_alerts(
                     details: details_json
                         .as_deref()
                         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                    detected_at: naive_datetime_to_rfc3339_utc(detected_at),
-                    resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
+                    detected_at: datetime_to_rfc3339_utc(detected_at),
+                    resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
                 },
             )
             .collect();

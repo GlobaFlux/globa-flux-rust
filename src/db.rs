@@ -204,6 +204,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         video_id VARCHAR(128) NOT NULL,
         estimated_revenue_usd DECIMAL(12,6) NOT NULL DEFAULT 0,
         impressions BIGINT NOT NULL DEFAULT 0,
+        impressions_ctr DOUBLE NULL,
         views BIGINT NOT NULL DEFAULT 0,
         updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
         PRIMARY KEY (tenant_id, channel_id, dt, video_id),
@@ -676,6 +677,16 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
     r#"
       ALTER TABLE yt_alerts
       ADD COLUMN IF NOT EXISTS details_json TEXT NULL;
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
+      ALTER TABLE video_daily_metrics
+      ADD COLUMN IF NOT EXISTS impressions_ctr DOUBLE NULL;
     "#,
   )
   .execute(pool)
@@ -1256,17 +1267,19 @@ pub async fn upsert_video_daily_metric(
   video_id: &str,
   estimated_revenue_usd: f64,
   impressions: i64,
+  impressions_ctr: Option<f64>,
   views: i64,
 ) -> Result<(), Error> {
   sqlx::query(
     r#"
       INSERT INTO video_daily_metrics
-        (tenant_id, channel_id, dt, video_id, estimated_revenue_usd, impressions, views)
+        (tenant_id, channel_id, dt, video_id, estimated_revenue_usd, impressions, impressions_ctr, views)
       VALUES
-        (?, ?, ?, ?, ?, ?, ?)
+        (?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         estimated_revenue_usd = VALUES(estimated_revenue_usd),
-        impressions = VALUES(impressions),
+        impressions = CASE WHEN VALUES(impressions) > 0 THEN VALUES(impressions) ELSE impressions END,
+        impressions_ctr = COALESCE(VALUES(impressions_ctr), impressions_ctr),
         views = VALUES(views),
         updated_at = CURRENT_TIMESTAMP(3);
     "#,
@@ -1277,6 +1290,44 @@ pub async fn upsert_video_daily_metric(
   .bind(video_id)
   .bind(estimated_revenue_usd)
   .bind(impressions)
+  .bind(impressions_ctr)
+  .bind(views)
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  Ok(())
+}
+
+pub async fn upsert_video_daily_reach_metrics(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  channel_id: &str,
+  dt: chrono::NaiveDate,
+  video_id: &str,
+  impressions: i64,
+  impressions_ctr: Option<f64>,
+  views: i64,
+) -> Result<(), Error> {
+  sqlx::query(
+    r#"
+      INSERT INTO video_daily_metrics
+        (tenant_id, channel_id, dt, video_id, impressions, impressions_ctr, views)
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        impressions = VALUES(impressions),
+        impressions_ctr = COALESCE(VALUES(impressions_ctr), impressions_ctr),
+        views = VALUES(views),
+        updated_at = CURRENT_TIMESTAMP(3);
+    "#,
+  )
+  .bind(tenant_id)
+  .bind(channel_id)
+  .bind(dt)
+  .bind(video_id)
+  .bind(impressions)
+  .bind(impressions_ctr)
   .bind(views)
   .execute(pool)
   .await
