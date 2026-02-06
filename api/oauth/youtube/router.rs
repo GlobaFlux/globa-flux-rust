@@ -2117,6 +2117,338 @@ async fn handle_youtube_data_health(
     )
 }
 
+async fn handle_youtube_dashboard_bundle(
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<Response<ResponseBody>, Error> {
+    if method != Method::GET {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
+    }
+
+    let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
+    if expected.is_empty() || provided != expected {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"ok": false, "error": "unauthorized"}),
+        );
+    }
+
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
+
+    let tenant_id = get_query_param(uri, "tenant_id").unwrap_or_default();
+    if tenant_id.trim().is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+        );
+    }
+
+    let pool = get_pool().await?;
+    let channel_id = match get_query_param(uri, "channel_id")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => v,
+        None => fetch_youtube_channel_id(pool, tenant_id.trim())
+            .await?
+            .unwrap_or_default(),
+    };
+
+    if channel_id.trim().is_empty() {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"ok": false, "error": "not_connected", "message": "No active YouTube channel for this tenant"}),
+        );
+    }
+
+    let today = Utc::now().date_naive();
+    let default_end = today - Duration::days(1);
+    let start_dt = get_query_param(uri, "start_dt")
+        .and_then(|v| parse_dt(&v))
+        .unwrap_or(default_end - Duration::days(27));
+    let end_dt = get_query_param(uri, "end_dt")
+        .and_then(|v| parse_dt(&v))
+        .unwrap_or(default_end);
+
+    if start_dt > end_dt {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "start_dt must be <= end_dt"}),
+        );
+    }
+
+    let mut errors = serde_json::Map::new();
+
+    let health = {
+        let days = ((end_dt - start_dt).num_days() + 1).max(1);
+        let baseline_start = start_dt - Duration::days(days);
+        let baseline_end = start_dt - Duration::days(1);
+
+        let window = DataHealthWindow {
+            start_dt: start_dt.to_string(),
+            end_dt: end_dt.to_string(),
+            days,
+        };
+        let baseline_window = DataHealthWindow {
+            start_dt: baseline_start.to_string(),
+            end_dt: baseline_end.to_string(),
+            days,
+        };
+
+        let current = aggregate_data_health_period(
+            pool,
+            tenant_id.trim(),
+            channel_id.trim(),
+            start_dt,
+            end_dt,
+        )
+        .await;
+        let baseline = aggregate_data_health_period(
+            pool,
+            tenant_id.trim(),
+            channel_id.trim(),
+            baseline_start,
+            baseline_end,
+        )
+        .await;
+
+        match (current, baseline) {
+            (Ok(current), Ok(baseline)) => {
+                let expected_days = days;
+                let coverage = if expected_days > 0 {
+                    (current.days_with_data as f64) / (expected_days as f64)
+                } else {
+                    0.0
+                };
+
+                let stale = current
+                    .last_dt
+                    .as_deref()
+                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                    .map(|dt| dt < end_dt)
+                    .unwrap_or(true);
+
+                let mut notes: Vec<String> = Vec::new();
+                if current.partial {
+                    notes.push(
+                        "Using video-level sums (may be partial if YouTube Analytics limits rows)."
+                            .to_string(),
+                    );
+                }
+                if stale {
+                    notes.push("Latest metric date is behind the requested end_dt (sync may be stale).".to_string());
+                }
+                if coverage < 0.8 {
+                    notes.push(
+                        "Low coverage: fewer days with data than expected in the window.".to_string(),
+                    );
+                }
+
+                Some(serde_json::json!({
+                  "ok": true,
+                  "channel_id": channel_id,
+                  "window": window,
+                  "baseline_window": baseline_window,
+                  "current": current,
+                  "baseline": baseline,
+                  "notes": notes,
+                }))
+            }
+            (Err(err), _) | (_, Err(err)) => {
+                errors.insert(
+                    "health".to_string(),
+                    serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+                );
+                None
+            }
+        }
+    };
+
+    let metrics: Vec<MetricDailyItem> = match sqlx::query_as::<_, (NaiveDate, f64, i64, i64)>(
+        r#"
+      SELECT dt,
+             CAST(COALESCE(
+               SUM(CASE WHEN video_id='csv_channel_total' THEN estimated_revenue_usd END),
+               SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' THEN estimated_revenue_usd END),
+               0
+             ) AS DOUBLE) AS revenue_usd,
+             CAST(COALESCE(
+               SUM(CASE WHEN video_id='csv_channel_total' THEN impressions END),
+               SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' THEN impressions END),
+               0
+             ) AS SIGNED) AS impressions,
+             CAST(COALESCE(
+               SUM(CASE WHEN video_id='csv_channel_total' THEN views END),
+               SUM(CASE WHEN video_id='__CHANNEL_TOTAL__' THEN views END),
+               0
+             ) AS SIGNED) AS views
+      FROM video_daily_metrics
+      WHERE tenant_id = ?
+        AND channel_id = ?
+        AND dt BETWEEN ? AND ?
+        AND video_id IN ('__CHANNEL_TOTAL__','csv_channel_total')
+      GROUP BY dt
+      ORDER BY dt ASC;
+    "#,
+    )
+    .bind(tenant_id.trim())
+    .bind(channel_id.trim())
+    .bind(start_dt)
+    .bind(end_dt)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(totals) => {
+            let rows: Vec<(NaiveDate, f64, i64, i64)> = if !totals.is_empty() {
+                totals
+            } else {
+                match sqlx::query_as::<_, (NaiveDate, f64, i64, i64)>(
+                    r#"
+              SELECT dt,
+                     CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS revenue_usd,
+                     CAST(SUM(impressions) AS SIGNED) AS impressions,
+                     CAST(SUM(views) AS SIGNED) AS views
+              FROM video_daily_metrics
+              WHERE tenant_id = ?
+                AND channel_id = ?
+                AND dt BETWEEN ? AND ?
+                AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total')
+              GROUP BY dt
+              ORDER BY dt ASC;
+            "#,
+                )
+                .bind(tenant_id.trim())
+                .bind(channel_id.trim())
+                .bind(start_dt)
+                .bind(end_dt)
+                .fetch_all(pool)
+                .await
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        errors.insert(
+                            "metrics".to_string(),
+                            serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+                        );
+                        Vec::new()
+                    }
+                }
+            };
+
+            rows.into_iter()
+                .map(|(dt, revenue_usd, impressions, views)| {
+                    let ctr = if impressions > 0 {
+                        (views as f64) / (impressions as f64)
+                    } else {
+                        0.0
+                    };
+                    let rpm = if views > 0 {
+                        (revenue_usd / (views as f64)) * 1000.0
+                    } else {
+                        0.0
+                    };
+                    MetricDailyItem {
+                        date: dt.to_string(),
+                        video_id: "channel_total".to_string(),
+                        impressions,
+                        views,
+                        revenue_usd: round2(revenue_usd),
+                        ctr: (ctr * 10000.0).round() / 10000.0,
+                        rpm: round2(rpm),
+                        source: "tidb".to_string(),
+                    }
+                })
+                .collect()
+        }
+        Err(err) => {
+            errors.insert(
+                "metrics".to_string(),
+                serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+            );
+            Vec::new()
+        }
+    };
+
+    // Best-effort: keep alerts fresh without requiring a separate job.
+    let _ = evaluate_alerts(pool, tenant_id.trim(), channel_id.trim()).await;
+
+    let alerts: Vec<AlertItem> = match sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+        ),
+    >(
+        r#"
+          SELECT id, kind, severity, message,
+                 detected_at,
+                 resolved_at,
+                 details_json
+          FROM yt_alerts
+          WHERE tenant_id = ? AND channel_id = ?
+          ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
+          LIMIT 50;
+        "#,
+    )
+    .bind(tenant_id.trim())
+    .bind(channel_id.trim())
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(id, kind, severity, message, detected_at, resolved_at, details_json)| AlertItem {
+                id: format!("alert_{id}"),
+                kind,
+                severity,
+                message,
+                details: details_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
+                detected_at: detected_at.to_rfc3339(),
+                resolved_at: resolved_at.map(|dt| dt.to_rfc3339()),
+            })
+            .collect(),
+        Err(err) => {
+            errors.insert(
+                "alerts".to_string(),
+                serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+            );
+            Vec::new()
+        }
+    };
+
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+          "ok": true,
+          "channel_id": channel_id,
+          "start_dt": start_dt.to_string(),
+          "end_dt": end_dt.to_string(),
+          "health": health,
+          "metrics": metrics,
+          "alerts": alerts,
+          "errors": errors,
+        }),
+    )
+}
+
 #[derive(serde::Serialize)]
 struct UploadItem {
     id: String,
@@ -4575,6 +4907,9 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
         }
         "youtube_data_health" => {
             handle_youtube_data_health(req.method(), req.headers(), req.uri()).await
+        }
+        "youtube_dashboard_bundle" => {
+            handle_youtube_dashboard_bundle(req.method(), req.headers(), req.uri()).await
         }
         "youtube_top_videos" => {
             handle_youtube_top_videos(req.method(), req.headers(), req.uri()).await
