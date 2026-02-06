@@ -865,6 +865,12 @@ struct DispatchRequest {
   now_ms: i64,
   #[serde(default)]
   tenant_id: Option<String>,
+  #[serde(default)]
+  channel_id: Option<String>,
+  #[serde(default)]
+  run_for_dt: Option<String>,
+  #[serde(default)]
+  backfill_weeks: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -970,7 +976,15 @@ async fn handle_dispatch(
     .timestamp_millis_opt(parsed.now_ms)
     .single()
     .unwrap_or_else(Utc::now);
-  let run_for_dt = now.date_naive();
+  let run_for_dt = parsed
+    .run_for_dt
+    .as_deref()
+    .map(str::trim)
+    .filter(|v| !v.is_empty())
+    .map(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d"))
+    .transpose()
+    .map_err(|e| -> Error { Box::new(std::io::Error::other(format!("invalid run_for_dt: {e}"))) })?
+    .unwrap_or_else(|| now.date_naive());
 
   let pool = get_pool().await?;
 
@@ -981,7 +995,61 @@ async fn handle_dispatch(
     .filter(|v| !v.is_empty())
     .map(str::to_string);
 
-  let channels: Vec<(String, String)> = if let Some(tenant_id) = tenant_filter.as_deref() {
+  let channel_filter = parsed
+    .channel_id
+    .as_deref()
+    .map(str::trim)
+    .filter(|v| !v.is_empty())
+    .map(str::to_string);
+
+  let channels: Vec<(String, String)> = if let Some(channel_id) = channel_filter.as_deref() {
+    let tenant_id = tenant_filter.as_deref().ok_or_else(|| {
+      Box::new(std::io::Error::other("tenant_id is required when channel_id is provided")) as Error
+    })?;
+
+    let exists: Option<i64> = if schedule == DispatchSchedule::YoutubeReporting {
+      sqlx::query_scalar(
+        r#"
+          SELECT 1
+          FROM channel_connections
+          WHERE tenant_id = ?
+            AND oauth_provider = 'youtube'
+            AND content_owner_id = ?
+          LIMIT 1;
+        "#,
+      )
+      .bind(tenant_id)
+      .bind(channel_id)
+      .fetch_optional(pool)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?
+    } else {
+      sqlx::query_scalar(
+        r#"
+          SELECT 1
+          FROM channel_connections
+          WHERE tenant_id = ?
+            AND oauth_provider = 'youtube'
+            AND channel_id = ?
+          LIMIT 1;
+        "#,
+      )
+      .bind(tenant_id)
+      .bind(channel_id)
+      .fetch_optional(pool)
+      .await
+      .map_err(|e| -> Error { Box::new(e) })?
+    };
+
+    if exists.is_none() {
+      return json_response(
+        StatusCode::NOT_FOUND,
+        serde_json::json!({"ok": false, "error": "not_connected", "message": "No matching YouTube connection for tenant/channel"}),
+      );
+    }
+
+    vec![(tenant_id.to_string(), channel_id.to_string())]
+  } else if let Some(tenant_id) = tenant_filter.as_deref() {
     sqlx::query_as(candidate_select_sql(schedule, true))
       .bind(tenant_id)
       .fetch_all(pool)
@@ -996,6 +1064,10 @@ async fn handle_dispatch(
 
   let job_type = schedule.job_type();
   let mut enqueued: usize = 0;
+  let backfill_weeks = parsed
+    .backfill_weeks
+    .unwrap_or(0)
+    .clamp(0, 52);
 
   for (tenant_id, channel_id) in channels.iter() {
     let mut run_for_dts: Vec<chrono::NaiveDate> = vec![run_for_dt];
@@ -1003,6 +1075,12 @@ async fn handle_dispatch(
     // First sync should backfill enough history for baseline comparisons + reports.
     // Only do this when the channel has no metrics yet.
     if schedule == DispatchSchedule::Daily {
+      if backfill_weeks > 1 {
+        // Insert newest first so the worker processes current data first (ORDER BY id ASC).
+        run_for_dts = (0..backfill_weeks)
+          .map(|i| run_for_dt - Duration::days((i * 7) as i64))
+          .collect();
+      } else {
       let max_dt: Option<chrono::NaiveDate> = sqlx::query_scalar(
         r#"
           SELECT MAX(dt) AS max_dt
@@ -1021,6 +1099,7 @@ async fn handle_dispatch(
         run_for_dts = (0..4)
           .map(|i| run_for_dt - Duration::days((i * 7) as i64))
           .collect();
+      }
       }
     }
 
