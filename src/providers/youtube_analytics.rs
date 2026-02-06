@@ -72,9 +72,7 @@ fn build_reports_url_with_ids(
   start_dt: NaiveDate,
   end_dt: NaiveDate,
 ) -> String {
-  // Note: YouTube Analytics API v2 does not support an `impressions` metric for this report on all projects,
-  // and will return `Unknown identifier (impressions) given in field parameters.metrics.`.
-  // Keep the schema column but request only stable metrics here.
+  // Keep this request to stable metrics; we fetch impressions via a separate query and merge.
   build_reports_url_with_ids_and_metrics(base_url, ids_value, start_dt, end_dt, "estimatedRevenue,views")
 }
 
@@ -85,6 +83,15 @@ fn build_reports_url_with_ids_views_only(
   end_dt: NaiveDate,
 ) -> String {
   build_reports_url_with_ids_and_metrics(base_url, ids_value, start_dt, end_dt, "views")
+}
+
+fn build_reports_url_with_ids_impressions(
+  base_url: &str,
+  ids_value: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+) -> String {
+  build_reports_url_with_ids_and_metrics(base_url, ids_value, start_dt, end_dt, "impressions,views")
 }
 
 pub fn build_reports_url(base_url: &str, start_dt: NaiveDate, end_dt: NaiveDate) -> String {
@@ -110,12 +117,7 @@ fn build_channel_reports_url_with_ids(
   start_dt: NaiveDate,
   end_dt: NaiveDate,
 ) -> String {
-  let base = base_url.trim_end_matches('/');
-  format!(
-    "{base}/v2/reports?ids={ids_value}&startDate={}&endDate={}&metrics=estimatedRevenue,views&dimensions=day&sort=day&maxResults=200",
-    start_dt,
-    end_dt
-  )
+  build_channel_reports_url_with_ids_and_metrics(base_url, ids_value, start_dt, end_dt, "estimatedRevenue,views")
 }
 
 fn build_channel_reports_url_with_ids_views_only(
@@ -124,11 +126,30 @@ fn build_channel_reports_url_with_ids_views_only(
   start_dt: NaiveDate,
   end_dt: NaiveDate,
 ) -> String {
+  build_channel_reports_url_with_ids_and_metrics(base_url, ids_value, start_dt, end_dt, "views")
+}
+
+fn build_channel_reports_url_with_ids_and_metrics(
+  base_url: &str,
+  ids_value: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+  metrics: &str,
+) -> String {
   let base = base_url.trim_end_matches('/');
   format!(
-    "{base}/v2/reports?ids={ids_value}&startDate={}&endDate={}&metrics=views&dimensions=day&sort=day&maxResults=200",
+    "{base}/v2/reports?ids={ids_value}&startDate={}&endDate={}&metrics={metrics}&dimensions=day&sort=day&maxResults=200",
     start_dt, end_dt
   )
+}
+
+fn build_channel_reports_url_with_ids_impressions(
+  base_url: &str,
+  ids_value: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+) -> String {
+  build_channel_reports_url_with_ids_and_metrics(base_url, ids_value, start_dt, end_dt, "impressions,views")
 }
 
 fn build_channel_reports_url(base_url: &str, start_dt: NaiveDate, end_dt: NaiveDate) -> String {
@@ -248,6 +269,7 @@ fn parse_rows_channel(json: &Value) -> Vec<VideoDailyMetricRow> {
 
   let mut idx_day: Option<usize> = None;
   let mut idx_rev: Option<usize> = None;
+  let mut idx_impr: Option<usize> = None;
   let mut idx_views: Option<usize> = None;
 
   for (i, h) in headers.iter().enumerate() {
@@ -255,6 +277,7 @@ fn parse_rows_channel(json: &Value) -> Vec<VideoDailyMetricRow> {
     match name {
       "day" => idx_day = Some(i),
       "estimatedRevenue" => idx_rev = Some(i),
+      "impressions" => idx_impr = Some(i),
       "views" => idx_views = Some(i),
       _ => {}
     }
@@ -290,6 +313,11 @@ fn parse_rows_channel(json: &Value) -> Vec<VideoDailyMetricRow> {
       .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
       .unwrap_or(0.0);
 
+    let impressions = idx_impr
+      .and_then(|i| arr.get(i))
+      .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|n| n as i64)))
+      .unwrap_or(0);
+
     let views = idx_views
       .and_then(|i| arr.get(i))
       .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|n| n as i64)))
@@ -299,7 +327,7 @@ fn parse_rows_channel(json: &Value) -> Vec<VideoDailyMetricRow> {
       dt,
       video_id: FALLBACK_CHANNEL_VIDEO_ID.to_string(),
       estimated_revenue_usd,
-      impressions: 0,
+      impressions,
       views,
     });
   }
@@ -449,6 +477,30 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
   };
 
   if !video_rows.is_empty() {
+    // Best-effort: fetch impressions (some accounts support it only via separate query).
+    let impressions_url = build_reports_url_with_ids_impressions(base_url, ids_value, start_dt, end_dt);
+    if let Ok(json) = fetch_report_json_by_url(access_token, &impressions_url).await {
+      let parsed = parse_rows(&json);
+      if !parsed.is_empty() {
+        use std::collections::HashMap;
+        let mut index: HashMap<(NaiveDate, String), usize> = HashMap::new();
+        for (i, row) in video_rows.iter().enumerate() {
+          index.insert((row.dt, row.video_id.clone()), i);
+        }
+
+        for row in parsed.into_iter() {
+          if let Some(idx) = index.get(&(row.dt, row.video_id.clone())).copied() {
+            video_rows[idx].impressions = row.impressions;
+            if video_rows[idx].views == 0 {
+              video_rows[idx].views = row.views;
+            }
+          } else {
+            video_rows.push(row);
+          }
+        }
+      }
+    }
+
     // Always try to add channel-level totals rows so downstream queries can avoid summing per-video rows.
     // If the channel report fails, fall back to aggregating the video-level rows (may be partial).
     let has_channel_totals = video_rows
@@ -457,18 +509,47 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
 
     if !has_channel_totals {
       let channel_url = build_channel_reports_url_with_ids(base_url, ids_value, start_dt, end_dt);
-      let totals_rows = match fetch_report_json_by_url(access_token, &channel_url).await {
+      let mut totals_rows = match fetch_report_json_by_url(access_token, &channel_url).await {
         Ok(json) => parse_rows_channel(&json),
         Err(err) if should_fallback_to_views_only(&err) => {
           let channel_url =
             build_channel_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
           match fetch_report_json_by_url(access_token, &channel_url).await {
             Ok(json) => parse_rows_channel(&json),
-            Err(_) => compute_channel_totals_from_video_rows(&video_rows),
+            Err(_) => Vec::new(),
           }
         }
-        Err(_) => compute_channel_totals_from_video_rows(&video_rows),
+        Err(_) => Vec::new(),
       };
+
+      // Best-effort: fill impressions via separate channel report.
+      let channel_impressions_url =
+        build_channel_reports_url_with_ids_impressions(base_url, ids_value, start_dt, end_dt);
+      if let Ok(json) = fetch_report_json_by_url(access_token, &channel_impressions_url).await {
+        let impr_rows = parse_rows_channel(&json);
+        if !impr_rows.is_empty() {
+          use std::collections::HashMap;
+          let mut index: HashMap<NaiveDate, usize> = HashMap::new();
+          for (i, row) in totals_rows.iter().enumerate() {
+            index.insert(row.dt, i);
+          }
+
+          for row in impr_rows.into_iter() {
+            if let Some(idx) = index.get(&row.dt).copied() {
+              totals_rows[idx].impressions = row.impressions;
+              if totals_rows[idx].views == 0 {
+                totals_rows[idx].views = row.views;
+              }
+            } else {
+              totals_rows.push(row);
+            }
+          }
+        }
+      }
+
+      if totals_rows.is_empty() {
+        totals_rows = compute_channel_totals_from_video_rows(&video_rows);
+      }
 
       if !totals_rows.is_empty() {
         video_rows.extend(totals_rows);
@@ -479,12 +560,66 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
 
   let channel_url = build_channel_reports_url_with_ids(base_url, ids_value, start_dt, end_dt);
   match fetch_report_json_by_url(access_token, &channel_url).await {
-    Ok(json) => Ok(parse_rows_channel(&json)),
+    Ok(json) => {
+      let mut rows = parse_rows_channel(&json);
+
+      let channel_impressions_url =
+        build_channel_reports_url_with_ids_impressions(base_url, ids_value, start_dt, end_dt);
+      if let Ok(impr_json) = fetch_report_json_by_url(access_token, &channel_impressions_url).await {
+        let impr_rows = parse_rows_channel(&impr_json);
+        if !impr_rows.is_empty() {
+          use std::collections::HashMap;
+          let mut index: HashMap<NaiveDate, usize> = HashMap::new();
+          for (i, row) in rows.iter().enumerate() {
+            index.insert(row.dt, i);
+          }
+
+          for row in impr_rows.into_iter() {
+            if let Some(idx) = index.get(&row.dt).copied() {
+              rows[idx].impressions = row.impressions;
+              if rows[idx].views == 0 {
+                rows[idx].views = row.views;
+              }
+            } else {
+              rows.push(row);
+            }
+          }
+        }
+      }
+
+      Ok(rows)
+    }
     Err(err) if should_fallback_to_views_only(&err) => {
       let channel_url =
         build_channel_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
       let json = fetch_report_json_by_url(access_token, &channel_url).await?;
-      Ok(parse_rows_channel(&json))
+      let mut rows = parse_rows_channel(&json);
+
+      let channel_impressions_url =
+        build_channel_reports_url_with_ids_impressions(base_url, ids_value, start_dt, end_dt);
+      if let Ok(impr_json) = fetch_report_json_by_url(access_token, &channel_impressions_url).await {
+        let impr_rows = parse_rows_channel(&impr_json);
+        if !impr_rows.is_empty() {
+          use std::collections::HashMap;
+          let mut index: HashMap<NaiveDate, usize> = HashMap::new();
+          for (i, row) in rows.iter().enumerate() {
+            index.insert(row.dt, i);
+          }
+
+          for row in impr_rows.into_iter() {
+            if let Some(idx) = index.get(&row.dt).copied() {
+              rows[idx].impressions = row.impressions;
+              if rows[idx].views == 0 {
+                rows[idx].views = row.views;
+              }
+            } else {
+              rows.push(row);
+            }
+          }
+        }
+      }
+
+      Ok(rows)
     }
     Err(err) => Err(err),
   }
@@ -745,7 +880,7 @@ mod tests {
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{}/", addr);
 
-    let task = tokio::spawn(serve_reports(listener, 3));
+    let task = tokio::spawn(serve_reports(listener, 5));
 
     let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
@@ -964,7 +1099,7 @@ mod tests {
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{}/", addr);
 
-    let task = tokio::spawn(serve_reports_empty_rows(listener, 3));
+    let task = tokio::spawn(serve_reports_empty_rows(listener, 5));
 
     let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
@@ -996,7 +1131,7 @@ mod tests {
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{}/", addr);
 
-    let task = tokio::spawn(serve_reports_forbidden(listener, 4));
+    let task = tokio::spawn(serve_reports_forbidden(listener, 5));
 
     let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
@@ -1010,6 +1145,154 @@ mod tests {
     assert_eq!(rows[0].video_id, FALLBACK_CHANNEL_VIDEO_ID);
     assert_eq!(rows[0].estimated_revenue_usd, 0.0);
     assert_eq!(rows[0].views, 200);
+
+    task.await.unwrap();
+  }
+
+  async fn serve_reports_with_impressions(listener: TcpListener, max_connections: usize) {
+    for _ in 0..max_connections {
+      let (stream, _) = listener.accept().await.unwrap();
+      let io = TokioIo::new(stream);
+      http1::Builder::new()
+        .serve_connection(
+          io,
+          service_fn(|req: Request<Incoming>| async move {
+            let query = req.uri().query().unwrap_or("");
+
+            if query.contains("dimensions=day,video") && query.contains("metrics=estimatedRevenue,views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"video","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"estimatedRevenue","columnType":"METRIC","dataType":"FLOAT"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": [
+                    ["2026-01-02","vid1", 1.25, 200]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            if query.contains("dimensions=day,video") && query.contains("metrics=impressions,views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"video","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"impressions","columnType":"METRIC","dataType":"INTEGER"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": [
+                    ["2026-01-02","vid1", 1000, 200]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            if query.contains("dimensions=day") && query.contains("metrics=estimatedRevenue,views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"estimatedRevenue","columnType":"METRIC","dataType":"FLOAT"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": [
+                    ["2026-01-02", 1.25, 200]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            if query.contains("dimensions=day") && query.contains("metrics=impressions,views") {
+              let body = r#"
+                {
+                  "columnHeaders": [
+                    {"name":"day","columnType":"DIMENSION","dataType":"STRING"},
+                    {"name":"impressions","columnType":"METRIC","dataType":"INTEGER"},
+                    {"name":"views","columnType":"METRIC","dataType":"INTEGER"}
+                  ],
+                  "rows": [
+                    ["2026-01-02", 1000, 200]
+                  ]
+                }
+              "#;
+              return Ok::<_, hyper::Error>(
+                Response::builder()
+                  .status(StatusCode::OK)
+                  .header("content-type", "application/json")
+                  .body(Full::new(Bytes::from(body)))
+                  .unwrap(),
+              );
+            }
+
+            Ok::<_, hyper::Error>(
+              Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from_static(b"not found")))
+                .unwrap(),
+            )
+          }),
+        )
+        .await
+        .unwrap();
+    }
+  }
+
+  #[tokio::test]
+  async fn fills_impressions_via_separate_report() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}/", addr);
+
+    let task = tokio::spawn(serve_reports_with_impressions(listener, 4));
+
+    let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
+    let rows =
+      fetch_video_daily_metrics_for_channel_with_base_url("token123", &base_url, "UC123", start_dt, end_dt)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+
+    let video = rows.iter().find(|r| r.video_id == "vid1").unwrap();
+    assert_eq!(video.dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    assert_eq!(video.views, 200);
+    assert_eq!(video.impressions, 1000);
+    assert_eq!(video.estimated_revenue_usd, 1.25);
+
+    let total = rows
+      .iter()
+      .find(|r| r.video_id == FALLBACK_CHANNEL_VIDEO_ID)
+      .unwrap();
+    assert_eq!(total.dt, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    assert_eq!(total.views, 200);
+    assert_eq!(total.impressions, 1000);
+    assert_eq!(total.estimated_revenue_usd, 1.25);
 
     task.await.unwrap();
   }

@@ -211,6 +211,15 @@ async fn main() -> Result<(), Error> {
   let url_rev_views = format!(
     "{base}/v2/reports?ids={ids_value}&startDate={start_dt}&endDate={end_dt}&metrics=estimatedRevenue,views&dimensions=day&sort=day&maxResults=200"
   );
+  let url_impr_views = format!(
+    "{base}/v2/reports?ids={ids_value}&startDate={start_dt}&endDate={end_dt}&metrics=impressions,views&dimensions=day&sort=day&maxResults=200"
+  );
+  let url_impr_views_video = format!(
+    "{base}/v2/reports?ids={ids_value}&startDate={start_dt}&endDate={end_dt}&metrics=impressions,views&dimensions=day,video&sort=day&maxResults=200"
+  );
+  let url_impr_views_video_only = format!(
+    "{base}/v2/reports?ids={ids_value}&startDate={start_dt}&endDate={end_dt}&metrics=impressions,views&dimensions=video&sort=-impressions&maxResults=50"
+  );
   let rows_len = |json: &serde_json::Value| {
     json
       .get("rows")
@@ -243,6 +252,9 @@ async fn main() -> Result<(), Error> {
 
   let views_res = fetch_report_json_by_url(&tokens.access_token, &url_views_only).await;
   let rev_res = fetch_report_json_by_url(&tokens.access_token, &url_rev_views).await;
+  let impr_res = fetch_report_json_by_url(&tokens.access_token, &url_impr_views).await;
+  let impr_video_res = fetch_report_json_by_url(&tokens.access_token, &url_impr_views_video).await;
+  let impr_video_only_res = fetch_report_json_by_url(&tokens.access_token, &url_impr_views_video_only).await;
 
   if let Ok(views_json) = &views_res {
     println!(
@@ -260,12 +272,40 @@ async fn main() -> Result<(), Error> {
       last_day(rev_views_json),
     );
   }
+  if let Ok(impr_json) = &impr_res {
+    println!(
+      "debug_raw impr_views_rows={} first_day={} last_day={}",
+      rows_len(impr_json),
+      first_day(impr_json),
+      last_day(impr_json),
+    );
+  }
+  if let Ok(impr_video_json) = &impr_video_res {
+    println!(
+      "debug_raw impr_views_video_rows={} first_day={} last_day={}",
+      rows_len(impr_video_json),
+      first_day(impr_video_json),
+      last_day(impr_video_json),
+    );
+  }
+  if let Ok(impr_video_only_json) = &impr_video_only_res {
+    let n = rows_len(impr_video_only_json);
+    println!("debug_raw impr_views_video_only_rows={}", n);
+  }
 
   if views_res.is_err() || rev_res.is_err() {
     println!(
       "debug_raw_error views_only_err={} rev_views_err={}",
       views_res.err().map(|e| e.to_string()).unwrap_or_else(|| "null".to_string()),
       rev_res.err().map(|e| e.to_string()).unwrap_or_else(|| "null".to_string()),
+    );
+  }
+  if impr_res.is_err() || impr_video_res.is_err() || impr_video_only_res.is_err() {
+    println!(
+      "debug_raw_error impr_views_err={} impr_views_video_err={} impr_views_video_only_err={}",
+      impr_res.err().map(|e| e.to_string()).unwrap_or_else(|| "null".to_string()),
+      impr_video_res.err().map(|e| e.to_string()).unwrap_or_else(|| "null".to_string()),
+      impr_video_only_res.err().map(|e| e.to_string()).unwrap_or_else(|| "null".to_string()),
     );
   }
 
@@ -357,10 +397,11 @@ async fn main() -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  let (max_dt, sum_views, sum_revenue): (Option<NaiveDate>, i64, f64) = sqlx::query_as(
+  let (max_dt, sum_views, sum_impressions, sum_revenue): (Option<NaiveDate>, i64, i64, f64) = sqlx::query_as(
     r#"
       SELECT MAX(dt) AS max_dt,
              CAST(COALESCE(SUM(views), 0) AS SIGNED) AS sum_views,
+             CAST(COALESCE(SUM(impressions), 0) AS SIGNED) AS sum_impressions,
              CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS sum_revenue
       FROM video_daily_metrics
       WHERE tenant_id = ?
@@ -390,12 +431,15 @@ async fn main() -> Result<(), Error> {
     after_rows,
     max_dt.map(|d| d.to_string()).unwrap_or_else(|| "null".to_string()),
   );
-  println!("tidb_sum_views={} tidb_sum_revenue_usd={}", sum_views, sum_revenue);
+  println!(
+    "tidb_sum_views={} tidb_sum_impressions={} tidb_sum_revenue_usd={}",
+    sum_views, sum_impressions, sum_revenue
+  );
 
   if let Some(sample) = metrics.last() {
     println!(
-      "sample dt={} video_id={} views={} revenue_usd={}",
-      sample.dt, sample.video_id, sample.views, sample.estimated_revenue_usd
+      "sample dt={} video_id={} views={} impressions={} revenue_usd={}",
+      sample.dt, sample.video_id, sample.views, sample.impressions, sample.estimated_revenue_usd
     );
   }
 
