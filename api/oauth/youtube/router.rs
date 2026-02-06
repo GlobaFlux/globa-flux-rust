@@ -1753,7 +1753,7 @@ struct TopVideoItem {
     views: i64,
     impressions: i64,
     revenue_usd: f64,
-    ctr: f64,
+    ctr: Option<f64>,
     rpm: f64,
 }
 
@@ -1856,9 +1856,9 @@ async fn handle_youtube_top_videos(
         .into_iter()
         .map(|(video_id, revenue_usd, views, impressions, ctr_num, ctr_denom)| {
             let ctr = if ctr_denom > 0 {
-                ctr_num / (ctr_denom as f64)
+                Some(((ctr_num / (ctr_denom as f64)) * 10000.0).round() / 10000.0)
             } else {
-                0.0
+                None
             };
             let rpm = if views > 0 {
                 (revenue_usd / (views as f64)) * 1000.0
@@ -1870,7 +1870,7 @@ async fn handle_youtube_top_videos(
                 views,
                 impressions,
                 revenue_usd: round2(revenue_usd),
-                ctr: (ctr * 10000.0).round() / 10000.0,
+                ctr,
                 rpm: round2(rpm),
             }
         })
