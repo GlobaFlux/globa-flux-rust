@@ -2121,6 +2121,132 @@ async fn handle_youtube_data_health(
     )
 }
 
+#[derive(serde::Serialize)]
+struct OutcomeLatestItem {
+    decision_dt: String,
+    outcome_dt: String,
+    revenue_change_pct_7d: Option<f64>,
+    catastrophic_flag: bool,
+    new_top_asset_flag: bool,
+    notes: Option<serde_json::Value>,
+}
+
+async fn fetch_outcome_latest(
+    pool: &sqlx::MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+) -> Result<Option<OutcomeLatestItem>, Error> {
+    let row = sqlx::query_as::<_, (NaiveDate, NaiveDate, Option<f64>, i8, i8, Option<String>)>(
+        r#"
+          SELECT decision_dt, outcome_dt, revenue_change_pct_7d, catastrophic_flag, new_top_asset_flag, notes
+          FROM decision_outcome
+          WHERE tenant_id = ? AND channel_id = ?
+          ORDER BY outcome_dt DESC, decision_dt DESC
+          LIMIT 1;
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    Ok(row.map(
+        |(decision_dt, outcome_dt, revenue_change_pct_7d, catastrophic_flag, new_top_asset_flag, notes)| {
+            let notes_json = notes.as_deref().and_then(|raw| {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(v) => Some(v),
+                    Err(_) => Some(serde_json::Value::String(trimmed.to_string())),
+                }
+            });
+
+            OutcomeLatestItem {
+                decision_dt: decision_dt.to_string(),
+                outcome_dt: outcome_dt.to_string(),
+                revenue_change_pct_7d,
+                catastrophic_flag: catastrophic_flag != 0,
+                new_top_asset_flag: new_top_asset_flag != 0,
+                notes: notes_json,
+            }
+        },
+    ))
+}
+
+async fn handle_youtube_outcome_latest(
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<Response<ResponseBody>, Error> {
+    if method != Method::GET {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
+    }
+
+    let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
+    if expected.is_empty() || provided != expected {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"ok": false, "error": "unauthorized"}),
+        );
+    }
+
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
+
+    let tenant_id = get_query_param(uri, "tenant_id").unwrap_or_default();
+    if tenant_id.trim().is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+        );
+    }
+
+    let pool = get_pool().await?;
+    let channel_id = match get_query_param(uri, "channel_id")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => v,
+        None => fetch_youtube_channel_id(pool, tenant_id.trim())
+            .await?
+            .unwrap_or_default(),
+    };
+
+    if channel_id.trim().is_empty() {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"ok": false, "error": "not_connected", "message": "No active YouTube channel for this tenant"}),
+        );
+    }
+
+    match fetch_outcome_latest(pool, tenant_id.trim(), channel_id.trim()).await {
+        Ok(Some(item)) => json_response(
+            StatusCode::OK,
+            serde_json::json!({"ok": true, "channel_id": channel_id, "found": true, "item": item}),
+        ),
+        Ok(None) => json_response(
+            StatusCode::OK,
+            serde_json::json!({"ok": true, "channel_id": channel_id, "found": false, "item": null}),
+        ),
+        Err(err) => json_response(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({"ok": false, "error": "outcome_query_failed", "message": truncate_string(&err.to_string(), 2000), "channel_id": channel_id}),
+        ),
+    }
+}
+
 async fn handle_youtube_dashboard_bundle(
     method: &Method,
     headers: &HeaderMap,
@@ -2438,6 +2564,18 @@ async fn handle_youtube_dashboard_bundle(
         }
     };
 
+    let outcome_latest: Option<OutcomeLatestItem> =
+        match fetch_outcome_latest(pool, tenant_id.trim(), channel_id.trim()).await {
+            Ok(v) => v,
+            Err(err) => {
+                errors.insert(
+                    "outcome".to_string(),
+                    serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+                );
+                None
+            }
+        };
+
     json_response(
         StatusCode::OK,
         serde_json::json!({
@@ -2448,6 +2586,7 @@ async fn handle_youtube_dashboard_bundle(
           "health": health,
           "metrics": metrics,
           "alerts": alerts,
+          "outcome_latest": outcome_latest,
           "errors": errors,
         }),
     )
@@ -5202,6 +5341,9 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
         }
         "youtube_data_health" => {
             handle_youtube_data_health(req.method(), req.headers(), req.uri()).await
+        }
+        "youtube_outcome_latest" => {
+            handle_youtube_outcome_latest(req.method(), req.headers(), req.uri()).await
         }
         "youtube_dashboard_bundle" => {
             handle_youtube_dashboard_bundle(req.method(), req.headers(), req.uri()).await
