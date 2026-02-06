@@ -3418,15 +3418,15 @@ async fn handle_youtube_alerts(
                 String,
                 String,
                 String,
-                DateTime<Utc>,
-                Option<DateTime<Utc>>,
+                NaiveDateTime,
+                Option<NaiveDateTime>,
                 Option<String>,
             ),
         >(
             r#"
           SELECT id, kind, severity, message,
-                 detected_at,
-                 resolved_at,
+                 CAST(detected_at AS DATETIME(3)) AS detected_at,
+                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
                  details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
@@ -3465,8 +3465,8 @@ async fn handle_youtube_alerts(
                     details: details_json
                         .as_deref()
                         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                    detected_at: datetime_to_rfc3339_utc(detected_at),
-                    resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
+                    detected_at: naive_datetime_to_rfc3339_utc(detected_at),
+                    resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
                 },
             )
             .collect();
