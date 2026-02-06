@@ -2881,6 +2881,59 @@ async fn handle_youtube_sync_bundle(
         }
     };
 
+    let alerts: Vec<AlertItem> = match sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            NaiveDateTime,
+            Option<NaiveDateTime>,
+            Option<String>,
+        ),
+    >(
+        r#"
+          SELECT id, kind, severity, message,
+                 CAST(detected_at AS DATETIME(3)) AS detected_at,
+                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
+                 details_json
+          FROM yt_alerts
+          WHERE tenant_id = ? AND channel_id = ?
+          ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
+          LIMIT 50;
+        "#,
+    )
+    .bind(tenant_id.trim())
+    .bind(channel_id.trim())
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(
+                |(id, kind, severity, message, detected_at, resolved_at, details_json)| AlertItem {
+                    id: format!("alert_{id}"),
+                    kind,
+                    severity,
+                    message,
+                    details: details_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
+                    detected_at: naive_datetime_to_rfc3339_utc(detected_at),
+                    resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
+                },
+            )
+            .collect(),
+        Err(err) => {
+            errors.insert(
+                "alerts".to_string(),
+                serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+            );
+            Vec::new()
+        }
+    };
+
     json_response(
         StatusCode::OK,
         serde_json::json!({
@@ -2890,6 +2943,7 @@ async fn handle_youtube_sync_bundle(
           "end_dt": end_dt.to_string(),
           "sync_status": sync_status,
           "health": health,
+          "alerts": alerts,
           "uploads": uploads,
           "errors": errors,
         }),
