@@ -382,10 +382,35 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
   start_dt: NaiveDate,
   end_dt: NaiveDate,
 ) -> Result<Vec<VideoDailyMetricRow>, YoutubeAnalyticsError> {
+  fn compute_channel_totals_from_video_rows(rows: &[VideoDailyMetricRow]) -> Vec<VideoDailyMetricRow> {
+    use std::collections::BTreeMap;
+
+    let mut by_day: BTreeMap<NaiveDate, (f64, i64, i64)> = BTreeMap::new();
+    for row in rows.iter() {
+      if row.video_id == FALLBACK_CHANNEL_VIDEO_ID {
+        continue;
+      }
+      let entry = by_day.entry(row.dt).or_insert((0.0, 0, 0));
+      entry.0 += row.estimated_revenue_usd;
+      entry.1 += row.impressions;
+      entry.2 += row.views;
+    }
+
+    by_day
+      .into_iter()
+      .map(|(dt, (rev, impressions, views))| VideoDailyMetricRow {
+        dt,
+        video_id: FALLBACK_CHANNEL_VIDEO_ID.to_string(),
+        estimated_revenue_usd: rev,
+        impressions,
+        views,
+      })
+      .collect()
+  }
+
   // Prefer video-level report. Some channels/projects return 0 rows for `dimensions=day,video`,
   // so we fall back to day-level aggregation to at least populate the pipeline.
   let mut video_rows: Vec<VideoDailyMetricRow> = Vec::new();
-  let mut video_rows_views_only = false;
 
   let video_url = build_reports_url_with_ids(base_url, ids_value, start_dt, end_dt);
   match fetch_report_json_by_url(access_token, &video_url).await {
@@ -400,7 +425,6 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
             let parsed = parse_rows(&json);
             if !parsed.is_empty() {
               video_rows = parsed;
-              video_rows_views_only = true;
             }
           }
           Err(err) if should_fallback_to_views_only(&err) => {}
@@ -415,7 +439,6 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
           let parsed = parse_rows(&json);
           if !parsed.is_empty() {
             video_rows = parsed;
-            video_rows_views_only = true;
           }
         }
         Err(err) if should_fallback_to_views_only(&err) => {}
@@ -426,20 +449,30 @@ async fn fetch_video_daily_metrics_for_ids_with_base_url(
   };
 
   if !video_rows.is_empty() {
-    // If we only have views-only per-video data, we still want channel-level totals so revenue/RPM guardrails work.
-    if video_rows_views_only {
+    // Always try to add channel-level totals rows so downstream queries can avoid summing per-video rows.
+    // If the channel report fails, fall back to aggregating the video-level rows (may be partial).
+    let has_channel_totals = video_rows
+      .iter()
+      .any(|row| row.video_id == FALLBACK_CHANNEL_VIDEO_ID);
+
+    if !has_channel_totals {
       let channel_url = build_channel_reports_url_with_ids(base_url, ids_value, start_dt, end_dt);
       let totals_rows = match fetch_report_json_by_url(access_token, &channel_url).await {
         Ok(json) => parse_rows_channel(&json),
         Err(err) if should_fallback_to_views_only(&err) => {
           let channel_url =
             build_channel_reports_url_with_ids_views_only(base_url, ids_value, start_dt, end_dt);
-          let json = fetch_report_json_by_url(access_token, &channel_url).await?;
-          parse_rows_channel(&json)
+          match fetch_report_json_by_url(access_token, &channel_url).await {
+            Ok(json) => parse_rows_channel(&json),
+            Err(_) => compute_channel_totals_from_video_rows(&video_rows),
+          }
         }
-        Err(err) => return Err(err),
+        Err(_) => compute_channel_totals_from_video_rows(&video_rows),
       };
-      video_rows.extend(totals_rows);
+
+      if !totals_rows.is_empty() {
+        video_rows.extend(totals_rows);
+      }
     }
     return Ok(video_rows);
   }

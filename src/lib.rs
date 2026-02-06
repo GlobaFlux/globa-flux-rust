@@ -8,3 +8,4 @@ pub mod backfill;
 pub mod replay_gate;
 pub mod geo_monitor;
 pub mod guardrails;
+pub mod youtube_alerts;

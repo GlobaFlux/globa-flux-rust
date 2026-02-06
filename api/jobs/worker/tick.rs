@@ -48,6 +48,7 @@ use globa_flux_rust::providers::youtube_reporting::{
   list_report_types,
   list_reports,
 };
+use globa_flux_rust::youtube_alerts::evaluate_youtube_alerts;
 use globa_flux_rust::{
   cost::compute_cost_usd,
   geo_monitor::{
@@ -994,12 +995,41 @@ async fn handle_dispatch(
   };
 
   let job_type = schedule.job_type();
+  let mut enqueued: usize = 0;
 
   for (tenant_id, channel_id) in channels.iter() {
-    let dedupe_key = format!("{tenant_id}:{job_type}:{channel_id}:{run_for_dt}");
+    let mut run_for_dts: Vec<chrono::NaiveDate> = vec![run_for_dt];
 
-    if force {
-      sqlx::query(
+    // First sync should backfill enough history for baseline comparisons + reports.
+    // Only do this when the channel has no metrics yet.
+    if schedule == DispatchSchedule::Daily {
+      let max_dt: Option<chrono::NaiveDate> = sqlx::query_scalar(
+        r#"
+          SELECT MAX(dt) AS max_dt
+          FROM video_daily_metrics
+          WHERE tenant_id = ? AND channel_id = ?;
+        "#,
+      )
+      .bind(tenant_id)
+      .bind(channel_id)
+      .fetch_one(pool)
+      .await
+      .unwrap_or(None);
+
+      if max_dt.is_none() {
+        // Insert newest first so the worker processes current data first (ORDER BY id ASC).
+        run_for_dts = (0..4)
+          .map(|i| run_for_dt - Duration::days((i * 7) as i64))
+          .collect();
+      }
+    }
+
+    for run_for_dt in run_for_dts.into_iter() {
+      enqueued += 1;
+      let dedupe_key = format!("{tenant_id}:{job_type}:{channel_id}:{run_for_dt}");
+
+      if force {
+        sqlx::query(
         r#"
           INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status, attempt, max_attempt, run_after)
           VALUES (?, ?, ?, ?, ?, 'pending', 0, 3, ?)
@@ -1034,19 +1064,19 @@ async fn handle_dispatch(
               ELSE NULL
             END;
         "#,
-      )
-      .bind(tenant_id)
-      .bind(job_type)
-      .bind(channel_id)
-      .bind(run_for_dt)
-      .bind(dedupe_key)
-      .bind(now)
-      .bind(now)
-      .execute(pool)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?;
-    } else {
-      sqlx::query(
+        )
+        .bind(tenant_id)
+        .bind(job_type)
+        .bind(channel_id)
+        .bind(run_for_dt)
+        .bind(dedupe_key)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+      } else {
+        sqlx::query(
         r#"
           INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status, attempt, max_attempt, run_after)
           VALUES (?, ?, ?, ?, ?, 'pending', 0, 3, ?)
@@ -1081,17 +1111,18 @@ async fn handle_dispatch(
               ELSE status
             END;
         "#,
-      )
-      .bind(tenant_id)
-      .bind(job_type)
-      .bind(channel_id)
-      .bind(run_for_dt)
-      .bind(dedupe_key)
-      .bind(now)
-      .bind(now)
-      .execute(pool)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?;
+        )
+        .bind(tenant_id)
+        .bind(job_type)
+        .bind(channel_id)
+        .bind(run_for_dt)
+        .bind(dedupe_key)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+      }
     }
   }
 
@@ -1103,7 +1134,8 @@ async fn handle_dispatch(
       "job_type": job_type,
       "run_for_dt": run_for_dt.to_string(),
       "force": force,
-      "candidates": channels.len()
+      "candidates": channels.len(),
+      "enqueued": enqueued
     }),
   )
 }
@@ -1649,6 +1681,14 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
               "daily_channel: evaluate_running_experiments_for_channel error: {}",
               err
             );
+          }
+
+          // Keep guardrails fresh after the latest sync window completes.
+          // For initial backfills we may run multiple `daily_channel` tasks; evaluate only once (today's run).
+          if run_for_dt == now.date_naive() {
+            if let Err(err) = evaluate_youtube_alerts(pool, tenant_id, channel_id).await {
+              eprintln!("daily_channel: evaluate_youtube_alerts error: {}", err);
+            }
           }
 
           Ok(())
