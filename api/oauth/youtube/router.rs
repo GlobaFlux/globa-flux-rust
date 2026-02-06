@@ -2453,6 +2453,291 @@ async fn handle_youtube_dashboard_bundle(
     )
 }
 
+async fn handle_youtube_sync_bundle(
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<Response<ResponseBody>, Error> {
+    if method != Method::GET {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
+    }
+
+    let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
+    if expected.is_empty() || provided != expected {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"ok": false, "error": "unauthorized"}),
+        );
+    }
+
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
+
+    let tenant_id = get_query_param(uri, "tenant_id").unwrap_or_default();
+    if tenant_id.trim().is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+        );
+    }
+
+    let pool = get_pool().await?;
+    let channel_id = match get_query_param(uri, "channel_id")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => v,
+        None => fetch_youtube_channel_id(pool, tenant_id.trim())
+            .await?
+            .unwrap_or_default(),
+    };
+
+    if channel_id.trim().is_empty() {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"ok": false, "error": "not_connected", "message": "No active YouTube channel for this tenant"}),
+        );
+    }
+
+    let mut errors = serde_json::Map::new();
+
+    let sync_status = match sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            Option<NaiveDate>,
+            String,
+            i64,
+            i64,
+            NaiveDateTime,
+            NaiveDateTime,
+            Option<String>,
+        ),
+    >(
+        r#"
+      SELECT id, job_type, run_for_dt, status, attempt, max_attempt,
+             CAST(run_after AS DATETIME(3)) AS run_after,
+             CAST(updated_at AS DATETIME(3)) AS updated_at,
+             last_error
+      FROM job_tasks
+      WHERE tenant_id = ?
+        AND channel_id = ?
+        AND job_type IN ('daily_channel','weekly_channel','youtube_reporting_owner')
+      ORDER BY updated_at DESC
+      LIMIT 30;
+    "#,
+    )
+    .bind(tenant_id.trim())
+    .bind(channel_id.trim())
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            let mut counts = serde_json::Map::new();
+            for status in rows.iter().map(|(_, _, _, status, _, _, _, _, _)| status) {
+                let v = counts
+                    .entry(status.clone())
+                    .or_insert(serde_json::Value::Number(0.into()));
+                if let serde_json::Value::Number(n) = v {
+                    let next = n.as_i64().unwrap_or(0) + 1;
+                    *v = serde_json::Value::Number(next.into());
+                }
+            }
+
+            let items: Vec<SyncStatusTaskItem> = rows
+                .into_iter()
+                .map(
+                    |(
+                        id,
+                        job_type,
+                        run_for_dt,
+                        status,
+                        attempt,
+                        max_attempt,
+                        run_after,
+                        updated_at,
+                        last_error,
+                    )| SyncStatusTaskItem {
+                        id,
+                        job_type,
+                        run_for_dt: run_for_dt.map(|d| d.to_string()),
+                        status,
+                        attempt,
+                        max_attempt,
+                        run_after: naive_datetime_to_rfc3339_utc(run_after),
+                        updated_at: naive_datetime_to_rfc3339_utc(updated_at),
+                        last_error: last_error.map(|e| truncate_string(&e, 800)),
+                    },
+                )
+                .collect();
+
+            Some(serde_json::json!({"counts": counts, "items": items}))
+        }
+        Err(err) => {
+            errors.insert(
+                "sync_status".to_string(),
+                serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+            );
+            None
+        }
+    };
+
+    let today = Utc::now().date_naive();
+    let default_end = today - Duration::days(1);
+    let start_dt = get_query_param(uri, "start_dt")
+        .and_then(|v| NaiveDate::parse_from_str(v.trim(), "%Y-%m-%d").ok())
+        .unwrap_or(default_end - Duration::days(27));
+    let end_dt = get_query_param(uri, "end_dt")
+        .and_then(|v| NaiveDate::parse_from_str(v.trim(), "%Y-%m-%d").ok())
+        .unwrap_or(default_end);
+
+    let health = {
+        let days = ((end_dt - start_dt).num_days() + 1).max(1);
+        let baseline_start = start_dt - Duration::days(days);
+        let baseline_end = start_dt - Duration::days(1);
+
+        let window = DataHealthWindow {
+            start_dt: start_dt.to_string(),
+            end_dt: end_dt.to_string(),
+            days,
+        };
+        let baseline_window = DataHealthWindow {
+            start_dt: baseline_start.to_string(),
+            end_dt: baseline_end.to_string(),
+            days,
+        };
+
+        let current = aggregate_data_health_period(
+            pool,
+            tenant_id.trim(),
+            channel_id.trim(),
+            start_dt,
+            end_dt,
+        )
+        .await;
+        let baseline = aggregate_data_health_period(
+            pool,
+            tenant_id.trim(),
+            channel_id.trim(),
+            baseline_start,
+            baseline_end,
+        )
+        .await;
+
+        match (current, baseline) {
+            (Ok(current), Ok(baseline)) => {
+                let expected_days = days;
+                let coverage = if expected_days > 0 {
+                    (current.days_with_data as f64) / (expected_days as f64)
+                } else {
+                    0.0
+                };
+
+                let stale = current
+                    .last_dt
+                    .as_deref()
+                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                    .map(|dt| dt < end_dt)
+                    .unwrap_or(true);
+
+                let mut notes: Vec<String> = Vec::new();
+                if current.partial {
+                    notes.push(
+                        "Using video-level sums (may be partial if YouTube Analytics limits rows)."
+                            .to_string(),
+                    );
+                }
+                if stale {
+                    notes.push(
+                        "Latest metric date is behind the requested end_dt (sync may be stale)."
+                            .to_string(),
+                    );
+                }
+                if coverage < 0.8 {
+                    notes.push(
+                        "Low coverage: fewer days with data than expected in the window.".to_string(),
+                    );
+                }
+
+                Some(serde_json::json!({
+                  "ok": true,
+                  "channel_id": channel_id,
+                  "window": window,
+                  "baseline_window": baseline_window,
+                  "current": current,
+                  "baseline": baseline,
+                  "notes": notes,
+                }))
+            }
+            (Err(err), _) | (_, Err(err)) => {
+                errors.insert(
+                    "health".to_string(),
+                    serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+                );
+                None
+            }
+        }
+    };
+
+    let uploads = match sqlx::query_as::<_, (i64, String, String, NaiveDateTime)>(
+        r#"
+      SELECT id, filename, status, CAST(created_at AS DATETIME(3)) AS created_at
+      FROM yt_csv_uploads
+      WHERE tenant_id = ?
+        AND channel_id = ?
+      ORDER BY created_at DESC
+      LIMIT 20;
+    "#,
+    )
+    .bind(tenant_id.trim())
+    .bind(channel_id.trim())
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(id, filename, status, created_at)| UploadItem {
+                id: format!("upload_{id}"),
+                filename,
+                channel_id: channel_id.clone(),
+                created_at: naive_datetime_to_rfc3339_utc(created_at),
+                status,
+            })
+            .collect(),
+        Err(err) => {
+            errors.insert(
+                "uploads".to_string(),
+                serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+            );
+            Vec::new()
+        }
+    };
+
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+          "ok": true,
+          "channel_id": channel_id,
+          "start_dt": start_dt.to_string(),
+          "end_dt": end_dt.to_string(),
+          "sync_status": sync_status,
+          "health": health,
+          "uploads": uploads,
+          "errors": errors,
+        }),
+    )
+}
+
 #[derive(serde::Serialize)]
 struct UploadItem {
     id: String,
@@ -4920,6 +5205,9 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
         }
         "youtube_dashboard_bundle" => {
             handle_youtube_dashboard_bundle(req.method(), req.headers(), req.uri()).await
+        }
+        "youtube_sync_bundle" => {
+            handle_youtube_sync_bundle(req.method(), req.headers(), req.uri()).await
         }
         "youtube_top_videos" => {
             handle_youtube_top_videos(req.method(), req.headers(), req.uri()).await
