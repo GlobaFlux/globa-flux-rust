@@ -4,7 +4,7 @@ use hyper::{HeaderMap, Method, StatusCode, Uri};
 use serde::Deserialize;
 use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 
-use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 
 use globa_flux_rust::db::{
     fetch_or_seed_youtube_oauth_app_config, fetch_youtube_channel_id,
@@ -1737,15 +1737,15 @@ async fn handle_youtube_sync_status(
             String,
             i64,
             i64,
-            NaiveDateTime,
-            NaiveDateTime,
+            DateTime<Utc>,
+            DateTime<Utc>,
             Option<String>,
         ),
     >(
         r#"
       SELECT id, job_type, run_for_dt, status, attempt, max_attempt,
-             CAST(run_after AS DATETIME(3)) AS run_after,
-             CAST(updated_at AS DATETIME(3)) AS updated_at,
+             run_after,
+             updated_at,
              last_error
       FROM job_tasks
       WHERE tenant_id = ?
@@ -1804,8 +1804,8 @@ async fn handle_youtube_sync_status(
                     status,
                     attempt,
                     max_attempt,
-                    run_after: naive_datetime_to_rfc3339_utc(run_after),
-                    updated_at: naive_datetime_to_rfc3339_utc(updated_at),
+                    run_after: datetime_to_rfc3339_utc(run_after),
+                    updated_at: datetime_to_rfc3339_utc(updated_at),
                     last_error: last_error.map(|e| truncate_string(&e, 800)),
                 }
             },
@@ -2074,11 +2074,11 @@ async fn aggregate_data_health_period(
     end_dt: NaiveDate,
 ) -> Result<DataHealthPeriod, Error> {
     let row =
-        sqlx::query_as::<_, (i64, Option<NaiveDate>, Option<NaiveDateTime>, f64, i64, i64)>(
+        sqlx::query_as::<_, (i64, Option<NaiveDate>, Option<DateTime<Utc>>, f64, i64, i64)>(
         r#"
       SELECT COUNT(DISTINCT dt) AS days_with_data,
              MAX(dt) AS last_dt,
-             CAST(MAX(updated_at) AS DATETIME(3)) AS last_updated_at,
+             MAX(updated_at) AS last_updated_at,
              CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
              CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views,
              CAST(COALESCE(SUM(impressions), 0) AS SIGNED) AS impressions
@@ -2109,7 +2109,7 @@ async fn aggregate_data_health_period(
             partial: false,
             days_with_data,
             last_dt: last_dt.map(|d| d.to_string()),
-            last_updated_at: last_updated_at.map(naive_datetime_to_rfc3339_utc),
+            last_updated_at: last_updated_at.map(datetime_to_rfc3339_utc),
             totals: DataHealthTotals {
                 views,
                 impressions,
@@ -2120,11 +2120,11 @@ async fn aggregate_data_health_period(
     }
 
     let row =
-        sqlx::query_as::<_, (i64, Option<NaiveDate>, Option<NaiveDateTime>, f64, i64, i64)>(
+        sqlx::query_as::<_, (i64, Option<NaiveDate>, Option<DateTime<Utc>>, f64, i64, i64)>(
         r#"
       SELECT COUNT(DISTINCT dt) AS days_with_data,
              MAX(dt) AS last_dt,
-             CAST(MAX(updated_at) AS DATETIME(3)) AS last_updated_at,
+             MAX(updated_at) AS last_updated_at,
              CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
              CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views,
              CAST(COALESCE(SUM(impressions), 0) AS SIGNED) AS impressions
@@ -2154,7 +2154,7 @@ async fn aggregate_data_health_period(
         partial: true,
         days_with_data,
         last_dt: last_dt.map(|d| d.to_string()),
-        last_updated_at: last_updated_at.map(naive_datetime_to_rfc3339_utc),
+        last_updated_at: last_updated_at.map(datetime_to_rfc3339_utc),
         totals: DataHealthTotals {
             views,
             impressions,
@@ -2713,15 +2713,15 @@ async fn handle_youtube_dashboard_bundle(
             String,
             String,
             String,
-            NaiveDateTime,
-            Option<NaiveDateTime>,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
             Option<String>,
         ),
     >(
         r#"
           SELECT id, kind, severity, message,
-                 CAST(detected_at AS DATETIME(3)) AS detected_at,
-                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
+                 detected_at,
+                 resolved_at,
                  details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
@@ -2744,8 +2744,8 @@ async fn handle_youtube_dashboard_bundle(
                 details: details_json
                     .as_deref()
                     .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                detected_at: naive_datetime_to_rfc3339_utc(detected_at),
-                resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
+                detected_at: datetime_to_rfc3339_utc(detected_at),
+                resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
             })
             .collect(),
         Err(err) => {
@@ -2851,15 +2851,15 @@ async fn handle_youtube_sync_bundle(
             String,
             i64,
             i64,
-            NaiveDateTime,
-            NaiveDateTime,
+            DateTime<Utc>,
+            DateTime<Utc>,
             Option<String>,
         ),
     >(
         r#"
       SELECT id, job_type, run_for_dt, status, attempt, max_attempt,
-             CAST(run_after AS DATETIME(3)) AS run_after,
-             CAST(updated_at AS DATETIME(3)) AS updated_at,
+             run_after,
+             updated_at,
              last_error
       FROM job_tasks
       WHERE tenant_id = ?
@@ -2906,8 +2906,8 @@ async fn handle_youtube_sync_bundle(
                         status,
                         attempt,
                         max_attempt,
-                        run_after: naive_datetime_to_rfc3339_utc(run_after),
-                        updated_at: naive_datetime_to_rfc3339_utc(updated_at),
+                        run_after: datetime_to_rfc3339_utc(run_after),
+                        updated_at: datetime_to_rfc3339_utc(updated_at),
                         last_error: last_error.map(|e| truncate_string(&e, 800)),
                     },
                 )
@@ -3021,9 +3021,9 @@ async fn handle_youtube_sync_bundle(
         }
     };
 
-    let uploads = match sqlx::query_as::<_, (i64, String, String, NaiveDateTime)>(
+    let uploads = match sqlx::query_as::<_, (i64, String, String, DateTime<Utc>)>(
         r#"
-      SELECT id, filename, status, CAST(created_at AS DATETIME(3)) AS created_at
+      SELECT id, filename, status, created_at
       FROM yt_csv_uploads
       WHERE tenant_id = ?
         AND channel_id = ?
@@ -3042,7 +3042,7 @@ async fn handle_youtube_sync_bundle(
                 id: format!("upload_{id}"),
                 filename,
                 channel_id: channel_id.clone(),
-                created_at: naive_datetime_to_rfc3339_utc(created_at),
+                created_at: datetime_to_rfc3339_utc(created_at),
                 status,
             })
             .collect(),
@@ -3062,15 +3062,15 @@ async fn handle_youtube_sync_bundle(
             String,
             String,
             String,
-            NaiveDateTime,
-            Option<NaiveDateTime>,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
             Option<String>,
         ),
     >(
         r#"
           SELECT id, kind, severity, message,
-                 CAST(detected_at AS DATETIME(3)) AS detected_at,
-                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
+                 detected_at,
+                 resolved_at,
                  details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
@@ -3094,8 +3094,8 @@ async fn handle_youtube_sync_bundle(
                     details: details_json
                         .as_deref()
                         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                    detected_at: naive_datetime_to_rfc3339_utc(detected_at),
-                    resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
+                    detected_at: datetime_to_rfc3339_utc(detected_at),
+                    resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
                 },
             )
             .collect(),
@@ -3188,9 +3188,9 @@ async fn handle_youtube_uploads_list(
         );
     }
 
-    let rows = sqlx::query_as::<_, (i64, String, String, NaiveDateTime)>(
+    let rows = sqlx::query_as::<_, (i64, String, String, DateTime<Utc>)>(
         r#"
-      SELECT id, filename, status, CAST(created_at AS DATETIME(3)) AS created_at
+      SELECT id, filename, status, created_at
       FROM yt_csv_uploads
       WHERE tenant_id = ?
         AND channel_id = ?
@@ -3210,7 +3210,7 @@ async fn handle_youtube_uploads_list(
             id: format!("upload_{id}"),
             filename,
             channel_id: channel_id.clone(),
-            created_at: naive_datetime_to_rfc3339_utc(created_at),
+            created_at: datetime_to_rfc3339_utc(created_at),
             status,
         })
         .collect();
@@ -3578,10 +3578,6 @@ fn parse_prefixed_id(raw: &str, prefix: &str) -> Option<i64> {
     s.parse::<i64>().ok()
 }
 
-fn naive_datetime_to_rfc3339_utc(dt: NaiveDateTime) -> String {
-    DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()
-}
-
 fn datetime_to_rfc3339_utc(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339()
 }
@@ -3646,15 +3642,15 @@ async fn handle_youtube_alerts(
                 String,
                 String,
                 String,
-                NaiveDateTime,
-                Option<NaiveDateTime>,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
                 Option<String>,
             ),
         >(
             r#"
           SELECT id, kind, severity, message,
-                 CAST(detected_at AS DATETIME(3)) AS detected_at,
-                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
+                 detected_at,
+                 resolved_at,
                  details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
@@ -3693,8 +3689,8 @@ async fn handle_youtube_alerts(
                     details: details_json
                         .as_deref()
                         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                    detected_at: naive_datetime_to_rfc3339_utc(detected_at),
-                    resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
+                    detected_at: datetime_to_rfc3339_utc(detected_at),
+                    resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
                 },
             )
             .collect();
@@ -4100,15 +4096,15 @@ async fn handle_youtube_experiment_get(
             String,
             Option<f64>,
             Option<i64>,
-            Option<NaiveDateTime>,
-            Option<NaiveDateTime>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
         ),
     >(
         r#"
       SELECT id, channel_id, type, state, video_ids_json,
              stop_loss_pct, planned_duration_days,
-             CAST(started_at AS DATETIME(3)) AS started_at,
-             CAST(ended_at AS DATETIME(3)) AS ended_at
+             started_at,
+             ended_at
       FROM yt_experiments
       WHERE id = ? AND tenant_id = ?
       LIMIT 1;
@@ -4142,12 +4138,12 @@ async fn handle_youtube_experiment_get(
     let mut variants = fetch_experiment_variants(pool, id).await?;
 
     if let Some(started_at) = started_at {
-        let start_dt = started_at.date();
+        let start_dt = started_at.date_naive();
         let baseline_start_dt = start_dt - Duration::days(7);
         let baseline_end_dt = start_dt - Duration::days(1);
 
         let last_complete_dt = Utc::now().date_naive() - Duration::days(1);
-        let ended_dt = ended_at.map(|dt| dt.date());
+        let ended_dt = ended_at.map(|dt| dt.date_naive());
         let current_end_dt = ended_dt.unwrap_or(last_complete_dt).min(last_complete_dt);
 
         let baseline = aggregate_metrics_for_videos(
@@ -4180,8 +4176,8 @@ async fn handle_youtube_experiment_get(
         state,
         stop_loss_pct,
         planned_duration_days,
-        started_at: started_at.map(naive_datetime_to_rfc3339_utc),
-        ended_at: ended_at.map(naive_datetime_to_rfc3339_utc),
+        started_at: started_at.map(datetime_to_rfc3339_utc),
+        ended_at: ended_at.map(datetime_to_rfc3339_utc),
         variants: if variants.is_empty() {
             None
         } else {
@@ -4288,15 +4284,15 @@ async fn handle_youtube_experiments(
                 String,
                 Option<f64>,
                 Option<i64>,
-                Option<NaiveDateTime>,
-                Option<NaiveDateTime>,
+                Option<DateTime<Utc>>,
+                Option<DateTime<Utc>>,
             ),
         >(
             r#"
         SELECT id, channel_id, type, state, video_ids_json,
                stop_loss_pct, planned_duration_days,
-               CAST(started_at AS DATETIME(3)) AS started_at,
-               CAST(ended_at AS DATETIME(3)) AS ended_at
+               started_at,
+               ended_at
         FROM yt_experiments
         WHERE tenant_id = ?
           AND channel_id = ?
@@ -4329,11 +4325,11 @@ async fn handle_youtube_experiments(
             let mut variants = fetch_experiment_variants(pool, id).await?;
 
             if let Some(started_at) = started_at {
-                let start_dt = started_at.date();
+                let start_dt = started_at.date_naive();
                 let baseline_start_dt = start_dt - Duration::days(7);
                 let baseline_end_dt = start_dt - Duration::days(1);
 
-                let ended_dt = ended_at.map(|dt| dt.date());
+                let ended_dt = ended_at.map(|dt| dt.date_naive());
                 let current_end_dt = ended_dt.unwrap_or(last_complete_dt).min(last_complete_dt);
 
                 let baseline = aggregate_metrics_for_videos(
@@ -4365,8 +4361,8 @@ async fn handle_youtube_experiments(
                 state,
                 stop_loss_pct,
                 planned_duration_days,
-                started_at: started_at.map(naive_datetime_to_rfc3339_utc),
-                ended_at: ended_at.map(naive_datetime_to_rfc3339_utc),
+                started_at: started_at.map(datetime_to_rfc3339_utc),
+                ended_at: ended_at.map(datetime_to_rfc3339_utc),
                 variants: if variants.is_empty() {
                     None
                 } else {
