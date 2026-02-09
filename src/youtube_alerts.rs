@@ -282,7 +282,9 @@ pub async fn evaluate_youtube_alerts(
   .map_err(|e| -> Error { Box::new(e) })?;
 
   let input = GuardrailInput {
-    today,
+    // Treat staleness relative to the expected "current window end" (yesterday).
+    // YouTube Analytics commonly lags by ~48h; we don't want to flag a normal 1–2 day delay as "stale".
+    today: current_end,
     current: WindowAgg {
       revenue_usd: cur_rev,
       views: cur_views,
@@ -398,11 +400,11 @@ pub async fn evaluate_youtube_alerts(
     .to_string(),
   );
 
-  let stale_age_days = max_dt.map(|dt| (today - dt).num_days());
+  let stale_age_days = max_dt.map(|dt| (current_end - dt).num_days().max(0));
   details_by_key.insert(
     "metrics_stale",
     serde_json::json!({
-      "today": today.to_string(),
+      "today": current_end.to_string(),
       "max_metric_dt": max_dt.map(|d| d.to_string()),
       "age_days": stale_age_days,
     })
