@@ -2,7 +2,13 @@ use chrono::{Duration, NaiveDate, Utc};
 use sqlx::MySqlPool;
 use vercel_runtime::Error;
 
+use crate::db::{
+  fetch_or_seed_youtube_oauth_app_config, fetch_youtube_connection_tokens,
+  update_youtube_connection_tokens,
+};
 use crate::guardrails::{evaluate_guardrails, GuardrailAlert, GuardrailInput, WindowAgg};
+use crate::providers::youtube::{refresh_tokens, youtube_oauth_client_from_config};
+use crate::providers::youtube_analytics::fetch_top_videos_by_revenue_for_channel;
 
 fn truncate_string(value: &str, max_chars: usize) -> String {
   if max_chars == 0 {
@@ -20,6 +26,43 @@ fn truncate_string(value: &str, max_chars: usize) -> String {
 
 fn round2(v: f64) -> f64 {
   (v * 100.0).round() / 100.0
+}
+
+async fn best_effort_youtube_access_token(
+  pool: &MySqlPool,
+  tenant_id: &str,
+  channel_id: &str,
+) -> Result<Option<String>, Error> {
+  let mut tokens = match fetch_youtube_connection_tokens(pool, tenant_id, channel_id).await? {
+    Some(v) => v,
+    None => return Ok(None),
+  };
+
+  let needs_refresh = tokens
+    .expires_at
+    .map(|dt| dt <= chrono::Utc::now())
+    .unwrap_or(false);
+
+  if needs_refresh {
+    if let Some(refresh) = tokens.refresh_token.clone() {
+      if let Some(app) = fetch_or_seed_youtube_oauth_app_config(pool, tenant_id).await? {
+        if let Some(client_secret) = app
+          .client_secret
+          .as_deref()
+          .map(str::trim)
+          .filter(|v| !v.is_empty())
+        {
+          let (client, _redirect) =
+            youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
+          let refreshed = refresh_tokens(&client, &refresh).await?;
+          update_youtube_connection_tokens(pool, tenant_id, channel_id, &refreshed).await?;
+          tokens.access_token = refreshed.access_token;
+        }
+      }
+    }
+  }
+
+  Ok(Some(tokens.access_token))
 }
 
 async fn upsert_alert(
@@ -165,7 +208,7 @@ pub async fn evaluate_youtube_alerts(
 
   let total_rev_7d = if cur_rev.is_finite() { Some(cur_rev) } else { None };
 
-  let top_video_7d = if total_rev_7d.unwrap_or(0.0) >= 20.0 {
+  let mut top_video_7d = if total_rev_7d.unwrap_or(0.0) >= 20.0 {
     sqlx::query_as::<_, (String, f64)>(
       r#"
         SELECT video_id, CAST(SUM(estimated_revenue_usd) AS DOUBLE) AS rev
@@ -189,6 +232,23 @@ pub async fn evaluate_youtube_alerts(
   } else {
     None
   };
+
+  if top_video_7d.is_none() && total_rev_7d.unwrap_or(0.0) >= 20.0 {
+    // Some channels/projects can't query `dimensions=day,video` in YouTube Analytics (400 unsupported),
+    // so our TiDB ingestion falls back to channel-total rows only. To still compute the Top1
+    // concentration guardrail, we fall back to `dimensions=video` (window aggregate).
+    if let Some(access_token) = best_effort_youtube_access_token(pool, tenant_id, channel_id).await? {
+      if let Ok(rows) =
+        fetch_top_videos_by_revenue_for_channel(&access_token, channel_id, current_start, current_end, 1).await
+      {
+        if let Some(row) = rows.into_iter().next() {
+          if row.estimated_revenue_usd.is_finite() && row.estimated_revenue_usd > 0.0 {
+            top_video_7d = Some((row.video_id, row.estimated_revenue_usd));
+          }
+        }
+      }
+    }
+  }
 
   let top1_concentration_7d = match (top_video_7d.as_ref(), total_rev_7d) {
     (Some((_video_id, top_rev)), Some(total_rev)) if total_rev > 0.0 => {
