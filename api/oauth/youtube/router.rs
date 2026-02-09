@@ -2103,12 +2103,19 @@ async fn handle_youtube_data_health(
         0.0
     };
 
-    let stale = current
+    let (lag_days, stale) = current
         .last_dt
         .as_deref()
         .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .map(|dt| dt < end_dt)
-        .unwrap_or(true);
+        .map(|dt| {
+            let raw = (end_dt - dt).num_days();
+            let lag = raw.max(0);
+            // YouTube Analytics commonly lags by ~48h; treat 0–2d lag as expected (not stale).
+            let is_stale = lag > 2;
+            (lag, is_stale, dt)
+        })
+        .map(|(lag, is_stale, dt)| (Some((lag, dt)), is_stale))
+        .unwrap_or((None, true));
 
     let mut notes: Vec<String> = Vec::new();
     if current.partial {
@@ -2116,10 +2123,18 @@ async fn handle_youtube_data_health(
             "Using video-level sums (may be partial if YouTube Analytics limits rows).".to_string(),
         );
     }
-    if stale {
-        notes.push(
-            "Latest metric date is behind the requested end_dt (sync may be stale).".to_string(),
-        );
+    if let Some((lag, dt)) = lag_days {
+        if lag > 0 && !stale {
+            notes.push(format!(
+                "YouTube Analytics often lags 1–2 days. Latest dt {dt} (lag {lag}d vs end_dt {end_dt})."
+            ));
+        } else if stale {
+            notes.push(format!(
+                "Latest metric date is behind the requested end_dt (lag {lag}d; latest dt {dt}). Sync may be stale."
+            ));
+        }
+    } else if stale {
+        notes.push("No metrics found yet in this window (sync may be stale).".to_string());
     }
     if coverage < 0.8 {
         notes.push("Low coverage: fewer days with data than expected in the window.".to_string());
