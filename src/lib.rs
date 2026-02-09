@@ -1,6 +1,7 @@
 pub mod sse;
 pub mod cost;
 pub mod db;
+pub mod http_client;
 pub mod providers;
 pub mod decision_engine;
 pub mod outcome_engine;

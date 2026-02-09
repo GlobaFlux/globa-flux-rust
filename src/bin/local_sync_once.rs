@@ -1,10 +1,7 @@
 use chrono::{Duration, NaiveDate, Utc};
 use vercel_runtime::Error;
 
-use bytes::Bytes;
-use http_body_util::{BodyExt, Empty};
-use hyper::header::{ACCEPT, AUTHORIZATION};
-use hyper::{Method, Request as HyperRequest, StatusCode};
+use globa_flux_rust::http_client::http_client_for_url;
 
 use globa_flux_rust::db::{
   fetch_or_seed_youtube_oauth_app_config, fetch_youtube_channel_id,
@@ -19,40 +16,25 @@ use globa_flux_rust::providers::youtube_analytics::{
 use globa_flux_rust::reach_reporting::ingest_channel_reach_basic_a1;
 
 async fn fetch_report_json_by_url(access_token: &str, url: &str) -> Result<serde_json::Value, Error> {
-  let connector = hyper_rustls::HttpsConnectorBuilder::new()
-    .with_native_roots()
-    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?
-    .https_or_http()
-    .enable_http1()
-    .build();
-
-  let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-    .build(connector);
-
-  let req = HyperRequest::builder()
-    .method(Method::GET)
-    .uri(url)
-    .header(AUTHORIZATION, format!("Bearer {}", access_token))
-    .header(ACCEPT, "application/json")
-    .body(Empty::<Bytes>::new())
+  let client = http_client_for_url(url)
     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?;
 
   let resp = client
-    .request(req)
+    .get(url)
+    .bearer_auth(access_token)
+    .header(reqwest::header::ACCEPT, "application/json")
+    .send()
     .await
     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?;
 
   let status = resp.status();
-  let body_bytes = resp
-    .into_body()
-    .collect()
+  let body = resp
+    .text()
     .await
-    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?
-    .to_bytes();
+    .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
 
-  if status != StatusCode::OK {
-    let snippet = String::from_utf8_lossy(&body_bytes);
-    let snippet = snippet.chars().take(800).collect::<String>();
+  if !status.is_success() {
+    let snippet = body.chars().take(800).collect::<String>();
     return Err(Box::new(std::io::Error::other(format!(
       "YouTube Analytics HTTP {}: {}",
       status.as_u16(),
@@ -60,7 +42,7 @@ async fn fetch_report_json_by_url(access_token: &str, url: &str) -> Result<serde
     ))) as Error);
   }
 
-  serde_json::from_slice::<serde_json::Value>(&body_bytes)
+  serde_json::from_str::<serde_json::Value>(&body)
     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)
 }
 

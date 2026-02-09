@@ -12,6 +12,7 @@ hyper = "1.8.1"
 hyper-util = { version = "0.1.17", features = ["client", "client-legacy", "tokio"] }
 http-body-util = "0.1.3"
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "ring"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 sqlx = { version = "0.8.3", features = ["runtime-tokio-rustls", "mysql", "macros", "chrono"] }
 chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
 tokio-stream = "0.1.18"

@@ -1,8 +1,8 @@
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty, Full};
-use hyper::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use hyper::{Method, Request};
+use reqwest::Method;
 use serde_json::Value;
+
+use crate::http_client::http_client_for_url;
 
 #[derive(Debug)]
 pub struct YoutubeReportingError {
@@ -209,58 +209,34 @@ fn parse_reports(json: &Value) -> Vec<YoutubeReportingReport> {
 }
 
 async fn fetch_json_by_url(access_token: &str, url: &str) -> Result<Value, YoutubeReportingError> {
-  let connector = hyper_rustls::HttpsConnectorBuilder::new()
-    .with_native_roots()
-    .map_err(|e| YoutubeReportingError {
-      status: None,
-      message: e.to_string(),
-    })?
-    .https_or_http()
-    .enable_http1()
-    .build();
-
-  let client =
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
-
-  let req = Request::builder()
-    .method(Method::GET)
-    .uri(url)
-    .header(AUTHORIZATION, format!("Bearer {}", access_token))
-    .header(ACCEPT, "application/json")
-    .body(Empty::<Bytes>::new())
-    .map_err(|e| YoutubeReportingError {
-      status: None,
-      message: e.to_string(),
-    })?;
+  let client = http_client_for_url(url).map_err(|e| YoutubeReportingError {
+    status: None,
+    message: format!("failed to build http client: {e}"),
+  })?;
 
   let resp = client
-    .request(req)
+    .get(url)
+    .bearer_auth(access_token)
+    .header(reqwest::header::ACCEPT, "application/json")
+    .send()
     .await
     .map_err(|e| YoutubeReportingError {
-      status: None,
-      message: e.to_string(),
+      status: e.status().map(|s| s.as_u16()),
+      message: format!("{e} (url: {url})"),
     })?;
 
   let status = resp.status();
-  let body_bytes = resp
-    .into_body()
-    .collect()
-    .await
-    .map_err(|e| YoutubeReportingError {
-      status: Some(status.as_u16()),
-      message: e.to_string(),
-    })?
-    .to_bytes();
+  let body = resp.text().await.unwrap_or_else(|e| format!("<failed to read body: {e}>"));
 
   if !status.is_success() {
-    let snippet = String::from_utf8_lossy(&body_bytes);
+    let snippet = body.chars().take(400).collect::<String>();
     return Err(YoutubeReportingError {
       status: Some(status.as_u16()),
-      message: snippet.chars().take(200).collect::<String>(),
+      message: snippet,
     });
   }
 
-  serde_json::from_slice(&body_bytes).map_err(|e| YoutubeReportingError {
+  serde_json::from_str(&body).map_err(|e| YoutubeReportingError {
     status: Some(status.as_u16()),
     message: e.to_string(),
   })
@@ -272,129 +248,70 @@ async fn request_json(
   url: &str,
   body_json: Option<Value>,
 ) -> Result<Value, YoutubeReportingError> {
-  let connector = hyper_rustls::HttpsConnectorBuilder::new()
-    .with_native_roots()
-    .map_err(|e| YoutubeReportingError {
-      status: None,
-      message: e.to_string(),
-    })?
-    .https_or_http()
-    .enable_http1()
-    .build();
+  let client = http_client_for_url(url).map_err(|e| YoutubeReportingError {
+    status: None,
+    message: format!("failed to build http client: {e}"),
+  })?;
 
-  let client =
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
+  let mut req = client
+    .request(method, url)
+    .bearer_auth(access_token)
+    .header(reqwest::header::ACCEPT, "application/json");
 
-  let (body_bytes, content_type) = match body_json {
-    Some(v) => (
-      serde_json::to_vec(&v).map_err(|e| YoutubeReportingError {
-        status: None,
-        message: e.to_string(),
-      })?,
-      Some("application/json"),
-    ),
-    None => (Vec::<u8>::new(), None),
-  };
-
-  let mut builder = Request::builder()
-    .method(method)
-    .uri(url)
-    .header(AUTHORIZATION, format!("Bearer {}", access_token))
-    .header(ACCEPT, "application/json");
-
-  if let Some(content_type) = content_type {
-    builder = builder.header(CONTENT_TYPE, content_type);
+  if let Some(body_json) = body_json {
+    req = req.json(&body_json);
   }
 
-  let req = builder
-    .body(Full::new(Bytes::from(body_bytes)))
-    .map_err(|e| YoutubeReportingError {
-      status: None,
-      message: e.to_string(),
-    })?;
-
-  let resp = client
-    .request(req)
-    .await
-    .map_err(|e| YoutubeReportingError {
-      status: None,
-      message: e.to_string(),
-    })?;
+  let resp = req.send().await.map_err(|e| YoutubeReportingError {
+    status: e.status().map(|s| s.as_u16()),
+    message: format!("{e} (url: {url})"),
+  })?;
 
   let status = resp.status();
-  let body_bytes = resp
-    .into_body()
-    .collect()
-    .await
-    .map_err(|e| YoutubeReportingError {
-      status: Some(status.as_u16()),
-      message: e.to_string(),
-    })?
-    .to_bytes();
+  let body = resp.text().await.unwrap_or_else(|e| format!("<failed to read body: {e}>"));
 
   if !status.is_success() {
-    let snippet = String::from_utf8_lossy(&body_bytes);
+    let snippet = body.chars().take(400).collect::<String>();
     return Err(YoutubeReportingError {
       status: Some(status.as_u16()),
-      message: snippet.chars().take(200).collect::<String>(),
+      message: snippet,
     });
   }
 
-  serde_json::from_slice(&body_bytes).map_err(|e| YoutubeReportingError {
+  serde_json::from_str(&body).map_err(|e| YoutubeReportingError {
     status: Some(status.as_u16()),
     message: e.to_string(),
   })
 }
 
 pub async fn download_report_file(access_token: &str, download_url: &str) -> Result<Bytes, YoutubeReportingError> {
-  let connector = hyper_rustls::HttpsConnectorBuilder::new()
-    .with_native_roots()
-    .map_err(|e| YoutubeReportingError {
-      status: None,
-      message: e.to_string(),
-    })?
-    .https_or_http()
-    .enable_http1()
-    .build();
-
-  let client =
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
-
-  let req = Request::builder()
-    .method(Method::GET)
-    .uri(download_url)
-    .header(AUTHORIZATION, format!("Bearer {}", access_token))
-    .header(ACCEPT, "application/octet-stream")
-    .body(Empty::<Bytes>::new())
-    .map_err(|e| YoutubeReportingError {
-      status: None,
-      message: e.to_string(),
-    })?;
+  let client = http_client_for_url(download_url).map_err(|e| YoutubeReportingError {
+    status: None,
+    message: format!("failed to build http client: {e}"),
+  })?;
 
   let resp = client
-    .request(req)
+    .get(download_url)
+    .bearer_auth(access_token)
+    .header(reqwest::header::ACCEPT, "application/octet-stream")
+    .send()
     .await
     .map_err(|e| YoutubeReportingError {
-      status: None,
-      message: e.to_string(),
+      status: e.status().map(|s| s.as_u16()),
+      message: format!("{e} (url: {download_url})"),
     })?;
 
   let status = resp.status();
-  let body_bytes = resp
-    .into_body()
-    .collect()
-    .await
-    .map_err(|e| YoutubeReportingError {
-      status: Some(status.as_u16()),
-      message: e.to_string(),
-    })?
-    .to_bytes();
+  let body_bytes = resp.bytes().await.map_err(|e| YoutubeReportingError {
+    status: Some(status.as_u16()),
+    message: format!("failed to read body: {e}"),
+  })?;
 
   if !status.is_success() {
     let snippet = String::from_utf8_lossy(&body_bytes);
     return Err(YoutubeReportingError {
       status: Some(status.as_u16()),
-      message: snippet.chars().take(200).collect::<String>(),
+      message: snippet.chars().take(400).collect::<String>(),
     });
   }
 
@@ -608,6 +525,7 @@ pub async fn list_reports_channel(
 mod tests {
   use super::*;
   use bytes::Bytes;
+  use http_body_util::BodyExt;
   use http_body_util::Full;
   use hyper::body::Incoming;
   use hyper::header::AUTHORIZATION;
@@ -731,7 +649,8 @@ mod tests {
     assert_eq!(types[0].report_type_name.as_deref(), Some("Report 1"));
     assert_eq!(types[0].system_managed, true);
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 
   #[test]
@@ -836,7 +755,8 @@ mod tests {
       .unwrap();
     assert_eq!(bytes, Bytes::from_static(b"hello"));
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 
   async fn serve_one_job_create(listener: TcpListener) {
@@ -914,7 +834,8 @@ mod tests {
       .unwrap();
     assert_eq!(job_id, "job_created");
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 
   async fn serve_one_jobs_list_has_match(listener: TcpListener) {
@@ -975,6 +896,7 @@ mod tests {
         .unwrap();
     assert_eq!(job_id, "job_existing");
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 }

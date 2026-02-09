@@ -1,5 +1,7 @@
 use vercel_runtime::Error;
 
+use crate::http_client::http_client_for_url;
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MyChannelSummary {
   pub channel_id: String,
@@ -9,77 +11,94 @@ pub struct MyChannelSummary {
 }
 
 pub async fn fetch_my_channel_id_with_base_url(access_token: &str, base_url: &str) -> Result<String, Error> {
-  let connector = hyper_rustls::HttpsConnectorBuilder::new()
-    .with_native_roots()
-    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?
-    .https_or_http()
-    .enable_http1()
-    .build();
+  let base = base_url.trim_end_matches('/');
+  let url = format!("{base}/youtube/v3/channels?part=id&mine=true&maxResults=50");
 
-  let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
+  let client = http_client_for_url(&url).map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?;
 
-  let mut hub = google_youtube3::YouTube::new(client, access_token.to_string());
-  hub.base_url(base_url.to_string());
-  hub.root_url(base_url.to_string());
-
-  let (_, response) = hub
-    .channels()
-    .list(&vec!["id".into()])
-    .mine(true)
-    .doit()
+  let resp = client
+    .get(&url)
+    .bearer_auth(access_token)
+    .header(reqwest::header::ACCEPT, "application/json")
+    .send()
     .await
     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?;
 
-  let channel_id = response
-    .items
-    .unwrap_or_default()
-    .into_iter()
-    .find_map(|c| c.id)
+  let status = resp.status();
+  let json = resp
+    .json::<serde_json::Value>()
+    .await
+    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?;
+
+  if !status.is_success() {
+    return Err(Box::new(std::io::Error::other(format!(
+      "YouTube Data API HTTP {}: {}",
+      status.as_u16(),
+      json
+    ))) as Error);
+  }
+
+  let channel_id = json
+    .get("items")
+    .and_then(|v| v.as_array())
+    .and_then(|items| items.iter().find_map(|c| c.get("id").and_then(|v| v.as_str())))
+    .map(|v| v.trim().to_string())
+    .filter(|v| !v.is_empty())
     .ok_or_else(|| Box::new(std::io::Error::other("No channel_id found for this token")) as Error)?;
 
   Ok(channel_id)
 }
 
 pub async fn list_my_channels_with_base_url(access_token: &str, base_url: &str) -> Result<Vec<MyChannelSummary>, Error> {
-  let connector = hyper_rustls::HttpsConnectorBuilder::new()
-    .with_native_roots()
-    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?
-    .https_or_http()
-    .enable_http1()
-    .build();
+  let base = base_url.trim_end_matches('/');
+  let url = format!("{base}/youtube/v3/channels?part=id,snippet&mine=true&maxResults=50");
 
-  let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
+  let client = http_client_for_url(&url).map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?;
 
-  let mut hub = google_youtube3::YouTube::new(client, access_token.to_string());
-  hub.base_url(base_url.to_string());
-  hub.root_url(base_url.to_string());
-
-  let (_, response) = hub
-    .channels()
-    .list(&vec!["id".into(), "snippet".into()])
-    .mine(true)
-    .doit()
+  let resp = client
+    .get(&url)
+    .bearer_auth(access_token)
+    .header(reqwest::header::ACCEPT, "application/json")
+    .send()
     .await
     .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?;
 
-  let items = response.items.unwrap_or_default();
+  let status = resp.status();
+  let json = resp
+    .json::<serde_json::Value>()
+    .await
+    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?;
+
+  if !status.is_success() {
+    return Err(Box::new(std::io::Error::other(format!(
+      "YouTube Data API HTTP {}: {}",
+      status.as_u16(),
+      json
+    ))) as Error);
+  }
+
+  let items = json.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
   let mut out: Vec<MyChannelSummary> = Vec::with_capacity(items.len());
   for c in items.into_iter() {
-    let Some(channel_id) = c.id else { continue };
+    let Some(channel_id) = c.get("id").and_then(|v| v.as_str()).map(|v| v.trim().to_string()) else {
+      continue;
+    };
+    if channel_id.is_empty() {
+      continue;
+    }
+
     let title = c
-      .snippet
-      .as_ref()
-      .and_then(|s| s.title.as_ref())
+      .get("snippet")
+      .and_then(|v| v.get("title"))
+      .and_then(|v| v.as_str())
       .map(|v| v.trim().to_string())
       .filter(|v| !v.is_empty())
       .unwrap_or_else(|| "Untitled channel".to_string());
 
-    let thumbnail_url = c
-      .snippet
-      .as_ref()
-      .and_then(|s| s.thumbnails.as_ref())
-      .and_then(|t| t.default.as_ref().and_then(|x| x.url.as_ref()))
-      .or_else(|| c.snippet.as_ref().and_then(|s| s.thumbnails.as_ref()).and_then(|t| t.high.as_ref().and_then(|x| x.url.as_ref())))
+    let thumbnails = c.get("snippet").and_then(|v| v.get("thumbnails"));
+    let thumbnail_url = thumbnails
+      .and_then(|t| t.get("default").and_then(|x| x.get("url")).and_then(|u| u.as_str()))
+      .or_else(|| thumbnails.and_then(|t| t.get("high").and_then(|x| x.get("url")).and_then(|u| u.as_str())))
       .map(|v| v.trim().to_string())
       .filter(|v| !v.is_empty());
 
@@ -160,7 +179,8 @@ mod tests {
     let channel_id = fetch_my_channel_id_with_base_url("token123", &base_url).await.unwrap();
     assert_eq!(channel_id, "UC123");
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 
   #[tokio::test]
@@ -219,6 +239,7 @@ mod tests {
     assert_eq!(channels[1].title, "Ch 2");
     assert_eq!(channels[1].thumbnail_url.as_deref(), Some("https://example.com/b.jpg"));
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 }

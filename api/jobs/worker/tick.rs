@@ -93,6 +93,34 @@ fn truncate_string(value: &str, max_chars: usize) -> String {
   out
 }
 
+fn youtube_reporting_enable_url_from_error(err_text: &str) -> Option<String> {
+  // Typical error contains:
+  // "... enable it by visiting https://console.developers.google.com/apis/api/youtubereporting.googleapis.com/overview?project=1076253714959 ..."
+  let find_digits_after = |haystack: &str, needle: &str| -> Option<String> {
+    let idx = haystack.find(needle)?;
+    let rest = &haystack[idx + needle.len()..];
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
+    if digits.len() < 6 {
+      return None;
+    }
+    Some(digits)
+  };
+
+  let project_id = find_digits_after(err_text, "project=")
+    .or_else(|| {
+      let lower = err_text.to_ascii_lowercase();
+      let idx = lower.find("project ")?;
+      let rest = &err_text[idx + "project ".len()..];
+      let digits = rest.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>();
+      if digits.len() < 6 { None } else { Some(digits) }
+    })?;
+
+  Some(format!(
+    "https://console.developers.google.com/apis/api/youtubereporting.googleapis.com/overview?project={}",
+    project_id
+  ))
+}
+
 fn worker_id() -> String {
   std::env::var("VERCEL_REGION")
     .or_else(|_| std::env::var("VERCEL_ENV"))
@@ -1704,15 +1732,20 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
               ("warning", "Impressions/Impr. CTR sync failed (best-effort).")
             };
 
+            let mut help = serde_json::json!({
+              "docs": "https://developers.google.com/youtube/reporting",
+              "gcp_api": "YouTube Reporting API",
+            });
+
+            if let Some(enable_url) = youtube_reporting_enable_url_from_error(&err_text) {
+              help["enable_url"] = serde_json::Value::String(enable_url);
+            }
+
             let details_json = serde_json::json!({
               "window": { "start_dt": start_dt.to_string(), "end_dt": end_dt.to_string() },
               "error": err_text,
-              "help": {
-                "docs": "https://developers.google.com/youtube/reporting",
-                "gcp_api": "YouTube Reporting API",
-              }
-            })
-            .to_string();
+              "help": help,
+            }).to_string();
 
             let _ = upsert_alert(
               pool,

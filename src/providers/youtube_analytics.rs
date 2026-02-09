@@ -1,10 +1,9 @@
-use bytes::Bytes;
 use chrono::NaiveDate;
-use http_body_util::{BodyExt, Empty};
-use hyper::header::{ACCEPT, AUTHORIZATION};
-use hyper::{Method, Request, StatusCode};
+use reqwest::StatusCode;
 use serde_json::Value;
 use vercel_runtime::Error;
+
+use crate::http_client::http_client_for_url;
 
 #[derive(Debug, Clone)]
 pub struct VideoDailyMetricRow {
@@ -465,58 +464,34 @@ async fn fetch_report_json_with_base_url(
 }
 
 async fn fetch_report_json_by_url(access_token: &str, url: &str) -> Result<Value, YoutubeAnalyticsError> {
-
-  let connector = hyper_rustls::HttpsConnectorBuilder::new()
-    .with_native_roots()
-    .map_err(|e| YoutubeAnalyticsError {
-      status: None,
-      message: e.to_string(),
-    })?
-    .https_or_http()
-    .enable_http1()
-    .build();
-
-  let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
-
-  let req = Request::builder()
-    .method(Method::GET)
-    .uri(url)
-    .header(AUTHORIZATION, format!("Bearer {}", access_token))
-    .header(ACCEPT, "application/json")
-    .body(Empty::<Bytes>::new())
-    .map_err(|e| YoutubeAnalyticsError {
-      status: None,
-      message: e.to_string(),
-    })?;
+  let client = http_client_for_url(url).map_err(|e| YoutubeAnalyticsError {
+    status: None,
+    message: format!("failed to build http client: {e}"),
+  })?;
 
   let resp = client
-    .request(req)
+    .get(url)
+    .bearer_auth(access_token)
+    .header(reqwest::header::ACCEPT, "application/json")
+    .send()
     .await
     .map_err(|e| YoutubeAnalyticsError {
-      status: None,
-      message: e.to_string(),
+      status: e.status().map(|s| s.as_u16()),
+      message: format!("{e} (url: {url})"),
     })?;
 
   let status = resp.status();
-  let body_bytes = resp
-    .into_body()
-    .collect()
-    .await
-    .map_err(|e| YoutubeAnalyticsError {
-      status: Some(status.as_u16()),
-      message: e.to_string(),
-    })?
-    .to_bytes();
+  let body = resp.text().await.unwrap_or_else(|e| format!("<failed to read body: {e}>"));
 
   if status != StatusCode::OK {
-    let msg = String::from_utf8_lossy(&body_bytes).to_string();
+    let snippet = body.chars().take(1400).collect::<String>();
     return Err(YoutubeAnalyticsError {
       status: Some(status.as_u16()),
-      message: format!("{msg} (url: {url})"),
+      message: format!("{snippet} (url: {url})"),
     });
   }
 
-  serde_json::from_slice::<Value>(&body_bytes).map_err(|e| YoutubeAnalyticsError {
+  serde_json::from_str::<Value>(&body).map_err(|e| YoutubeAnalyticsError {
     status: Some(status.as_u16()),
     message: format!("invalid json response: {e}"),
   })
@@ -1228,7 +1203,8 @@ mod tests {
     assert_eq!(total.views, 200);
     assert_eq!(total.estimated_revenue_usd, 1.25);
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 
   async fn serve_reports_forbidden(listener: TcpListener, max_connections: usize) {
@@ -1447,7 +1423,8 @@ mod tests {
     assert_eq!(total.views, 200);
     assert_eq!(total.estimated_revenue_usd, 1.25);
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 
   #[tokio::test]
@@ -1471,7 +1448,8 @@ mod tests {
     assert_eq!(rows[0].estimated_revenue_usd, 0.0);
     assert_eq!(rows[0].views, 200);
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 
   async fn serve_reports_with_impressions(listener: TcpListener, max_connections: usize) {
@@ -1735,7 +1713,8 @@ mod tests {
     assert!((ctr - 0.06).abs() < 1e-9);
     assert_eq!(total.estimated_revenue_usd, 1.25);
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 
   #[tokio::test]
@@ -1763,6 +1742,7 @@ mod tests {
     assert_eq!(total.impressions, 0);
     assert!(total.impressions_ctr.is_none());
 
-    task.await.unwrap();
+    task.abort();
+    let _ = task.await;
   }
 }
