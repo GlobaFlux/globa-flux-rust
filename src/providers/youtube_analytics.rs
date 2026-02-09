@@ -16,6 +16,13 @@ pub struct VideoDailyMetricRow {
   pub views: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct VideoTotalsRow {
+  pub video_id: String,
+  pub estimated_revenue_usd: f64,
+  pub views: i64,
+}
+
 const FALLBACK_CHANNEL_VIDEO_ID: &str = "__CHANNEL_TOTAL__";
 
 #[derive(Debug)]
@@ -98,6 +105,22 @@ fn build_reports_url_with_ids_impressions(
     start_dt,
     end_dt,
     "videoThumbnailImpressions,videoThumbnailImpressionsClickRate",
+  )
+}
+
+fn build_video_totals_url_with_ids_and_metrics(
+  base_url: &str,
+  ids_value: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+  metrics: &str,
+  sort: &str,
+  max_results: i64,
+) -> String {
+  let base = base_url.trim_end_matches('/');
+  format!(
+    "{base}/v2/reports?ids={ids_value}&startDate={}&endDate={}&metrics={metrics}&dimensions=video&sort={sort}&maxResults={max_results}",
+    start_dt, end_dt
   )
 }
 
@@ -362,6 +385,75 @@ fn parse_rows_channel(json: &Value) -> Vec<VideoDailyMetricRow> {
   out
 }
 
+fn parse_video_totals_rows(json: &Value) -> Vec<VideoTotalsRow> {
+  let headers = json
+    .get("columnHeaders")
+    .and_then(|v| v.as_array())
+    .cloned()
+    .unwrap_or_default();
+
+  let mut idx_video: Option<usize> = None;
+  let mut idx_rev: Option<usize> = None;
+  let mut idx_views: Option<usize> = None;
+
+  for (i, h) in headers.iter().enumerate() {
+    let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    match name {
+      "video" => idx_video = Some(i),
+      "estimatedRevenue" => idx_rev = Some(i),
+      "views" => idx_views = Some(i),
+      _ => {}
+    }
+  }
+
+  let idx_video = match idx_video {
+    Some(v) => v,
+    None => return vec![],
+  };
+
+  let rows = json
+    .get("rows")
+    .and_then(|v| v.as_array())
+    .cloned()
+    .unwrap_or_default();
+
+  let mut out = Vec::with_capacity(rows.len());
+  for row in rows {
+    let arr = match row.as_array() {
+      Some(a) => a,
+      None => continue,
+    };
+
+    let video_id = arr
+      .get(idx_video)
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .trim()
+      .to_string();
+    if video_id.is_empty() {
+      continue;
+    }
+
+    let estimated_revenue_usd = idx_rev
+      .and_then(|i| arr.get(i))
+      .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+      .unwrap_or(0.0);
+
+    let views = idx_views
+      .and_then(|i| arr.get(i))
+      .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|n| n as i64)))
+      .unwrap_or(0);
+
+    out.push(VideoTotalsRow {
+      video_id,
+      estimated_revenue_usd,
+      views,
+    });
+  }
+
+  out
+}
+
 async fn fetch_report_json_with_base_url(
   access_token: &str,
   base_url: &str,
@@ -428,6 +520,60 @@ async fn fetch_report_json_by_url(access_token: &str, url: &str) -> Result<Value
     status: Some(status.as_u16()),
     message: format!("invalid json response: {e}"),
   })
+}
+
+async fn fetch_video_totals_for_ids_with_base_url(
+  access_token: &str,
+  base_url: &str,
+  ids_value: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+  metrics: &str,
+  sort: &str,
+  limit: i64,
+) -> Result<Vec<VideoTotalsRow>, YoutubeAnalyticsError> {
+  let url = build_video_totals_url_with_ids_and_metrics(base_url, ids_value, start_dt, end_dt, metrics, sort, limit);
+  let json = fetch_report_json_by_url(access_token, &url).await?;
+  Ok(parse_video_totals_rows(&json))
+}
+
+async fn fetch_top_videos_by_revenue_for_ids_with_base_url(
+  access_token: &str,
+  base_url: &str,
+  ids_value: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+  limit: i64,
+) -> Result<Vec<VideoTotalsRow>, YoutubeAnalyticsError> {
+  match fetch_video_totals_for_ids_with_base_url(
+    access_token,
+    base_url,
+    ids_value,
+    start_dt,
+    end_dt,
+    "estimatedRevenue,views",
+    "-estimatedRevenue",
+    limit,
+  )
+  .await
+  {
+    Ok(rows) => Ok(rows),
+    Err(err) if should_fallback_to_views_only(&err) => {
+      fetch_video_totals_for_ids_with_base_url(access_token, base_url, ids_value, start_dt, end_dt, "views", "-views", limit).await
+    }
+    Err(err) => Err(err),
+  }
+}
+
+async fn fetch_top_videos_by_views_for_ids_with_base_url(
+  access_token: &str,
+  base_url: &str,
+  ids_value: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+  limit: i64,
+) -> Result<Vec<VideoTotalsRow>, YoutubeAnalyticsError> {
+  fetch_video_totals_for_ids_with_base_url(access_token, base_url, ids_value, start_dt, end_dt, "views", "-views", limit).await
 }
 
 async fn fetch_video_daily_metrics_for_ids_with_base_url(
@@ -745,6 +891,60 @@ pub async fn fetch_video_daily_metrics(
   .await
 }
 
+pub async fn fetch_top_videos_by_revenue_for_channel(
+  access_token: &str,
+  channel_id: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+  limit: i64,
+) -> Result<Vec<VideoTotalsRow>, YoutubeAnalyticsError> {
+  let channel_id = channel_id.trim();
+  if channel_id.is_empty() {
+    return Err(YoutubeAnalyticsError {
+      status: None,
+      message: "missing channel_id".to_string(),
+    });
+  }
+
+  let ids_value = format!("channel=={}", channel_id);
+  fetch_top_videos_by_revenue_for_ids_with_base_url(
+    access_token,
+    "https://youtubeanalytics.googleapis.com/",
+    &ids_value,
+    start_dt,
+    end_dt,
+    limit,
+  )
+  .await
+}
+
+pub async fn fetch_top_videos_by_views_for_channel(
+  access_token: &str,
+  channel_id: &str,
+  start_dt: NaiveDate,
+  end_dt: NaiveDate,
+  limit: i64,
+) -> Result<Vec<VideoTotalsRow>, YoutubeAnalyticsError> {
+  let channel_id = channel_id.trim();
+  if channel_id.is_empty() {
+    return Err(YoutubeAnalyticsError {
+      status: None,
+      message: "missing channel_id".to_string(),
+    });
+  }
+
+  let ids_value = format!("channel=={}", channel_id);
+  fetch_top_videos_by_views_for_ids_with_base_url(
+    access_token,
+    "https://youtubeanalytics.googleapis.com/",
+    &ids_value,
+    start_dt,
+    end_dt,
+    limit,
+  )
+  .await
+}
+
 pub fn youtube_analytics_error_to_vercel_error(err: YoutubeAnalyticsError) -> Error {
   Box::new(err) as Error
 }
@@ -787,6 +987,26 @@ mod tests {
     );
 
     assert!(url.contains("metrics=videoThumbnailImpressions,videoThumbnailImpressionsClickRate"));
+  }
+
+  #[test]
+  fn build_video_totals_url_includes_expected_params() {
+    let start_dt = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let end_dt = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
+    let url = build_video_totals_url_with_ids_and_metrics(
+      "https://youtubeanalytics.googleapis.com/",
+      "channel==MINE",
+      start_dt,
+      end_dt,
+      "views",
+      "-views",
+      10,
+    );
+
+    assert!(url.contains("dimensions=video"));
+    assert!(url.contains("sort=-views"));
+    assert!(url.contains("metrics=views"));
+    assert!(url.contains("maxResults=10"));
   }
 
   #[test]

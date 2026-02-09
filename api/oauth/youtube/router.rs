@@ -18,6 +18,7 @@ use globa_flux_rust::providers::youtube::{
     build_authorize_url, exchange_code_for_tokens, refresh_tokens, youtube_oauth_client_from_config,
 };
 use globa_flux_rust::providers::youtube_analytics::{
+    fetch_top_videos_by_revenue_for_channel, fetch_top_videos_by_views_for_channel,
     fetch_video_daily_metrics_for_channel, youtube_analytics_error_to_vercel_error,
 };
 use globa_flux_rust::providers::youtube_api::{fetch_my_channel_id, list_my_channels};
@@ -49,6 +50,49 @@ fn has_tidb_url() -> bool {
         .or_else(|_| std::env::var("DATABASE_URL"))
         .map(|v| !v.is_empty())
         .unwrap_or(false)
+}
+
+async fn ensure_fresh_youtube_access_token(
+    pool: &sqlx::MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+) -> Result<String, Error> {
+    let mut tokens = fetch_youtube_connection_tokens(pool, tenant_id, channel_id)
+        .await?
+        .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+
+    let needs_refresh = tokens
+        .expires_at
+        .map(|dt| dt <= chrono::Utc::now())
+        .unwrap_or(false);
+
+    if needs_refresh {
+        if let Some(refresh) = tokens.refresh_token.clone() {
+            let app = fetch_or_seed_youtube_oauth_app_config(pool, tenant_id).await?;
+            let Some(app) = app else {
+                return Err(Box::new(std::io::Error::other("missing youtube oauth app config")) as Error);
+            };
+
+            let Some(client_secret) = app
+                .client_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            else {
+                return Err(
+                    Box::new(std::io::Error::other("missing youtube oauth client_secret")) as Error
+                );
+            };
+
+            let (client, _redirect) =
+                youtube_oauth_client_from_config(&app.client_id, client_secret, &app.redirect_uri)?;
+            let refreshed = refresh_tokens(&client, &refresh).await?;
+            update_youtube_connection_tokens(pool, tenant_id, channel_id, &refreshed).await?;
+            tokens.access_token = refreshed.access_token;
+        }
+    }
+
+    Ok(tokens.access_token)
 }
 
 fn truncate_string(value: &str, max_chars: usize) -> String {
@@ -1363,7 +1407,34 @@ async fn handle_youtube_sponsor_quote_defaults(
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
 
+    let mut long_source = "top_10_video_views_28d_median".to_string();
+    let mut long_n = rows.len() as i64;
+
     let mut views: Vec<i64> = rows.iter().map(|(_, v)| *v).filter(|v| *v > 0).collect();
+    if views.is_empty() {
+        // Fallback: some channels/projects don't support `dimensions=day,video`, so TiDB has only
+        // channel-total rows. Use YouTube Analytics `dimensions=video` as a best-effort source.
+        match ensure_fresh_youtube_access_token(pool, tenant_id.trim(), channel_id.trim()).await {
+            Ok(access_token) => {
+                match fetch_top_videos_by_views_for_channel(&access_token, channel_id.trim(), start_dt, end_dt, 10).await {
+                    Ok(api_rows) => {
+                        views = api_rows.iter().map(|r| r.views).filter(|v| *v > 0).collect();
+                        long_source = "youtube_analytics_top10_video_views_28d_median".to_string();
+                        long_n = api_rows.len() as i64;
+                    }
+                    Err(_err) => {
+                        long_source = "fallback_default".to_string();
+                        long_n = 0;
+                    }
+                }
+            }
+            Err(_err) => {
+                long_source = "fallback_default".to_string();
+                long_n = 0;
+            }
+        }
+    }
+
     let long = median_i64(&mut views).unwrap_or(50_000);
     let shorts = ((long as f64) * 0.6).round() as i64;
 
@@ -1371,10 +1442,10 @@ async fn handle_youtube_sponsor_quote_defaults(
         avg_views_long: if long > 0 { long } else { 50_000 },
         avg_views_shorts: if shorts > 0 { shorts } else { 30_000 },
         basis: SponsorQuoteDefaultsBasis {
-            long_source: "top_10_video_views_28d_median".to_string(),
-            long_n: rows.len() as i64,
+            long_source,
+            long_n,
             shorts_source: "long_x0.6".to_string(),
-            shorts_n: rows.len() as i64,
+            shorts_n: long_n,
         },
     };
 
@@ -1852,7 +1923,7 @@ async fn handle_youtube_top_videos(
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
 
-    let items: Vec<TopVideoItem> = rows
+    let mut items: Vec<TopVideoItem> = rows
         .into_iter()
         .map(|(video_id, revenue_usd, views, impressions, ctr_num, ctr_denom)| {
             let ctr = if ctr_denom > 0 {
@@ -1876,9 +1947,97 @@ async fn handle_youtube_top_videos(
         })
         .collect();
 
+    if items.is_empty() {
+        let access_token = match ensure_fresh_youtube_access_token(pool, tenant_id.trim(), channel_id.trim()).await {
+            Ok(v) => v,
+            Err(err) => {
+                let msg = err.to_string();
+                let code = if msg.contains("not_configured")
+                    || msg.contains("oauth app config")
+                    || msg.contains("client_secret")
+                {
+                    "not_configured"
+                } else if msg.contains("missing youtube channel connection") {
+                    "not_connected"
+                } else {
+                    "upstream_error"
+                };
+                return json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": code,
+                        "message": msg,
+                        "channel_id": channel_id,
+                        "start_dt": start_dt.to_string(),
+                        "end_dt": end_dt.to_string()
+                    }),
+                );
+            }
+        };
+
+        match fetch_top_videos_by_revenue_for_channel(
+            &access_token,
+            channel_id.trim(),
+            start_dt,
+            end_dt,
+            limit,
+        )
+        .await
+        {
+            Ok(rows) => {
+                items = rows
+                    .into_iter()
+                    .map(|row| {
+                        let revenue_usd = row.estimated_revenue_usd;
+                        let views = row.views;
+                        let rpm = if views > 0 {
+                            (revenue_usd / (views as f64)) * 1000.0
+                        } else {
+                            0.0
+                        };
+                        TopVideoItem {
+                            video_id: row.video_id,
+                            views,
+                            impressions: 0,
+                            revenue_usd: round2(revenue_usd),
+                            ctr: None,
+                            rpm: round2(rpm),
+                        }
+                    })
+                    .collect();
+
+                return json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": true,
+                        "source": "youtube_analytics",
+                        "channel_id": channel_id,
+                        "start_dt": start_dt.to_string(),
+                        "end_dt": end_dt.to_string(),
+                        "items": items
+                    }),
+                );
+            }
+            Err(err) => {
+                return json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "upstream_error",
+                        "message": err.to_string(),
+                        "channel_id": channel_id,
+                        "start_dt": start_dt.to_string(),
+                        "end_dt": end_dt.to_string()
+                    }),
+                );
+            }
+        }
+    }
+
     json_response(
         StatusCode::OK,
-        serde_json::json!({"ok": true, "channel_id": channel_id, "start_dt": start_dt.to_string(), "end_dt": end_dt.to_string(), "items": items}),
+        serde_json::json!({"ok": true, "source": "tidb", "channel_id": channel_id, "start_dt": start_dt.to_string(), "end_dt": end_dt.to_string(), "items": items}),
     )
 }
 
