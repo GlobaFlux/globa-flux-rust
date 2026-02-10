@@ -36,9 +36,28 @@ fn parse_i64_field(raw: &str) -> Option<i64> {
   cleaned.parse::<i64>().ok()
 }
 
-fn parse_f64_field(raw: &str) -> Option<f64> {
-  let cleaned = raw.trim().replace(',', "");
-  cleaned.parse::<f64>().ok()
+fn parse_ctr_field(raw: &str) -> Option<f64> {
+  let s = raw.trim();
+  if s.is_empty() {
+    return None;
+  }
+
+  let is_percent = s.ends_with('%');
+  let cleaned = s.trim_end_matches('%').replace(',', "");
+  let parsed = cleaned.parse::<f64>().ok()?;
+
+  let mut out = if is_percent { parsed / 100.0 } else { parsed };
+
+  // Some exports omit the % sign but still use 0-100 units.
+  if !is_percent && out > 1.0 && out <= 100.0 {
+    out /= 100.0;
+  }
+
+  if !(0.0..=1.0).contains(&out) {
+    return None;
+  }
+
+  Some(out)
 }
 
 fn maybe_gunzip_bytes(input: &[u8]) -> Result<Vec<u8>, std::io::Error> {
@@ -203,9 +222,7 @@ pub async fn ingest_channel_reach_basic_a1(
         .unwrap_or(0)
         .max(0);
 
-      let impressions_ctr = ctr_idx
-        .and_then(|i| rec.get(i))
-        .and_then(parse_f64_field);
+    let impressions_ctr = ctr_idx.and_then(|i| rec.get(i)).and_then(parse_ctr_field);
 
       upsert_video_daily_reach_metrics(
         pool,
@@ -262,4 +279,27 @@ pub async fn ingest_channel_reach_basic_a1(
     reports_downloaded,
     rows_upserted,
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn parse_ctr_field_normalizes_percent_and_ratio() {
+    let a = parse_ctr_field("5.8%").unwrap();
+    assert!((a - 0.058).abs() < 1e-9);
+
+    let b = parse_ctr_field("5.8").unwrap();
+    assert!((b - 0.058).abs() < 1e-9);
+
+    let c = parse_ctr_field("0.058").unwrap();
+    assert!((c - 0.058).abs() < 1e-9);
+
+    let d = parse_ctr_field("0.0").unwrap();
+    assert!((d - 0.0).abs() < 1e-9);
+
+    assert!(parse_ctr_field("").is_none());
+    assert!(parse_ctr_field("180").is_none());
+  }
 }
