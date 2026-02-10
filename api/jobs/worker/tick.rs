@@ -1696,7 +1696,7 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
 
           // Reach metrics (impressions/CTR) are only available via the YouTube Reporting API bulk reports.
           // Best-effort: sync the last window to unlock CTR + impressions guardrails and dashboard verification.
-          if let Err(err) = ingest_channel_reach_basic_a1(
+          match ingest_channel_reach_basic_a1(
             pool,
             tenant_id,
             channel_id,
@@ -1706,58 +1706,112 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
           )
           .await
           {
-            eprintln!(
-              "daily_channel: reach ingest failed tenant_id={} channel_id={} window={}..{} err={}",
-              tenant_id,
-              channel_id,
-              start_dt,
-              end_dt,
-              err
-            );
+            Ok(summary) => {
+              // If the job is newly created (or API was just enabled), reports can take hours to appear.
+              // When we have zero reports in the window, surface a "pending" alert so the UI doesn't
+              // misleadingly show Impr. CTR=0 without explanation.
+              if summary.reports_listed == 0 || summary.reports_selected == 0 {
+                let details_json = serde_json::json!({
+                  "window": { "start_dt": start_dt.to_string(), "end_dt": end_dt.to_string() },
+                  "reporting": {
+                    "report_type_id": summary.report_type_id,
+                    "job_id": summary.job_id,
+                    "reports_listed": summary.reports_listed,
+                    "reports_selected": summary.reports_selected,
+                    "reports_downloaded": summary.reports_downloaded,
+                    "rows_upserted": summary.rows_upserted,
+                  },
+                  "help": {
+                    "docs": "https://developers.google.com/youtube/reporting",
+                    "note": "Reporting API jobs can take up to ~24h to generate the first daily reports after enabling/creating the job. Retry tomorrow or upload Studio CSV as a temporary fallback.",
+                  }
+                })
+                .to_string();
 
-            let err_text = truncate_string(&err.to_string(), 1400);
-            let (severity, message) = if err_text.contains("YouTube Reporting API has not been used in project")
-              || err_text.contains("is disabled")
-            {
-              (
-                "warning",
-                "Impressions/Impr. CTR unavailable: enable the YouTube Reporting API for this OAuth project, then re-sync.",
-              )
-            } else if err_text.contains("forbidden") || err_text.contains("Forbidden") {
-              (
-                "warning",
-                "Impressions/Impr. CTR unavailable: missing YouTube Reporting permission for this channel/account.",
-              )
-            } else {
-              ("warning", "Impressions/Impr. CTR sync failed (best-effort).")
-            };
-
-            let mut help = serde_json::json!({
-              "docs": "https://developers.google.com/youtube/reporting",
-              "gcp_api": "YouTube Reporting API",
-            });
-
-            if let Some(enable_url) = youtube_reporting_enable_url_from_error(&err_text) {
-              help["enable_url"] = serde_json::Value::String(enable_url);
+                let _ = upsert_alert(
+                  pool,
+                  tenant_id,
+                  channel_id,
+                  "reach_reporting_pending",
+                  "Data reach",
+                  "warning",
+                  "Impressions/Impr. CTR pending: Reporting API enabled, but no reports available yet for this channel.",
+                  Some(&details_json),
+                )
+                .await;
+              } else if summary.rows_upserted > 0 {
+                // Auto-resolve any previous "pending" alert once we actually ingest reach rows.
+                let _ = sqlx::query(
+                  r#"
+                    UPDATE yt_alerts
+                    SET resolved_at = CURRENT_TIMESTAMP(3),
+                        updated_at = CURRENT_TIMESTAMP(3)
+                    WHERE tenant_id = ?
+                      AND channel_id = ?
+                      AND alert_key = 'reach_reporting_pending'
+                      AND resolved_at IS NULL;
+                  "#,
+                )
+                .bind(tenant_id)
+                .bind(channel_id)
+                .execute(pool)
+                .await;
+              }
             }
+            Err(err) => {
+              eprintln!(
+                "daily_channel: reach ingest failed tenant_id={} channel_id={} window={}..{} err={}",
+                tenant_id,
+                channel_id,
+                start_dt,
+                end_dt,
+                err
+              );
 
-            let details_json = serde_json::json!({
-              "window": { "start_dt": start_dt.to_string(), "end_dt": end_dt.to_string() },
-              "error": err_text,
-              "help": help,
-            }).to_string();
+              let err_text = truncate_string(&err.to_string(), 1400);
+              let (severity, message) = if err_text.contains("YouTube Reporting API has not been used in project")
+                || err_text.contains("is disabled")
+              {
+                (
+                  "warning",
+                  "Impressions/Impr. CTR unavailable: enable the YouTube Reporting API for this OAuth project, then re-sync.",
+                )
+              } else if err_text.contains("forbidden") || err_text.contains("Forbidden") {
+                (
+                  "warning",
+                  "Impressions/Impr. CTR unavailable: missing YouTube Reporting permission for this channel/account.",
+                )
+              } else {
+                ("warning", "Impressions/Impr. CTR sync failed (best-effort).")
+              };
 
-            let _ = upsert_alert(
-              pool,
-              tenant_id,
-              channel_id,
-              "reach_reporting_unavailable",
-              "Data reach",
-              severity,
-              message,
-              Some(&details_json),
-            )
-            .await;
+              let mut help = serde_json::json!({
+                "docs": "https://developers.google.com/youtube/reporting",
+                "gcp_api": "YouTube Reporting API",
+              });
+
+              if let Some(enable_url) = youtube_reporting_enable_url_from_error(&err_text) {
+                help["enable_url"] = serde_json::Value::String(enable_url);
+              }
+
+              let details_json = serde_json::json!({
+                "window": { "start_dt": start_dt.to_string(), "end_dt": end_dt.to_string() },
+                "error": err_text,
+                "help": help,
+              }).to_string();
+
+              let _ = upsert_alert(
+                pool,
+                tenant_id,
+                channel_id,
+                "reach_reporting_unavailable",
+                "Data reach",
+                severity,
+                message,
+                Some(&details_json),
+              )
+              .await;
+            }
           }
 
           let publish_counts =
