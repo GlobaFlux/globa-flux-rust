@@ -2713,15 +2713,15 @@ async fn handle_youtube_dashboard_bundle(
             String,
             String,
             String,
-            DateTime<Utc>,
-            Option<DateTime<Utc>>,
+            chrono::NaiveDateTime,
+            Option<chrono::NaiveDateTime>,
             Option<String>,
         ),
     >(
         r#"
           SELECT id, kind, severity, message,
-                 detected_at,
-                 resolved_at,
+                 CAST(detected_at AS DATETIME(3)) AS detected_at,
+                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
                  details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
@@ -2744,8 +2744,8 @@ async fn handle_youtube_dashboard_bundle(
                 details: details_json
                     .as_deref()
                     .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                detected_at: datetime_to_rfc3339_utc(detected_at),
-                resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
+                detected_at: naive_datetime_to_rfc3339_utc(detected_at),
+                resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
             })
             .collect(),
         Err(err) => {
@@ -3021,9 +3021,9 @@ async fn handle_youtube_sync_bundle(
         }
     };
 
-    let uploads = match sqlx::query_as::<_, (i64, String, String, DateTime<Utc>)>(
+    let uploads = match sqlx::query_as::<_, (i64, String, String, chrono::NaiveDateTime)>(
         r#"
-      SELECT id, filename, status, created_at
+      SELECT id, filename, status, CAST(created_at AS DATETIME(3)) AS created_at
       FROM yt_csv_uploads
       WHERE tenant_id = ?
         AND channel_id = ?
@@ -3042,7 +3042,7 @@ async fn handle_youtube_sync_bundle(
                 id: format!("upload_{id}"),
                 filename,
                 channel_id: channel_id.clone(),
-                created_at: datetime_to_rfc3339_utc(created_at),
+                created_at: naive_datetime_to_rfc3339_utc(created_at),
                 status,
             })
             .collect(),
@@ -3062,15 +3062,15 @@ async fn handle_youtube_sync_bundle(
             String,
             String,
             String,
-            DateTime<Utc>,
-            Option<DateTime<Utc>>,
+            chrono::NaiveDateTime,
+            Option<chrono::NaiveDateTime>,
             Option<String>,
         ),
     >(
         r#"
           SELECT id, kind, severity, message,
-                 detected_at,
-                 resolved_at,
+                 CAST(detected_at AS DATETIME(3)) AS detected_at,
+                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
                  details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
@@ -3094,8 +3094,8 @@ async fn handle_youtube_sync_bundle(
                     details: details_json
                         .as_deref()
                         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                    detected_at: datetime_to_rfc3339_utc(detected_at),
-                    resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
+                    detected_at: naive_datetime_to_rfc3339_utc(detected_at),
+                    resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
                 },
             )
             .collect(),
@@ -3188,9 +3188,9 @@ async fn handle_youtube_uploads_list(
         );
     }
 
-    let rows = sqlx::query_as::<_, (i64, String, String, DateTime<Utc>)>(
+    let rows = sqlx::query_as::<_, (i64, String, String, chrono::NaiveDateTime)>(
         r#"
-      SELECT id, filename, status, created_at
+      SELECT id, filename, status, CAST(created_at AS DATETIME(3)) AS created_at
       FROM yt_csv_uploads
       WHERE tenant_id = ?
         AND channel_id = ?
@@ -3210,7 +3210,7 @@ async fn handle_youtube_uploads_list(
             id: format!("upload_{id}"),
             filename,
             channel_id: channel_id.clone(),
-            created_at: datetime_to_rfc3339_utc(created_at),
+            created_at: naive_datetime_to_rfc3339_utc(created_at),
             status,
         })
         .collect();
@@ -3582,6 +3582,10 @@ fn datetime_to_rfc3339_utc(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339()
 }
 
+fn naive_datetime_to_rfc3339_utc(dt: chrono::NaiveDateTime) -> String {
+    DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()
+}
+
 async fn handle_youtube_alerts(
     method: &Method,
     headers: &HeaderMap,
@@ -3642,15 +3646,15 @@ async fn handle_youtube_alerts(
                 String,
                 String,
                 String,
-                DateTime<Utc>,
-                Option<DateTime<Utc>>,
+                chrono::NaiveDateTime,
+                Option<chrono::NaiveDateTime>,
                 Option<String>,
             ),
         >(
             r#"
           SELECT id, kind, severity, message,
-                 detected_at,
-                 resolved_at,
+                 CAST(detected_at AS DATETIME(3)) AS detected_at,
+                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
                  details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
@@ -3689,8 +3693,8 @@ async fn handle_youtube_alerts(
                     details: details_json
                         .as_deref()
                         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                    detected_at: datetime_to_rfc3339_utc(detected_at),
-                    resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
+                    detected_at: naive_datetime_to_rfc3339_utc(detected_at),
+                    resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
                 },
             )
             .collect();
