@@ -3570,6 +3570,8 @@ struct ResolveAlertRequest {
     id: String,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
 }
 
 fn parse_prefixed_id(raw: &str, prefix: &str) -> Option<i64> {
@@ -3760,6 +3762,13 @@ async fn handle_youtube_alerts(
             .filter(|v| !v.is_empty())
             .map(|v| truncate_string(v, 600));
 
+        let action = parsed
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| truncate_string(v, 80));
+
         let handled_at = Utc::now().to_rfc3339();
         let updated_details_json = {
             let mut details_val = match existing_details_json.as_deref() {
@@ -3780,6 +3789,9 @@ async fn handle_youtube_alerts(
             if let Some(obj) = details_val.as_object_mut() {
                 let mut handled = serde_json::Map::new();
                 handled.insert("at".to_string(), serde_json::Value::String(handled_at.clone()));
+                if let Some(a) = action.as_deref() {
+                    handled.insert("action".to_string(), serde_json::Value::String(a.to_string()));
+                }
                 if let Some(n) = note.as_deref() {
                     handled.insert("note".to_string(), serde_json::Value::String(n.to_string()));
                 }
@@ -3815,6 +3827,7 @@ async fn handle_youtube_alerts(
               "alert_id": parsed.id,
               "alert_key": alert_key,
               "handled_at": handled_at,
+              "action": action,
               "note": note,
             })
             .to_string();
