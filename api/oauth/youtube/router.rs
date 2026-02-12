@@ -3055,6 +3055,133 @@ async fn handle_youtube_sync_bundle(
         }
     };
 
+    let reporting = match fetch_youtube_content_owner_id(pool, tenant_id.trim()).await {
+        Ok(Some(content_owner_id)) if !content_owner_id.trim().is_empty() => {
+            let owner_id = content_owner_id.trim();
+
+            let jobs_rows = sqlx::query_as::<_, (String, String, DateTime<Utc>, DateTime<Utc>)>(
+                r#"
+          SELECT report_type_id, job_id, created_at, updated_at
+          FROM yt_reporting_jobs
+          WHERE tenant_id = ? AND content_owner_id = ?
+          ORDER BY updated_at DESC
+          LIMIT 50;
+        "#,
+            )
+            .bind(tenant_id.trim())
+            .bind(owner_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+
+            let mut jobs_by_type: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            for (report_type_id, job_id, _created_at, _updated_at) in jobs_rows.into_iter() {
+                jobs_by_type.entry(report_type_id).or_insert(job_id);
+            }
+
+            let stats_rows = sqlx::query_as::<
+                _,
+                (
+                    String,
+                    i64,
+                    i64,
+                    i64,
+                    Option<DateTime<Utc>>,
+                    Option<DateTime<Utc>>,
+                ),
+            >(
+                r#"
+          SELECT report_type_id,
+                 CAST(COUNT(*) AS SIGNED) AS total_reports,
+                 CAST(SUM(CASE WHEN downloaded_at IS NOT NULL THEN 1 ELSE 0 END) AS SIGNED) AS reports_downloaded,
+                 CAST(SUM(CASE WHEN parse_status='parsed' THEN 1 ELSE 0 END) AS SIGNED) AS reports_parsed,
+                 MAX(create_time) AS last_create_time,
+                 MAX(parsed_at) AS last_parsed_at
+          FROM yt_reporting_report_files
+          WHERE tenant_id = ? AND content_owner_id = ?
+          GROUP BY report_type_id
+          ORDER BY last_create_time DESC;
+        "#,
+            )
+            .bind(tenant_id.trim())
+            .bind(owner_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+
+            let error_rows =
+                sqlx::query_as::<_, (String, String, DateTime<Utc>)>(
+                    r#"
+            SELECT report_type_id, parse_error, updated_at
+            FROM yt_reporting_report_files
+            WHERE tenant_id = ?
+              AND content_owner_id = ?
+              AND parse_status = 'error'
+              AND parse_error IS NOT NULL
+            ORDER BY updated_at DESC
+            LIMIT 50;
+          "#,
+                )
+                .bind(tenant_id.trim())
+                .bind(owner_id)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+
+            let mut last_error_by_type: std::collections::HashMap<String, (String, String)> =
+                std::collections::HashMap::new();
+            for (report_type_id, parse_error, updated_at) in error_rows.into_iter() {
+                if last_error_by_type.contains_key(&report_type_id) {
+                    continue;
+                }
+                last_error_by_type.insert(
+                    report_type_id,
+                    (
+                        truncate_string(&parse_error, 800),
+                        datetime_to_rfc3339_utc(updated_at),
+                    ),
+                );
+            }
+
+            let report_types: Vec<serde_json::Value> = stats_rows
+                .into_iter()
+                .map(|(report_type_id, total, downloaded, parsed, last_create, last_parsed)| {
+                    let job_id = jobs_by_type.get(&report_type_id).cloned();
+                    let last_error = last_error_by_type.get(&report_type_id).map(|v| v.0.clone());
+                    let last_error_at =
+                        last_error_by_type.get(&report_type_id).map(|v| v.1.clone());
+                    serde_json::json!({
+                      "report_type_id": report_type_id,
+                      "job_id": job_id,
+                      "reports_total": total,
+                      "reports_downloaded": downloaded,
+                      "reports_parsed": parsed,
+                      "last_create_time": last_create.map(datetime_to_rfc3339_utc),
+                      "last_parsed_at": last_parsed.map(datetime_to_rfc3339_utc),
+                      "last_error": last_error,
+                      "last_error_at": last_error_at,
+                    })
+                })
+                .collect();
+
+            Some(serde_json::json!({
+              "ok": true,
+              "docs": "https://developers.google.com/youtube/reporting",
+              "note": "Reporting API jobs can take up to ~24h to generate the first daily reports after enabling/creating the job.",
+              "content_owner_id": owner_id,
+              "report_types": report_types,
+            }))
+        }
+        Ok(_) => None,
+        Err(err) => {
+            errors.insert(
+                "reporting".to_string(),
+                serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+            );
+            None
+        }
+    };
+
     let alerts: Vec<AlertItem> = match sqlx::query_as::<
         _,
         (
@@ -3062,15 +3189,15 @@ async fn handle_youtube_sync_bundle(
             String,
             String,
             String,
-            chrono::NaiveDateTime,
-            Option<chrono::NaiveDateTime>,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
             Option<String>,
         ),
     >(
         r#"
           SELECT id, kind, severity, message,
-                 CAST(detected_at AS DATETIME(3)) AS detected_at,
-                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
+                 detected_at,
+                 resolved_at,
                  details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
@@ -3094,8 +3221,8 @@ async fn handle_youtube_sync_bundle(
                     details: details_json
                         .as_deref()
                         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                    detected_at: naive_datetime_to_rfc3339_utc(detected_at),
-                    resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
+                    detected_at: datetime_to_rfc3339_utc(detected_at),
+                    resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
                 },
             )
             .collect(),
@@ -3119,7 +3246,183 @@ async fn handle_youtube_sync_bundle(
           "health": health,
           "alerts": alerts,
           "uploads": uploads,
+          "reporting": reporting,
           "errors": errors,
+        }),
+    )
+}
+
+async fn handle_youtube_reporting_status(
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<Response<ResponseBody>, Error> {
+    if method != Method::GET {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
+    }
+
+    let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
+    if expected.is_empty() || provided != expected {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"ok": false, "error": "unauthorized"}),
+        );
+    }
+
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
+
+    let tenant_id = get_query_param(uri, "tenant_id").unwrap_or_default();
+    if tenant_id.trim().is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+        );
+    }
+
+    let pool = get_pool().await?;
+    let owner = match get_query_param(uri, "content_owner_id")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => Some(v),
+        None => fetch_youtube_content_owner_id(pool, tenant_id.trim()).await?,
+    };
+
+    let Some(owner_id) = owner.filter(|v| !v.trim().is_empty()) else {
+        return json_response(
+            StatusCode::OK,
+            serde_json::json!({
+              "ok": true,
+              "docs": "https://developers.google.com/youtube/reporting",
+              "note": "Content owner id not discovered yet. Ensure YouTube Partner scope is granted and run sync again.",
+              "content_owner_id": null,
+              "report_types": [],
+            }),
+        );
+    };
+
+    let jobs_rows = sqlx::query_as::<_, (String, String, DateTime<Utc>, DateTime<Utc>)>(
+        r#"
+      SELECT report_type_id, job_id, created_at, updated_at
+      FROM yt_reporting_jobs
+      WHERE tenant_id = ? AND content_owner_id = ?
+      ORDER BY updated_at DESC
+      LIMIT 50;
+    "#,
+    )
+    .bind(tenant_id.trim())
+    .bind(owner_id.trim())
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut jobs_by_type: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (report_type_id, job_id, _created_at, _updated_at) in jobs_rows.into_iter() {
+        jobs_by_type.entry(report_type_id).or_insert(job_id);
+    }
+
+    let stats_rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            i64,
+            i64,
+            i64,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+        ),
+    >(
+        r#"
+      SELECT report_type_id,
+             CAST(COUNT(*) AS SIGNED) AS total_reports,
+             CAST(SUM(CASE WHEN downloaded_at IS NOT NULL THEN 1 ELSE 0 END) AS SIGNED) AS reports_downloaded,
+             CAST(SUM(CASE WHEN parse_status='parsed' THEN 1 ELSE 0 END) AS SIGNED) AS reports_parsed,
+             MAX(create_time) AS last_create_time,
+             MAX(parsed_at) AS last_parsed_at
+      FROM yt_reporting_report_files
+      WHERE tenant_id = ? AND content_owner_id = ?
+      GROUP BY report_type_id
+      ORDER BY last_create_time DESC;
+    "#,
+    )
+    .bind(tenant_id.trim())
+    .bind(owner_id.trim())
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let error_rows =
+        sqlx::query_as::<_, (String, String, DateTime<Utc>)>(
+            r#"
+        SELECT report_type_id, parse_error, updated_at
+        FROM yt_reporting_report_files
+        WHERE tenant_id = ?
+          AND content_owner_id = ?
+          AND parse_status = 'error'
+          AND parse_error IS NOT NULL
+        ORDER BY updated_at DESC
+        LIMIT 50;
+      "#,
+        )
+        .bind(tenant_id.trim())
+        .bind(owner_id.trim())
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+    let mut last_error_by_type: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for (report_type_id, parse_error, updated_at) in error_rows.into_iter() {
+        if last_error_by_type.contains_key(&report_type_id) {
+            continue;
+        }
+        last_error_by_type.insert(
+            report_type_id,
+            (
+                truncate_string(&parse_error, 800),
+                datetime_to_rfc3339_utc(updated_at),
+            ),
+        );
+    }
+
+    let report_types: Vec<serde_json::Value> = stats_rows
+        .into_iter()
+        .map(|(report_type_id, total, downloaded, parsed, last_create, last_parsed)| {
+            let job_id = jobs_by_type.get(&report_type_id).cloned();
+            let last_error = last_error_by_type.get(&report_type_id).map(|v| v.0.clone());
+            let last_error_at = last_error_by_type.get(&report_type_id).map(|v| v.1.clone());
+            serde_json::json!({
+              "report_type_id": report_type_id,
+              "job_id": job_id,
+              "reports_total": total,
+              "reports_downloaded": downloaded,
+              "reports_parsed": parsed,
+              "last_create_time": last_create.map(datetime_to_rfc3339_utc),
+              "last_parsed_at": last_parsed.map(datetime_to_rfc3339_utc),
+              "last_error": last_error,
+              "last_error_at": last_error_at,
+            })
+        })
+        .collect();
+
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+          "ok": true,
+          "docs": "https://developers.google.com/youtube/reporting",
+          "note": "Reporting API jobs can take up to ~24h to generate the first daily reports after enabling/creating the job.",
+          "content_owner_id": owner_id.trim(),
+          "report_types": report_types,
         }),
     )
 }
@@ -5186,6 +5489,9 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
             let headers = req.headers().clone();
             let bytes = req.into_body().collect().await?.to_bytes();
             handle_youtube_upload_csv(&method, &headers, bytes).await
+        }
+        "youtube_reporting_status" => {
+            handle_youtube_reporting_status(req.method(), req.headers(), req.uri()).await
         }
         "youtube_alerts" => {
             let method = req.method().clone();
