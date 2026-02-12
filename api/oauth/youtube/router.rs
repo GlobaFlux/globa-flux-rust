@@ -3064,18 +3064,18 @@ async fn handle_youtube_dashboard_bundle(
         }
     };
 
-    let alerts: Vec<AlertItem> = match sqlx::query_as::<
-        _,
-        (i64, String, String, String, DateTime<Utc>, Option<DateTime<Utc>>, Option<String>),
-    >(
-        r#"
-          SELECT id, kind, severity, message,
-                 detected_at,
-                 resolved_at,
-                 details_json
-          FROM yt_alerts
-          WHERE tenant_id = ? AND channel_id = ?
-          ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
+	      let alerts: Vec<AlertItem> = match sqlx::query_as::<
+	        _,
+	        (i64, String, String, String, DateTime<Utc>, Option<DateTime<Utc>>, Option<String>),
+	      >(
+	        r#"
+	          SELECT id, kind, severity, message,
+	                 CAST(detected_at AS DATETIME) AS detected_at,
+	                 CAST(resolved_at AS DATETIME) AS resolved_at,
+	                 details_json
+	          FROM yt_alerts
+	          WHERE tenant_id = ? AND channel_id = ?
+	          ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
           LIMIT 50;
         "#,
     )
@@ -3532,26 +3532,26 @@ async fn handle_youtube_sync_bundle(
         }
     };
 
-    let alerts: Vec<AlertItem> = match sqlx::query_as::<
-        _,
-        (
-            i64,
-            String,
-            String,
-            String,
-            DateTime<Utc>,
-            Option<DateTime<Utc>>,
-            Option<String>,
-        ),
-    >(
-        r#"
-          SELECT id, kind, severity, message,
-                 detected_at,
-                 resolved_at,
-                 details_json
-          FROM yt_alerts
-          WHERE tenant_id = ? AND channel_id = ?
-          ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
+	    let alerts: Vec<AlertItem> = match sqlx::query_as::<
+	        _,
+	        (
+	            i64,
+	            String,
+	            String,
+	            String,
+	            DateTime<Utc>,
+	            Option<DateTime<Utc>>,
+	            Option<String>,
+	        ),
+	    >(
+	        r#"
+	          SELECT id, kind, severity, message,
+	                 CAST(detected_at AS DATETIME) AS detected_at,
+	                 CAST(resolved_at AS DATETIME) AS resolved_at,
+	                 details_json
+	          FROM yt_alerts
+	          WHERE tenant_id = ? AND channel_id = ?
+	          ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
           LIMIT 50;
         "#,
     )
@@ -4391,26 +4391,26 @@ async fn handle_youtube_alerts(
         // Alerts are evaluated by the daily sync job; reads should stay fast.
         let eval_error: Option<String> = None;
 
-        let rows = match sqlx::query_as::<
-            _,
-            (
-                i64,
-                String,
-                String,
-                String,
-                DateTime<Utc>,
-                Option<DateTime<Utc>>,
-                Option<String>,
-            ),
-        >(
-            r#"
-          SELECT id, kind, severity, message,
-                 detected_at,
-                 resolved_at,
-                 details_json
-          FROM yt_alerts
-          WHERE tenant_id = ? AND channel_id = ?
-          ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
+	        let rows = match sqlx::query_as::<
+	            _,
+	            (
+	                i64,
+	                String,
+	                String,
+	                String,
+	                DateTime<Utc>,
+	                Option<DateTime<Utc>>,
+	                Option<String>,
+	            ),
+	        >(
+	            r#"
+	          SELECT id, kind, severity, message,
+	                 CAST(detected_at AS DATETIME) AS detected_at,
+	                 CAST(resolved_at AS DATETIME) AS resolved_at,
+	                 details_json
+	          FROM yt_alerts
+	          WHERE tenant_id = ? AND channel_id = ?
+	          ORDER BY (resolved_at IS NULL) DESC, detected_at DESC
           LIMIT 50;
         "#,
         )

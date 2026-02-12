@@ -49,7 +49,7 @@ async fn main() -> Result<(), Error> {
 
   let result = sqlx::query_as::<_, (i64, DateTime<Utc>)>(
     r#"
-      SELECT id, detected_at
+      SELECT id, CAST(detected_at AS DATETIME) AS detected_at
       FROM yt_alerts
       WHERE tenant_id = ?
         AND channel_id = ?
