@@ -1318,7 +1318,7 @@ pub async fn upsert_video_daily_reach_metrics(
       ON DUPLICATE KEY UPDATE
         impressions = VALUES(impressions),
         impressions_ctr = COALESCE(VALUES(impressions_ctr), impressions_ctr),
-        views = VALUES(views),
+        views = CASE WHEN VALUES(views) > 0 THEN VALUES(views) ELSE views END,
         updated_at = CURRENT_TIMESTAMP(3);
     "#,
   )

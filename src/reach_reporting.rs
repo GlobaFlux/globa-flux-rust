@@ -182,14 +182,34 @@ pub async fn ingest_channel_reach_basic_a1(
     };
 
     let dt_idx = find_idx(&["date", "day"]);
+    // Some channel-level report types do not include a video dimension.
     let video_idx = find_idx(&["video_id", "video"]);
+    // Some reach report types omit views; we already fetch views via Analytics API.
     let views_idx = find_idx(&["views", "view"]);
-    let impressions_idx = find_idx(&["video_thumbnail_impressions"]);
-    let ctr_idx = find_idx(&["video_thumbnail_impressions_ctr", "video_thumbnail_impressions_click_through_rate"]);
+    let impressions_idx = find_idx(&[
+      "video_thumbnail_impressions",
+      "thumbnail_impressions",
+      "impressions",
+      "impr",
+      "impression",
+    ]);
+    let ctr_idx = find_idx(&[
+      "video_thumbnail_impressions_ctr",
+      "video_thumbnail_impressions_click_through_rate",
+      "video_thumbnail_impressions_click_rate",
+      "thumbnail_impressions_ctr",
+      "impressions_ctr",
+      "ctr",
+    ]);
 
-    if dt_idx.is_none() || video_idx.is_none() || views_idx.is_none() || impressions_idx.is_none() {
+    if dt_idx.is_none() || impressions_idx.is_none() {
+      let mut cols: Vec<String> = idx.keys().cloned().collect();
+      cols.sort();
       return Err(Box::new(std::io::Error::other(
-        "reach report missing required columns (date/video_id/views/video_thumbnail_impressions)",
+        format!(
+          "reach report missing required columns (date/impressions). available_columns={}",
+          cols.join(",")
+        ),
       )) as Error);
     }
 
@@ -204,14 +224,18 @@ pub async fn ingest_channel_reach_basic_a1(
         continue;
       }
 
-      let video_id = rec
-        .get(video_idx.unwrap())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "__CHANNEL_TOTAL__".to_string());
+      let video_id = match video_idx.and_then(|i| rec.get(i)) {
+        Some(v) => v.trim().to_string(),
+        None => "__CHANNEL_TOTAL__".to_string(),
+      };
+      let video_id = if video_id.is_empty() {
+        "__CHANNEL_TOTAL__".to_string()
+      } else {
+        video_id
+      };
 
-      let views = rec
-        .get(views_idx.unwrap())
+      let views = views_idx
+        .and_then(|i| rec.get(i))
         .and_then(parse_i64_field)
         .unwrap_or(0)
         .max(0);
