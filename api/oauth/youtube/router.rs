@@ -3585,6 +3585,41 @@ async fn handle_youtube_sync_bundle(
         }
     };
 
+    let share_latest = match sqlx::query_as::<_, (String, Option<DateTime<Utc>>,)>(
+        r#"
+          SELECT token, expires_at
+          FROM yt_report_shares
+          WHERE tenant_id = ?
+            AND channel_id = ?
+            AND start_dt = ?
+            AND end_dt = ?
+            AND (expires_at IS NULL OR expires_at > ?)
+          ORDER BY created_at DESC
+          LIMIT 1;
+        "#,
+    )
+    .bind(tenant_id.trim())
+    .bind(channel_id.trim())
+    .bind(start_dt)
+    .bind(end_dt)
+    .bind(Utc::now())
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some((token, expires_at))) => Some(serde_json::json!({
+          "token": token,
+          "expires_at": expires_at.map(datetime_to_rfc3339_utc),
+        })),
+        Ok(None) => None,
+        Err(err) => {
+            errors.insert(
+                "share_latest".to_string(),
+                serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+            );
+            None
+        }
+    };
+
     json_response(
         StatusCode::OK,
         serde_json::json!({
@@ -3597,6 +3632,7 @@ async fn handle_youtube_sync_bundle(
           "alerts": alerts,
           "uploads": uploads,
           "reporting": reporting,
+          "share_latest": share_latest,
           "errors": errors,
         }),
     )
