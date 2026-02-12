@@ -3260,9 +3260,9 @@ async fn handle_youtube_sync_bundle(
         }
     };
 
-    let uploads = match sqlx::query_as::<_, (i64, String, String, chrono::NaiveDateTime)>(
+    let uploads = match sqlx::query_as::<_, CsvUploadRow>(
         r#"
-      SELECT id, filename, status, CAST(created_at AS DATETIME(3)) AS created_at
+      SELECT id, filename, status, created_at
       FROM yt_csv_uploads
       WHERE tenant_id = ?
         AND channel_id = ?
@@ -3281,7 +3281,7 @@ async fn handle_youtube_sync_bundle(
                 id: format!("upload_{id}"),
                 filename,
                 channel_id: channel_id.clone(),
-                created_at: naive_datetime_to_rfc3339_utc(created_at),
+                created_at: datetime_to_rfc3339_utc(created_at),
                 status,
             })
             .collect(),
@@ -3675,6 +3675,8 @@ struct UploadItem {
     status: String,
 }
 
+type CsvUploadRow = (i64, String, String, DateTime<Utc>);
+
 async fn handle_youtube_uploads_list(
     method: &Method,
     headers: &HeaderMap,
@@ -3730,9 +3732,9 @@ async fn handle_youtube_uploads_list(
         );
     }
 
-    let rows = sqlx::query_as::<_, (i64, String, String, chrono::NaiveDateTime)>(
+    let rows = sqlx::query_as::<_, CsvUploadRow>(
         r#"
-      SELECT id, filename, status, CAST(created_at AS DATETIME(3)) AS created_at
+      SELECT id, filename, status, created_at
       FROM yt_csv_uploads
       WHERE tenant_id = ?
         AND channel_id = ?
@@ -3752,7 +3754,7 @@ async fn handle_youtube_uploads_list(
             id: format!("upload_{id}"),
             filename,
             channel_id: channel_id.clone(),
-            created_at: naive_datetime_to_rfc3339_utc(created_at),
+            created_at: datetime_to_rfc3339_utc(created_at),
             status,
         })
         .collect();
@@ -4187,10 +4189,6 @@ fn parse_prefixed_id(raw: &str, prefix: &str) -> Option<i64> {
 
 fn datetime_to_rfc3339_utc(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339()
-}
-
-fn naive_datetime_to_rfc3339_utc(dt: chrono::NaiveDateTime) -> String {
-    DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()
 }
 
 async fn handle_youtube_alerts(
@@ -5891,5 +5889,11 @@ mod tests {
         assert_eq!(rows[0].views, 100);
         assert_eq!(rows[0].impressions, 1000);
         assert!((rows[0].estimated_revenue_usd - 12.34).abs() < 1e-6);
+    }
+
+    #[test]
+    fn csv_upload_row_created_at_is_datetime_utc() {
+        let row: CsvUploadRow = (1, "file.csv".to_string(), "received".to_string(), Utc::now());
+        let _dt: DateTime<Utc> = row.3;
     }
 }
