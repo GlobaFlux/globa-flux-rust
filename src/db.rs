@@ -456,6 +456,30 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
+  // Public share links for proof reports (HTML snapshots).
+  // Purpose: send to brands/partners without requiring login.
+  sqlx::query(
+    r#"
+      CREATE TABLE IF NOT EXISTS yt_report_shares (
+        token CHAR(32) PRIMARY KEY,
+        tenant_id VARCHAR(128) NOT NULL,
+        channel_id VARCHAR(128) NOT NULL,
+        start_dt DATE NOT NULL,
+        end_dt DATE NOT NULL,
+        filename VARCHAR(256) NULL,
+        html LONGTEXT NOT NULL,
+        hits BIGINT NOT NULL DEFAULT 0,
+        expires_at TIMESTAMP(3) NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        KEY idx_yt_report_shares_lookup (tenant_id, channel_id, created_at),
+        KEY idx_yt_report_shares_expiry (expires_at)
+      );
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
   sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS policy_params (

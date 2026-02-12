@@ -764,6 +764,7 @@ dependencies = [
  "hyper-util",
  "oauth2",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

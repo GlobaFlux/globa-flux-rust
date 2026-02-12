@@ -27,6 +27,7 @@ use globa_flux_rust::providers::youtube_videos::{
     fetch_video_snapshot, set_video_thumbnail_from_url, update_video_publish_at, update_video_title,
 };
 use globa_flux_rust::youtube_alerts::evaluate_youtube_alerts;
+use ring::rand::{SecureRandom, SystemRandom};
 
 fn bearer_token(header_value: Option<&str>) -> Option<&str> {
     let value = header_value?;
@@ -151,6 +152,42 @@ fn percent_decode(input: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+fn percent_encode(input: &str) -> String {
+    // Minimal RFC 3986 percent-encoding for query values.
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out
+}
+
+fn gen_share_token() -> Result<String, Error> {
+    let rng = SystemRandom::new();
+    let mut buf = [0u8; 16];
+    rng.fill(&mut buf)
+        .map_err(|_| Box::new(std::io::Error::other("failed to generate token")) as Error)?;
+    Ok(bytes_to_hex(&buf))
+}
+
 fn get_query_param(uri: &Uri, key: &str) -> Option<String> {
     let query = uri.query()?;
     for part in query.split('&') {
@@ -194,6 +231,216 @@ fn median_i64(values: &mut [i64]) -> Option<i64> {
 struct StartRequest {
     tenant_id: String,
     state: String,
+}
+
+#[derive(Deserialize)]
+struct ReportSharePutRequest {
+    tenant_id: String,
+    channel_id: Option<String>,
+    start_dt: String,
+    end_dt: String,
+    filename: Option<String>,
+    html: String,
+    expires_in_days: Option<i64>,
+}
+
+async fn handle_youtube_report_share_put(
+    method: &Method,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response<ResponseBody>, Error> {
+    if method != Method::POST {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
+    }
+
+    let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
+    if expected.is_empty() || provided != expected {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"ok": false, "error": "unauthorized"}),
+        );
+    }
+
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
+
+    let parsed: ReportSharePutRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
+        Box::new(std::io::Error::other(format!("invalid json body: {e}")))
+    })?;
+
+    let tenant_id = parsed.tenant_id.trim();
+    if tenant_id.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+        );
+    }
+
+    let start_dt = parse_dt(&parsed.start_dt).ok_or_else(|| {
+        Box::new(std::io::Error::other("start_dt must be YYYY-MM-DD")) as Error
+    })?;
+    let end_dt = parse_dt(&parsed.end_dt).ok_or_else(|| {
+        Box::new(std::io::Error::other("end_dt must be YYYY-MM-DD")) as Error
+    })?;
+    if start_dt > end_dt {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "start_dt must be <= end_dt"}),
+        );
+    }
+
+    let pool = get_pool().await?;
+    let channel_id = match parsed
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => v.to_string(),
+        None => fetch_youtube_channel_id(pool, tenant_id)
+            .await?
+            .unwrap_or_default(),
+    };
+
+    if channel_id.trim().is_empty() {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"ok": false, "error": "not_connected", "message": "No active YouTube channel for this tenant"}),
+        );
+    }
+
+    if parsed.html.trim().is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "html is required"}),
+        );
+    }
+
+    let token = gen_share_token()?;
+    let expires_at = parsed
+        .expires_in_days
+        .unwrap_or(30)
+        .clamp(1, 365);
+    let expires_dt = Utc::now() + Duration::days(expires_at);
+
+    sqlx::query(
+        r#"
+          INSERT INTO yt_report_shares
+            (token, tenant_id, channel_id, start_dt, end_dt, filename, html, expires_at)
+          VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(token.as_str())
+    .bind(tenant_id)
+    .bind(channel_id.trim())
+    .bind(start_dt)
+    .bind(end_dt)
+    .bind(parsed.filename.as_deref().map(str::trim).filter(|v| !v.is_empty()))
+    .bind(parsed.html)
+    .bind(expires_dt)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    json_response(
+        StatusCode::CREATED,
+        serde_json::json!({
+          "ok": true,
+          "token": token,
+          "channel_id": channel_id,
+          "start_dt": start_dt.to_string(),
+          "end_dt": end_dt.to_string(),
+          "expires_at": datetime_to_rfc3339_utc(expires_dt),
+        }),
+    )
+}
+
+async fn handle_youtube_report_share_get(
+    method: &Method,
+    uri: &Uri,
+) -> Result<Response<ResponseBody>, Error> {
+    if method != Method::GET {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
+    }
+
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
+
+    let token = get_query_param(uri, "token").unwrap_or_default();
+    let token = token.trim();
+    if token.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "token is required"}),
+        );
+    }
+
+    let pool = get_pool().await?;
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<DateTime<Utc>>,)>(
+        r#"
+          SELECT html, filename, expires_at
+          FROM yt_report_shares
+          WHERE token = ?
+          LIMIT 1;
+        "#,
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    let Some((html, filename, expires_at)) = row else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"ok": false, "error": "not_found"}),
+        );
+    };
+
+    if let Some(exp) = expires_at {
+        if exp <= Utc::now() {
+            return json_response(
+                StatusCode::GONE,
+                serde_json::json!({"ok": false, "error": "expired"}),
+            );
+        }
+    }
+
+    let _ = sqlx::query(
+        r#"
+          UPDATE yt_report_shares
+          SET hits = hits + 1
+          WHERE token = ?;
+        "#,
+    )
+    .bind(token)
+    .execute(pool)
+    .await;
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .header("cache-control", "public, max-age=60");
+    if let Some(name) = filename.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        builder = builder.header("x-report-filename", name);
+    }
+    Ok(builder.body(ResponseBody::from(html))?)
 }
 
 async fn handle_start(
@@ -5519,6 +5766,15 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
         }
         "youtube_top_videos" => {
             handle_youtube_top_videos(req.method(), req.headers(), req.uri()).await
+        }
+        "youtube_report_share_put" => {
+            let method = req.method().clone();
+            let headers = req.headers().clone();
+            let bytes = req.into_body().collect().await?.to_bytes();
+            handle_youtube_report_share_put(&method, &headers, bytes).await
+        }
+        "youtube_report_share_get" => {
+            handle_youtube_report_share_get(req.method(), req.uri()).await
         }
         "youtube_sponsor_quote_defaults" => {
             let method = req.method().clone();
