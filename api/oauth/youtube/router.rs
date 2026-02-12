@@ -4304,12 +4304,14 @@ async fn fetch_experiment_variants(
 struct AggMetrics {
     revenue_usd: f64,
     impressions: i64,
+    ctr_num: f64,
+    ctr_denom: i64,
     views: i64,
 }
 
 fn agg_ctr(m: AggMetrics) -> Option<f64> {
-    if m.impressions > 0 {
-        Some((m.views as f64) / (m.impressions as f64))
+    if m.ctr_denom > 0 {
+        Some(m.ctr_num / (m.ctr_denom as f64))
     } else {
         None
     }
@@ -4339,6 +4341,8 @@ async fn aggregate_metrics_for_videos(
         r#"
       SELECT CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
              CAST(COALESCE(SUM(impressions), 0) AS SIGNED) AS impressions,
+             CAST(COALESCE(SUM(impressions_ctr * impressions), 0) AS DOUBLE) AS ctr_num,
+             CAST(COALESCE(SUM(CASE WHEN impressions_ctr IS NOT NULL THEN impressions ELSE 0 END), 0) AS SIGNED) AS ctr_denom,
              CAST(COALESCE(SUM(views), 0) AS SIGNED) AS views
       FROM video_daily_metrics
       WHERE tenant_id =
@@ -4360,8 +4364,8 @@ async fn aggregate_metrics_for_videos(
     }
     qb.push(");");
 
-    let (revenue_usd, impressions, views) = qb
-        .build_query_as::<(f64, i64, i64)>()
+    let (revenue_usd, impressions, ctr_num, ctr_denom, views) = qb
+        .build_query_as::<(f64, i64, f64, i64, i64)>()
         .fetch_one(pool)
         .await
         .map_err(|e| -> Error { Box::new(e) })?;
@@ -4369,6 +4373,8 @@ async fn aggregate_metrics_for_videos(
     Ok(AggMetrics {
         revenue_usd,
         impressions,
+        ctr_num,
+        ctr_denom,
         views,
     })
 }
@@ -4413,6 +4419,59 @@ fn enrich_experiment_variants_with_stats(
     }
 
     variants
+}
+
+#[cfg(test)]
+mod experiments_tests {
+    use super::*;
+
+    #[test]
+    fn enrich_variants_uses_weighted_impressions_ctr() {
+        let variants = vec![
+            ExperimentVariantResponse {
+                variant_id: "A".to_string(),
+                status: "control".to_string(),
+                payload: serde_json::json!({"title": "A"}),
+                impressions: None,
+                views: None,
+                revenue_usd: None,
+                ctr: None,
+                rpm: None,
+            },
+            ExperimentVariantResponse {
+                variant_id: "B".to_string(),
+                status: "active".to_string(),
+                payload: serde_json::json!({"title": "B"}),
+                impressions: None,
+                views: None,
+                revenue_usd: None,
+                ctr: None,
+                rpm: None,
+            },
+        ];
+
+        let baseline = AggMetrics {
+            revenue_usd: 10.0,
+            impressions: 10_000,
+            ctr_num: 0.05 * 10_000.0,
+            ctr_denom: 10_000,
+            views: 500,
+        };
+        let current = AggMetrics {
+            revenue_usd: 12.0,
+            impressions: 20_000,
+            ctr_num: 0.06 * 20_000.0,
+            ctr_denom: 20_000,
+            views: 800,
+        };
+
+        let enriched = enrich_experiment_variants_with_stats(variants, baseline, current);
+        let a = enriched.iter().find(|v| v.variant_id == "A").unwrap();
+        let b = enriched.iter().find(|v| v.variant_id == "B").unwrap();
+
+        assert_eq!(a.ctr, Some(0.05));
+        assert_eq!(b.ctr, Some(0.06));
+    }
 }
 
 async fn handle_youtube_experiment_get(
