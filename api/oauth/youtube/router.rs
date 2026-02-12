@@ -3508,6 +3508,50 @@ async fn handle_youtube_upload_csv(
         }
     };
 
+    let mut min_dt: Option<NaiveDate> = None;
+    let mut max_dt: Option<NaiveDate> = None;
+    let mut channel_total_rows: i64 = 0;
+    let mut per_video_rows: i64 = 0;
+    let mut rows_with_views: i64 = 0;
+    let mut rows_with_impressions: i64 = 0;
+    let mut rows_with_revenue: i64 = 0;
+    let mut ctr_present_rows: i64 = 0;
+    let mut ctr_nonzero_rows: i64 = 0;
+
+    for row in parsed_rows.iter() {
+        min_dt = Some(match min_dt {
+            Some(cur) => cur.min(row.dt),
+            None => row.dt,
+        });
+        max_dt = Some(match max_dt {
+            Some(cur) => cur.max(row.dt),
+            None => row.dt,
+        });
+
+        if row.video_id == "csv_channel_total" {
+            channel_total_rows += 1;
+        } else {
+            per_video_rows += 1;
+        }
+
+        if row.views > 0 {
+            rows_with_views += 1;
+        }
+        if row.impressions > 0 {
+            rows_with_impressions += 1;
+        }
+        if row.estimated_revenue_usd > 0.0 {
+            rows_with_revenue += 1;
+        }
+
+        if let Some(ctr) = row.impressions_ctr {
+            ctr_present_rows += 1;
+            if ctr > 0.0 {
+                ctr_nonzero_rows += 1;
+            }
+        }
+    }
+
     for row in parsed_rows.iter() {
         upsert_video_daily_metric(
             pool,
@@ -3549,7 +3593,26 @@ async fn handle_youtube_upload_csv(
 
     json_response(
         StatusCode::OK,
-        serde_json::json!({"ok": true, "upload_id": format!("upload_{upload_id}"), "rows_parsed": parsed_rows.len(), "channel_id": channel_id, "eval_error": eval_error}),
+        serde_json::json!({
+          "ok": true,
+          "upload_id": format!("upload_{upload_id}"),
+          "rows_parsed": parsed_rows.len(),
+          "channel_id": channel_id,
+          "eval_error": eval_error,
+          "csv_stats": {
+            "total_rows": parsed_rows.len(),
+            "channel_total_rows": channel_total_rows,
+            "per_video_rows": per_video_rows,
+            "date_min": min_dt.map(|d| d.to_string()),
+            "date_max": max_dt.map(|d| d.to_string()),
+            "has_views": rows_with_views > 0,
+            "has_impressions": rows_with_impressions > 0,
+            "has_revenue": rows_with_revenue > 0,
+            "has_ctr": ctr_present_rows > 0,
+            "ctr_present_rows": ctr_present_rows,
+            "ctr_nonzero_rows": ctr_nonzero_rows
+          }
+        }),
     )
 }
 
