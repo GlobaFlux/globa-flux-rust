@@ -2708,20 +2708,12 @@ async fn handle_youtube_dashboard_bundle(
 
     let alerts: Vec<AlertItem> = match sqlx::query_as::<
         _,
-        (
-            i64,
-            String,
-            String,
-            String,
-            chrono::NaiveDateTime,
-            Option<chrono::NaiveDateTime>,
-            Option<String>,
-        ),
+        (i64, String, String, String, DateTime<Utc>, Option<DateTime<Utc>>, Option<String>),
     >(
         r#"
           SELECT id, kind, severity, message,
-                 CAST(detected_at AS DATETIME(3)) AS detected_at,
-                 CAST(resolved_at AS DATETIME(3)) AS resolved_at,
+                 detected_at,
+                 resolved_at,
                  details_json
           FROM yt_alerts
           WHERE tenant_id = ? AND channel_id = ?
@@ -2744,8 +2736,8 @@ async fn handle_youtube_dashboard_bundle(
                 details: details_json
                     .as_deref()
                     .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                detected_at: naive_datetime_to_rfc3339_utc(detected_at),
-                resolved_at: resolved_at.map(naive_datetime_to_rfc3339_utc),
+                detected_at: datetime_to_rfc3339_utc(detected_at),
+                resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
             })
             .collect(),
         Err(err) => {
