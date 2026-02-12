@@ -443,6 +443,117 @@ async fn handle_youtube_report_share_get(
     Ok(builder.body(ResponseBody::from(html))?)
 }
 
+async fn handle_youtube_report_share_latest(
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<Response<ResponseBody>, Error> {
+    if method != Method::GET {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
+    }
+
+    let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
+    if expected.is_empty() || provided != expected {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"ok": false, "error": "unauthorized"}),
+        );
+    }
+
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
+
+    let tenant_id = get_query_param(uri, "tenant_id").unwrap_or_default();
+    let tenant_id = tenant_id.trim().to_string();
+    if tenant_id.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+        );
+    }
+
+    let start_dt_raw = get_query_param(uri, "start_dt").unwrap_or_default();
+    let end_dt_raw = get_query_param(uri, "end_dt").unwrap_or_default();
+    let start_dt = parse_dt(&start_dt_raw).ok_or_else(|| {
+        Box::new(std::io::Error::other("start_dt must be YYYY-MM-DD")) as Error
+    })?;
+    let end_dt = parse_dt(&end_dt_raw).ok_or_else(|| {
+        Box::new(std::io::Error::other("end_dt must be YYYY-MM-DD")) as Error
+    })?;
+    if start_dt > end_dt {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "start_dt must be <= end_dt"}),
+        );
+    }
+
+    let pool = get_pool().await?;
+    let channel_id = match get_query_param(uri, "channel_id")
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => v.to_string(),
+        None => fetch_youtube_channel_id(pool, tenant_id.as_str())
+            .await?
+            .unwrap_or_default(),
+    };
+
+    if channel_id.trim().is_empty() {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"ok": false, "error": "not_connected", "message": "No active YouTube channel for this tenant"}),
+        );
+    }
+
+    let now = Utc::now();
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<DateTime<Utc>>,)>(
+        r#"
+          SELECT token, filename, expires_at
+          FROM yt_report_shares
+          WHERE tenant_id = ?
+            AND channel_id = ?
+            AND start_dt = ?
+            AND end_dt = ?
+            AND (expires_at IS NULL OR expires_at > ?)
+          ORDER BY created_at DESC
+          LIMIT 1;
+        "#,
+    )
+    .bind(tenant_id.as_str())
+    .bind(channel_id.trim())
+    .bind(start_dt)
+    .bind(end_dt)
+    .bind(now)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    let (token, filename, expires_at) = match row {
+        Some(v) => (Some(v.0), v.1, v.2),
+        None => (None, None, None),
+    };
+
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+          "ok": true,
+          "token": token,
+          "filename": filename,
+          "expires_at": expires_at.map(datetime_to_rfc3339_utc),
+        }),
+    )
+}
+
 async fn handle_start(
     method: &Method,
     headers: &HeaderMap,
@@ -5773,6 +5884,12 @@ async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
         }
         "youtube_report_share_get" => {
             handle_youtube_report_share_get(req.method(), req.uri()).await
+        }
+        "youtube_report_share_latest" => {
+            let method = req.method().clone();
+            let headers = req.headers().clone();
+            let uri = req.uri().clone();
+            handle_youtube_report_share_latest(&method, &headers, &uri).await
         }
         "youtube_sponsor_quote_defaults" => {
             let method = req.method().clone();
