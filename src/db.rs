@@ -709,6 +709,16 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
 
   sqlx::query(
     r#"
+      ALTER TABLE yt_report_shares
+      ADD COLUMN IF NOT EXISTS last_opened_at TIMESTAMP(3) NULL;
+    "#,
+  )
+  .execute(pool)
+  .await
+  .map_err(|e| -> Error { Box::new(e) })?;
+
+  sqlx::query(
+    r#"
       ALTER TABLE video_daily_metrics
       ADD COLUMN IF NOT EXISTS impressions_ctr DOUBLE NULL;
     "#,
@@ -2551,6 +2561,37 @@ mod tests {
     assert!(
       src_router.contains("public_proof_link_created"),
       "youtube report share put should record public proof link creation in observed_actions"
+    );
+  }
+
+  #[test]
+  fn report_share_tracks_last_opened_at() {
+    let src_db = include_str!("db.rs");
+    let src_router = include_str!("../api/oauth/youtube/router.rs");
+
+    let ddl_needle = [
+      "ALTER TABLE yt_report_shares\n      ADD COLUMN IF NOT EXISTS last_open",
+      "ed_at TIMESTAMP(3) NULL;",
+    ]
+    .concat();
+    assert!(
+      src_db.contains(&ddl_needle),
+      "ensure_schema() should add yt_report_shares.last_opened_at"
+    );
+
+    let update_needle = "last_opened_at = CURRENT_TIMESTAMP(3)";
+    assert!(
+      src_router.contains(update_needle),
+      "youtube_report_share_get should update last_opened_at when a proof link is opened"
+    );
+
+    assert!(
+      src_router.contains("\"hits\""),
+      "youtube_report_share_latest should expose hits"
+    );
+    assert!(
+      src_router.contains("\"last_opened_at\""),
+      "youtube_report_share_latest should expose last_opened_at"
     );
   }
 }

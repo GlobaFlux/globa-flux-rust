@@ -446,7 +446,8 @@ async fn handle_youtube_report_share_get(
     let _ = sqlx::query(
         r#"
           UPDATE yt_report_shares
-          SET hits = hits + 1
+          SET hits = hits + 1,
+              last_opened_at = CURRENT_TIMESTAMP(3)
           WHERE token = ?;
         "#,
     )
@@ -537,9 +538,22 @@ async fn handle_youtube_report_share_latest(
     }
 
     let now = Utc::now();
-    let row = sqlx::query_as::<_, (String, Option<String>, Option<DateTime<Utc>>,)>(
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            i64,
+            Option<DateTime<Utc>>,
+        ),
+    >(
         r#"
-          SELECT token, filename, expires_at
+          SELECT token,
+                 filename,
+                 CAST(expires_at AS DATETIME) AS expires_at,
+                 CAST(hits AS SIGNED) AS hits,
+                 CAST(last_opened_at AS DATETIME) AS last_opened_at
           FROM yt_report_shares
           WHERE tenant_id = ?
             AND channel_id = ?
@@ -559,9 +573,15 @@ async fn handle_youtube_report_share_latest(
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
 
-    let (token, filename, expires_at) = match row {
-        Some(v) => (Some(v.0), v.1, v.2),
-        None => (None, None, None),
+    let (token, filename, expires_at, hits, last_opened_at) = match row {
+        Some((token, filename, expires_at, hits, last_opened_at)) => (
+            Some(token),
+            filename,
+            expires_at,
+            Some(hits),
+            last_opened_at,
+        ),
+        None => (None, None, None, None, None),
     };
 
     json_response(
@@ -571,6 +591,8 @@ async fn handle_youtube_report_share_latest(
           "token": token,
           "filename": filename,
           "expires_at": expires_at.map(datetime_to_rfc3339_utc),
+          "hits": hits,
+          "last_opened_at": last_opened_at.map(datetime_to_rfc3339_utc),
         }),
     )
 }
@@ -3606,9 +3628,12 @@ async fn handle_youtube_sync_bundle(
         }
     };
 
-    let share_latest = match sqlx::query_as::<_, (String, Option<DateTime<Utc>>,)>(
+    let share_latest = match sqlx::query_as::<_, (String, Option<DateTime<Utc>>, i64, Option<DateTime<Utc>>,)>(
         r#"
-          SELECT token, expires_at
+          SELECT token,
+                 CAST(expires_at AS DATETIME) AS expires_at,
+                 CAST(hits AS SIGNED) AS hits,
+                 CAST(last_opened_at AS DATETIME) AS last_opened_at
           FROM yt_report_shares
           WHERE tenant_id = ?
             AND channel_id = ?
@@ -3627,9 +3652,11 @@ async fn handle_youtube_sync_bundle(
     .fetch_optional(pool)
     .await
     {
-        Ok(Some((token, expires_at))) => Some(serde_json::json!({
+        Ok(Some((token, expires_at, hits, last_opened_at))) => Some(serde_json::json!({
           "token": token,
           "expires_at": expires_at.map(datetime_to_rfc3339_utc),
+          "hits": hits,
+          "last_opened_at": last_opened_at.map(datetime_to_rfc3339_utc),
         })),
         Ok(None) => None,
         Err(err) => {
