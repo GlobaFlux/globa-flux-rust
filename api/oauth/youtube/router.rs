@@ -10,8 +10,8 @@ use globa_flux_rust::db::{
     fetch_or_seed_youtube_oauth_app_config, fetch_youtube_channel_id,
     fetch_youtube_connection_tokens, fetch_youtube_content_owner_id,
     fetch_youtube_oauth_app_config, get_pool, set_youtube_channel_id, set_youtube_content_owner_id,
-    update_youtube_connection_tokens, upsert_video_daily_metric, upsert_youtube_connection,
-    upsert_youtube_oauth_app_config,
+    update_youtube_connection_tokens, upsert_observed_action, upsert_video_daily_metric,
+    upsert_youtube_connection, upsert_youtube_oauth_app_config,
 };
 use globa_flux_rust::decision_engine::{compute_decision, DecisionEngineConfig};
 use globa_flux_rust::providers::youtube::{
@@ -351,6 +351,27 @@ async fn handle_youtube_report_share_put(
     .execute(pool)
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
+
+    // Proof hook: record that the user generated a public proof link (Gate 3).
+    // Best-effort; don't fail share creation if this insert fails.
+    let action_type = format!("public_proof_link_created:{}", token.as_str());
+    let action_meta_json = serde_json::json!({
+      "token": token.as_str(),
+      "start_dt": start_dt.to_string(),
+      "end_dt": end_dt.to_string(),
+      "expires_at": datetime_to_rfc3339_utc(expires_dt),
+      "filename": parsed.filename.as_deref().map(str::trim).filter(|v| !v.is_empty()),
+    })
+    .to_string();
+    let _ = upsert_observed_action(
+        pool,
+        tenant_id,
+        channel_id.trim(),
+        Utc::now().date_naive(),
+        action_type.as_str(),
+        Some(action_meta_json.as_str()),
+    )
+    .await;
 
     json_response(
         StatusCode::CREATED,

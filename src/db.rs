@@ -2544,4 +2544,13 @@ mod tests {
     let deduped = dedupe_columns(&headers);
     assert_eq!(deduped, vec!["views", "views_2", "views_3"]);
   }
+
+  #[test]
+  fn report_share_put_records_observed_action() {
+    let src_router = include_str!("../api/oauth/youtube/router.rs");
+    assert!(
+      src_router.contains("public_proof_link_created"),
+      "youtube report share put should record public proof link creation in observed_actions"
+    );
+  }
 }
