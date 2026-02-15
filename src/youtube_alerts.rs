@@ -88,7 +88,7 @@ async fn upsert_alert(
         severity = VALUES(severity),
         message = VALUES(message),
         details_json = COALESCE(VALUES(details_json), details_json),
-        detected_at = CURRENT_TIMESTAMP(3),
+        detected_at = IF(resolved_at IS NULL, detected_at, CURRENT_TIMESTAMP(3)),
         resolved_at = NULL,
         updated_at = CURRENT_TIMESTAMP(3);
     "#,
@@ -575,4 +575,32 @@ pub async fn evaluate_youtube_alerts(
   }
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  #[test]
+  fn upsert_alert_preserves_detected_at_for_open_alerts() {
+    let src_youtube_alerts = include_str!("youtube_alerts.rs");
+    let src_tick = include_str!("../api/jobs/worker/tick.rs");
+
+    // When an alert is already open (resolved_at IS NULL), we must NOT reset detected_at on every evaluation;
+    // otherwise MTTR/MTTA evidence becomes meaningless (it always looks "fresh").
+    // Build the needle dynamically so the full substring doesn't appear in this file (otherwise the
+    // youtube_alerts.rs assertion would trivially pass because the test itself contains it).
+    let needle = [
+      "detected_at = IF(resolved_at IS NULL, detected_at, ",
+      "CURRENT_TIMESTAMP(3))",
+    ]
+    .concat();
+
+    assert!(
+      src_youtube_alerts.contains(&needle),
+      "youtube_alerts.rs upsert must preserve detected_at for open alerts"
+    );
+    assert!(
+      src_tick.contains(&needle),
+      "tick.rs upsert must preserve detected_at for open alerts"
+    );
+  }
 }

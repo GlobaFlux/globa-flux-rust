@@ -268,7 +268,7 @@ async fn upsert_alert(
         severity = VALUES(severity),
         message = VALUES(message),
         details_json = COALESCE(VALUES(details_json), details_json),
-        detected_at = CURRENT_TIMESTAMP(3),
+        detected_at = IF(resolved_at IS NULL, detected_at, CURRENT_TIMESTAMP(3)),
         resolved_at = NULL,
         updated_at = CURRENT_TIMESTAMP(3);
     "#,
