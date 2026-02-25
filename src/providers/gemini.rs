@@ -4,9 +4,37 @@ use hyper::header::{ACCEPT, CONTENT_TYPE};
 use hyper::{Method, Request, StatusCode};
 use serde_json::Value;
 use std::future::Future;
+use std::sync::OnceLock;
 use vercel_runtime::Error;
 
 use crate::cost::ModelPricingUsdPerMToken;
+
+type GeminiHttpsConnector =
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
+type GeminiHttpClient = hyper_util::client::legacy::Client<GeminiHttpsConnector, Full<Bytes>>;
+
+static GEMINI_HTTP_CLIENT: OnceLock<Result<GeminiHttpClient, String>> = OnceLock::new();
+
+fn gemini_http_client() -> Result<&'static GeminiHttpClient, Error> {
+    let result = GEMINI_HTTP_CLIENT.get_or_init(|| {
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .map_err(|e| e.to_string())?
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        Ok(
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(connector),
+        )
+    });
+
+    match result {
+        Ok(client) => Ok(client),
+        Err(message) => Err(Box::new(std::io::Error::other(message.clone()))),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GeminiUsage {
@@ -150,14 +178,7 @@ pub async fn generate_text(
     let payload = build_request_json(system, user, temperature, max_output_tokens);
     let body = serde_json::to_vec(&payload)?;
 
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?
-        .https_or_http()
-        .enable_http1()
-        .build();
-    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build(connector);
+    let client = gemini_http_client()?;
 
     let req = Request::builder()
         .method(Method::POST)
@@ -213,14 +234,7 @@ where
     let payload = build_request_json(system, user, temperature, max_output_tokens);
     let body = serde_json::to_vec(&payload)?;
 
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Error)?
-        .https_or_http()
-        .enable_http1()
-        .build();
-    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build(connector);
+    let client = gemini_http_client()?;
 
     let req = Request::builder()
         .method(Method::POST)

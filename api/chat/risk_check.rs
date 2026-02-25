@@ -8,7 +8,8 @@ use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 use bytes::Bytes;
 use globa_flux_rust::cost::compute_cost_usd;
 use globa_flux_rust::db::{
-    fetch_tenant_gemini_model, fetch_usage_event, get_pool, insert_usage_event, sum_spent_usd_today,
+    consume_daily_usage_event, fetch_tenant_gemini_model, fetch_usage_event, get_pool,
+    insert_usage_event, sum_spent_usd_today,
 };
 use globa_flux_rust::providers::gemini::{
     generate_text as gemini_generate_text, pricing_for_model as gemini_pricing_for_model,
@@ -16,10 +17,183 @@ use globa_flux_rust::providers::gemini::{
 };
 use globa_flux_rust::providers::openai::{build_risk_check_prompt, RiskCheckMessageArgs};
 use globa_flux_rust::sse::sse_event;
+use sqlx::MySqlPool;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 const GLOBAL_TENANT_ID: &str = "global";
+const DAILY_RISK_CHECK_EVENT_TYPE: &str = "chat_risk_check_count";
+
+#[derive(Clone)]
+struct TtlEntry<T> {
+    value: T,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct DailyLimitStatus {
+    day_key: String,
+    used: i64,
+    limit: i64,
+    allowed: bool,
+}
+
+static GEMINI_MODEL_CACHE: OnceLock<Mutex<HashMap<String, TtlEntry<String>>>> = OnceLock::new();
+static SPENT_TODAY_CACHE: OnceLock<Mutex<HashMap<String, TtlEntry<f64>>>> = OnceLock::new();
+
+fn ttl_from_env_ms(key: &str, default_ms: u64) -> Duration {
+    let ms = std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default_ms);
+    Duration::from_millis(ms)
+}
+
+fn cache_lookup<T: Clone>(cache: &Mutex<HashMap<String, TtlEntry<T>>>, key: &str) -> Option<T> {
+    let mut guard = cache.lock().ok()?;
+    let now = Instant::now();
+    if let Some(entry) = guard.get(key) {
+        if entry.expires_at > now {
+            return Some(entry.value.clone());
+        }
+    }
+    guard.remove(key);
+    None
+}
+
+fn cache_store<T: Clone>(
+    cache: &Mutex<HashMap<String, TtlEntry<T>>>,
+    key: String,
+    value: T,
+    ttl: Duration,
+) {
+    if ttl.is_zero() {
+        return;
+    }
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(
+            key,
+            TtlEntry {
+                value,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+    }
+}
+
+async fn fetch_tenant_gemini_model_cached(
+    pool: &MySqlPool,
+    tenant_id: &str,
+) -> Result<Option<String>, Error> {
+    let ttl = ttl_from_env_ms("CHAT_GEMINI_MODEL_CACHE_TTL_MS", 5 * 60 * 1000);
+    let cache = GEMINI_MODEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = tenant_id.to_string();
+
+    if let Some(v) = cache_lookup(cache, &key) {
+        return Ok(Some(v));
+    }
+
+    let fetched = fetch_tenant_gemini_model(pool, tenant_id).await?;
+    if let Some(model) = fetched.as_ref() {
+        cache_store(cache, key, model.clone(), ttl);
+    }
+    Ok(fetched)
+}
+
+async fn sum_spent_usd_today_cached(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<f64, Error> {
+    let ttl = ttl_from_env_ms("CHAT_SPENT_USD_CACHE_TTL_MS", 15 * 1000);
+    let cache = SPENT_TODAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let day_key = now.format("%Y-%m-%d").to_string();
+    let key = format!("{tenant_id}:{day_key}");
+
+    if let Some(v) = cache_lookup(cache, &key) {
+        return Ok(v);
+    }
+
+    let spent = sum_spent_usd_today(pool, tenant_id, now).await?;
+    cache_store(cache, key, spent, ttl);
+    Ok(spent)
+}
+
+fn daily_limit_exceeded_response(
+    stream: bool,
+    status: DailyLimitStatus,
+) -> Result<Response<ResponseBody>, Error> {
+    if stream {
+        return sse_response(
+            StatusCode::OK,
+            sse_event(
+                "error",
+                &serde_json::json!({
+                  "code": "entitlement_exceeded",
+                  "message": "Daily chat_risk_checks_per_day limit exceeded",
+                  "day_key": status.day_key,
+                  "used": status.used,
+                  "limit": status.limit,
+                })
+                .to_string(),
+            ),
+        );
+    }
+
+    json_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        serde_json::json!({
+          "ok": false,
+          "error": "entitlement_exceeded",
+          "message": "Daily chat_risk_checks_per_day limit exceeded",
+          "day_key": status.day_key,
+          "used": status.used,
+          "limit": status.limit,
+        }),
+    )
+}
+
+async fn enforce_daily_chat_risk_limit(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    idempotency_key: &str,
+    limit: Option<i64>,
+) -> Result<Option<DailyLimitStatus>, Error> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+
+    let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    if limit <= 0 {
+        return Ok(Some(DailyLimitStatus {
+            day_key,
+            used: 0,
+            limit,
+            allowed: false,
+        }));
+    }
+
+    let result = consume_daily_usage_event(
+        pool,
+        tenant_id,
+        DAILY_RISK_CHECK_EVENT_TYPE,
+        idempotency_key,
+        limit,
+        chrono::Utc::now(),
+    )
+    .await?;
+
+    Ok(Some(DailyLimitStatus {
+        day_key: result.day_key,
+        used: result.used,
+        limit,
+        allowed: result.allowed,
+    }))
+}
 
 #[derive(Deserialize)]
 struct RiskCheckRequest {
@@ -27,6 +201,8 @@ struct RiskCheckRequest {
     tenant_id: String,
     trial_started_at_ms: i64,
     budget_usd_per_day: f64,
+    #[serde(default)]
+    chat_risk_checks_per_day: Option<i64>,
     action_type: String,
     #[serde(default)]
     note: Option<String>,
@@ -44,6 +220,8 @@ struct AgentRequest {
     tenant_id: String,
     trial_started_at_ms: i64,
     budget_usd_per_day: f64,
+    #[serde(default)]
+    chat_risk_checks_per_day: Option<i64>,
     message: String,
     #[serde(default)]
     video_context: Option<VideoContext>,
@@ -402,6 +580,20 @@ async fn handle_agent(
         }
     };
 
+    match enforce_daily_chat_risk_limit(
+        pool,
+        &parsed.tenant_id,
+        &idempotency_key,
+        parsed.chat_risk_checks_per_day,
+    )
+    .await?
+    {
+        Some(status) if !status.allowed => {
+            return daily_limit_exceeded_response(stream, status);
+        }
+        _ => {}
+    }
+
     const EVENT_TYPE: &str = "chat_agent";
 
     if let Some(existing) =
@@ -436,9 +628,10 @@ async fn handle_agent(
         );
     }
 
-    let spent_usd_today = sum_spent_usd_today(pool, &parsed.tenant_id, chrono::Utc::now()).await?;
+    let spent_usd_today =
+        sum_spent_usd_today_cached(pool, &parsed.tenant_id, chrono::Utc::now()).await?;
 
-    let db_model = match fetch_tenant_gemini_model(pool, GLOBAL_TENANT_ID).await {
+    let db_model = match fetch_tenant_gemini_model_cached(pool, GLOBAL_TENANT_ID).await {
         Ok(model) => model.unwrap_or_default(),
         Err(err) => {
             return config_error_response(stream, &err.to_string());
@@ -663,14 +856,8 @@ async fn handle_agent(
             .body(ResponseBody::from(body))?);
     }
 
-    let (text, u) = gemini_generate_text(
-        &gemini_cfg,
-        &system,
-        &user,
-        temperature,
-        max_output_tokens,
-    )
-    .await?;
+    let (text, u) =
+        gemini_generate_text(&gemini_cfg, &system, &user, temperature, max_output_tokens).await?;
 
     let usage = Usage {
         prompt_tokens: u.as_ref().map(|x| x.prompt_tokens).unwrap_or(0),
@@ -746,12 +933,8 @@ async fn handle_risk_check(
     }
 
     let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
-    let provided = bearer_token(
-        headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok()),
-    )
-    .unwrap_or("");
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
 
     if expected.is_empty() || provided != expected {
         return json_response(
@@ -808,6 +991,20 @@ async fn handle_risk_check(
         }
     };
 
+    match enforce_daily_chat_risk_limit(
+        pool,
+        &parsed.tenant_id,
+        &idempotency_key,
+        parsed.chat_risk_checks_per_day,
+    )
+    .await?
+    {
+        Some(status) if !status.allowed => {
+            return daily_limit_exceeded_response(stream, status);
+        }
+        _ => {}
+    }
+
     const EVENT_TYPE: &str = "chat_risk_check";
     if let Some(existing) =
         fetch_usage_event(pool, &parsed.tenant_id, EVENT_TYPE, &idempotency_key).await?
@@ -845,10 +1042,11 @@ async fn handle_risk_check(
         );
     }
 
-    let spent_usd_today = sum_spent_usd_today(pool, &parsed.tenant_id, chrono::Utc::now()).await?;
+    let spent_usd_today =
+        sum_spent_usd_today_cached(pool, &parsed.tenant_id, chrono::Utc::now()).await?;
     let temperature: f64 = 0.2;
 
-    let db_model = match fetch_tenant_gemini_model(pool, GLOBAL_TENANT_ID).await {
+    let db_model = match fetch_tenant_gemini_model_cached(pool, GLOBAL_TENANT_ID).await {
         Ok(model) => model.unwrap_or_default(),
         Err(err) => {
             return config_error_response(stream, &err.to_string());
@@ -856,10 +1054,7 @@ async fn handle_risk_check(
     };
     let db_model = db_model.trim().to_string();
     if db_model.is_empty() {
-        return config_error_response(
-            stream,
-            "Missing gemini_model for tenant_id=global",
-        );
+        return config_error_response(stream, "Missing gemini_model for tenant_id=global");
     }
     gemini_cfg.model = db_model.clone();
 
@@ -1231,7 +1426,9 @@ mod tests {
         assert!(agent_wants_run_task("刷新"));
         assert!(agent_wants_run_task("Run now"));
         assert!(agent_wants_run_task("dispatch the worker tick"));
-        assert!(!agent_wants_run_task("Just generate a content pack please."));
+        assert!(!agent_wants_run_task(
+            "Just generate a content pack please."
+        ));
     }
 
     #[tokio::test]
@@ -1258,6 +1455,9 @@ mod tests {
 
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json.get("error").and_then(|v| v.as_str()), Some("config_error"));
+        assert_eq!(
+            json.get("error").and_then(|v| v.as_str()),
+            Some("config_error")
+        );
     }
 }
