@@ -8,25 +8,25 @@ static POOL: OnceCell<MySqlPool> = OnceCell::const_new();
 
 #[derive(Debug, Clone)]
 pub struct UsageEventRow {
-  pub provider: String,
-  pub model: String,
-  pub prompt_tokens: i32,
-  pub completion_tokens: i32,
-  pub cost_usd: f64,
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+    pub cost_usd: f64,
 }
 
 fn utc_day_bounds(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
-  let day_start = Utc
-    .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-    .single()
-    .unwrap_or_else(|| Utc.timestamp_opt(now.timestamp(), 0).single().unwrap());
-  (day_start, day_start + chrono::Duration::days(1))
+    let day_start = Utc
+        .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(now.timestamp(), 0).single().unwrap());
+    (day_start, day_start + chrono::Duration::days(1))
 }
 
 async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
-  // Keep schema creation idempotent; avoids footguns in early MVP.
-  sqlx::query(
-    r#"
+    // Keep schema creation idempotent; avoids footguns in early MVP.
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS usage_events (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
         tenant_id VARCHAR(128) NOT NULL,
@@ -42,12 +42,12 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         KEY idx_usage_events_day (tenant_id, occurred_at)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS usage_daily_counters (
         tenant_id VARCHAR(128) NOT NULL,
@@ -63,7 +63,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS channel_connections (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -88,10 +88,10 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  // Per-tenant OAuth app configuration (BYO OAuth client).
-  // Note: `client_secret` is sensitive. For now we store it like other tokens (plaintext),
-  // but in production you likely want to encrypt it with a KMS/master key.
-  sqlx::query(
+    // Per-tenant OAuth app configuration (BYO OAuth client).
+    // Note: `client_secret` is sensitive. For now we store it like other tokens (plaintext),
+    // but in production you likely want to encrypt it with a KMS/master key.
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS oauth_apps (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -111,8 +111,8 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS tenant_trials (
         tenant_id VARCHAR(128) PRIMARY KEY,
         trial_started_at_ms BIGINT NOT NULL,
@@ -120,12 +120,12 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS job_tasks (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -153,7 +153,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS decision_daily (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -176,8 +176,8 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS billing_events (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
         provider VARCHAR(32) NOT NULL,
@@ -190,12 +190,12 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         KEY idx_billing_events_topic (provider, topic, created_at)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS video_daily_metrics (
         tenant_id VARCHAR(128) NOT NULL,
@@ -217,8 +217,8 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS sync_run_log (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
         tenant_id VARCHAR(128) NOT NULL,
@@ -233,14 +233,14 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         KEY idx_sync_run_log_tenant (tenant_id, channel_id, started_at)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  // CSV uploads (Studio export fallback) - raw file is handled on the frontend,
-  // backend persists parsed status + writes rows into `video_daily_metrics`.
-  sqlx::query(
+    // CSV uploads (Studio export fallback) - raw file is handled on the frontend,
+    // backend persists parsed status + writes rows into `video_daily_metrics`.
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS yt_csv_uploads (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -260,8 +260,8 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  // Agent alerts (derived from stored metrics or external signals).
-  sqlx::query(
+    // Agent alerts (derived from stored metrics or external signals).
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS yt_alerts (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -284,8 +284,8 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  // Experiments (MVP: persisted experiment definitions + variants).
-  sqlx::query(
+    // Experiments (MVP: persisted experiment definitions + variants).
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS yt_experiments (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -308,7 +308,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS yt_experiment_variants (
         experiment_id BIGINT NOT NULL,
@@ -326,8 +326,8 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  // YouTube Reporting / Content ID ingestion tables (raw blobs + metadata).
-  sqlx::query(
+    // YouTube Reporting / Content ID ingestion tables (raw blobs + metadata).
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS yt_reporting_report_types (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -346,7 +346,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS yt_reporting_jobs (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -365,7 +365,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS yt_reporting_report_files (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -398,7 +398,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS yt_reporting_wide_tables (
         report_type_id VARCHAR(256) PRIMARY KEY,
@@ -415,8 +415,8 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS observed_actions (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
         tenant_id VARCHAR(128) NOT NULL,
@@ -429,13 +429,13 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         KEY idx_observed_actions_day (tenant_id, channel_id, dt)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS decision_outcome (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
         tenant_id VARCHAR(128) NOT NULL,
@@ -451,15 +451,15 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         KEY idx_decision_outcome_channel (tenant_id, channel_id, outcome_dt)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  // Public share links for proof reports (HTML snapshots).
-  // Purpose: send to brands/partners without requiring login.
-  sqlx::query(
-    r#"
+    // Public share links for proof reports (HTML snapshots).
+    // Purpose: send to brands/partners without requiring login.
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS yt_report_shares (
         token CHAR(32) PRIMARY KEY,
         tenant_id VARCHAR(128) NOT NULL,
@@ -475,13 +475,13 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         KEY idx_yt_report_shares_expiry (expires_at)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS policy_params (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
         tenant_id VARCHAR(128) NOT NULL,
@@ -493,13 +493,13 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         UNIQUE KEY uq_policy_params (tenant_id, channel_id, version)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS policy_eval_report (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
         tenant_id VARCHAR(128) NOT NULL,
@@ -511,13 +511,13 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         UNIQUE KEY uq_policy_eval_report (tenant_id, channel_id, candidate_version)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS plans (
         id VARCHAR(64) PRIMARY KEY,
         name VARCHAR(128) NOT NULL,
@@ -529,12 +529,12 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS subscriptions (
         tenant_id VARCHAR(128) PRIMARY KEY,
@@ -553,8 +553,8 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       CREATE TABLE IF NOT EXISTS entitlements (
         tenant_id VARCHAR(128) PRIMARY KEY,
         overrides_json TEXT NULL,
@@ -562,19 +562,33 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
         updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
       );
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
-      CREATE TABLE IF NOT EXISTS tenant_llm_settings (
-        tenant_id VARCHAR(128) PRIMARY KEY,
-        gemini_model VARCHAR(128) NOT NULL,
-        updated_by VARCHAR(64) NOT NULL DEFAULT 'system',
+      CREATE TABLE IF NOT EXISTS tenant_ai_provider_settings (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        provider VARCHAR(32) NOT NULL,
+        status VARCHAR(16) NOT NULL DEFAULT 'inactive',
+        default_model VARCHAR(128) NOT NULL,
+        model_allowlist_json TEXT NULL,
+        encrypted_api_key LONGTEXT NOT NULL,
+        encrypted_dek LONGTEXT NULL,
+        key_version VARCHAR(64) NOT NULL,
+        key_fingerprint VARCHAR(128) NOT NULL,
+        last_test_status VARCHAR(16) NULL,
+        last_test_error TEXT NULL,
+        last_test_at TIMESTAMP(3) NULL,
+        created_by VARCHAR(128) NOT NULL DEFAULT 'system',
+        updated_by VARCHAR(128) NOT NULL DEFAULT 'system',
         created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        UNIQUE KEY uq_tenant_ai_provider (tenant_id, provider),
+        KEY idx_tenant_ai_provider_status (tenant_id, status, updated_at)
       );
     "#,
   )
@@ -582,7 +596,42 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
+        r#"
+      CREATE TABLE IF NOT EXISTS tenant_ai_provider_audit (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        tenant_id VARCHAR(128) NOT NULL,
+        provider VARCHAR(32) NOT NULL,
+        action VARCHAR(32) NOT NULL,
+        actor VARCHAR(128) NOT NULL,
+        request_id VARCHAR(128) NULL,
+        before_json TEXT NULL,
+        after_json TEXT NULL,
+        created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        KEY idx_tenant_ai_provider_audit (tenant_id, provider, created_at)
+      );
+    "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    sqlx::query(
+        r#"
+      CREATE TABLE IF NOT EXISTS tenant_ai_routing_policy (
+        tenant_id VARCHAR(128) PRIMARY KEY,
+        default_provider VARCHAR(32) NOT NULL,
+        monthly_budget_usd DECIMAL(12,4) NULL,
+        updated_by VARCHAR(128) NOT NULL,
+        updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+      );
+    "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS geo_monitor_projects (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -603,7 +652,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS geo_monitor_prompts (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -624,7 +673,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS geo_monitor_runs (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -649,7 +698,7 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
+    sqlx::query(
     r#"
       CREATE TABLE IF NOT EXISTS geo_monitor_run_results (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -676,211 +725,213 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<(), Error> {
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  // Best-effort schema upgrades for existing tables (TiDB supports IF NOT EXISTS).
-  sqlx::query(
-    r#"
+    // Best-effort schema upgrades for existing tables (TiDB supports IF NOT EXISTS).
+    sqlx::query(
+        r#"
       ALTER TABLE channel_connections
       ADD COLUMN IF NOT EXISTS channel_id VARCHAR(128) NULL;
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       ALTER TABLE channel_connections
       ADD COLUMN IF NOT EXISTS content_owner_id VARCHAR(128) NULL;
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       ALTER TABLE yt_alerts
       ADD COLUMN IF NOT EXISTS details_json TEXT NULL;
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       ALTER TABLE yt_report_shares
       ADD COLUMN IF NOT EXISTS last_opened_at TIMESTAMP(3) NULL;
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       ALTER TABLE video_daily_metrics
       ADD COLUMN IF NOT EXISTS impressions_ctr DOUBLE NULL;
     "#,
-  )
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 pub async fn get_pool() -> Result<&'static MySqlPool, Error> {
-  POOL
-    .get_or_try_init(|| async {
-      let url = std::env::var("TIDB_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .map_err(|_| -> Error {
-          Box::new(std::io::Error::other(
-            "Missing TIDB_DATABASE_URL (or DATABASE_URL)",
-          ))
-        })?;
+    POOL.get_or_try_init(|| async {
+        let url = std::env::var("TIDB_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .map_err(|_| -> Error {
+                Box::new(std::io::Error::other(
+                    "Missing TIDB_DATABASE_URL (or DATABASE_URL)",
+                ))
+            })?;
 
-      let pool = MySqlPoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
-        .await
-        .map_err(|e| -> Error { Box::new(e) })?;
+        let pool = MySqlPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?;
 
-      ensure_schema(&pool).await?;
-      Ok::<_, Error>(pool)
+        ensure_schema(&pool).await?;
+        Ok::<_, Error>(pool)
     })
     .await
 }
 
-pub async fn sum_spent_usd_today(pool: &MySqlPool, tenant_id: &str, now: DateTime<Utc>) -> Result<f64, Error> {
-  let (start, end) = utc_day_bounds(now);
+pub async fn sum_spent_usd_today(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    now: DateTime<Utc>,
+) -> Result<f64, Error> {
+    let (start, end) = utc_day_bounds(now);
 
-  let spent: f64 = sqlx::query_scalar(
-    r#"
+    let spent: f64 = sqlx::query_scalar(
+        r#"
       SELECT COALESCE(CAST(SUM(cost_usd) AS DOUBLE), 0) AS spent_usd
       FROM usage_events
       WHERE tenant_id = ?
         AND occurred_at >= ? AND occurred_at < ?;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(start)
-  .bind(end)
-  .fetch_one(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(start)
+    .bind(end)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(spent)
+    Ok(spent)
 }
 
 pub async fn fetch_usage_event(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  event_type: &str,
-  idempotency_key: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    event_type: &str,
+    idempotency_key: &str,
 ) -> Result<Option<UsageEventRow>, Error> {
-  let row = sqlx::query_as::<_, (String, String, i32, i32, f64)>(
-    r#"
+    let row = sqlx::query_as::<_, (String, String, i32, i32, f64)>(
+        r#"
       SELECT provider, model, prompt_tokens, completion_tokens, CAST(cost_usd AS DOUBLE) AS cost_usd
       FROM usage_events
       WHERE tenant_id = ? AND event_type = ? AND idempotency_key = ?
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(event_type)
-  .bind(idempotency_key)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(event_type)
+    .bind(idempotency_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.map(|(provider, model, prompt_tokens, completion_tokens, cost_usd)| UsageEventRow {
-    provider,
-    model,
-    prompt_tokens,
-    completion_tokens,
-    cost_usd,
-  }))
+    Ok(row.map(
+        |(provider, model, prompt_tokens, completion_tokens, cost_usd)| UsageEventRow {
+            provider,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            cost_usd,
+        },
+    ))
 }
 
 pub async fn fetch_daily_usage_used(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  event_type: &str,
-  day: chrono::NaiveDate,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    event_type: &str,
+    day: chrono::NaiveDate,
 ) -> Result<i64, Error> {
-  let used = sqlx::query_scalar::<_, i64>(
-    r#"
+    let used = sqlx::query_scalar::<_, i64>(
+        r#"
       SELECT CAST(used AS SIGNED) AS used
       FROM usage_daily_counters
       WHERE tenant_id = ? AND day_key = ? AND event_type = ?
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(day)
-  .bind(event_type)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?
-  .unwrap_or(0);
+    )
+    .bind(tenant_id)
+    .bind(day)
+    .bind(event_type)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?
+    .unwrap_or(0);
 
-  Ok(used)
+    Ok(used)
 }
 
 pub struct ConsumeDailyUsageResult {
-  pub day_key: String,
-  pub used: i64,
-  pub allowed: bool,
+    pub day_key: String,
+    pub used: i64,
+    pub allowed: bool,
 }
 
 pub async fn consume_daily_usage_event(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  event_type: &str,
-  idempotency_key: &str,
-  limit: i64,
-  now: DateTime<Utc>,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    event_type: &str,
+    idempotency_key: &str,
+    limit: i64,
+    now: DateTime<Utc>,
 ) -> Result<ConsumeDailyUsageResult, Error> {
-  let day = now.date_naive();
-  let day_key = day.format("%Y-%m-%d").to_string();
+    let day = now.date_naive();
+    let day_key = day.format("%Y-%m-%d").to_string();
 
-  let mut tx = pool
-    .begin()
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
+    let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       INSERT INTO usage_daily_counters (tenant_id, day_key, event_type, used)
       VALUES (?, ?, ?, 0)
       ON DUPLICATE KEY UPDATE used = used;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(day)
-  .bind(event_type)
-  .execute(&mut *tx)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(day)
+    .bind(event_type)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  let used: i64 = sqlx::query_scalar(
-    r#"
+    let used: i64 = sqlx::query_scalar(
+        r#"
       SELECT CAST(used AS SIGNED) AS used
       FROM usage_daily_counters
       WHERE tenant_id = ? AND day_key = ? AND event_type = ?
       FOR UPDATE;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(day)
-  .bind(event_type)
-  .fetch_one(&mut *tx)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(day)
+    .bind(event_type)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  let insert_result = sqlx::query(
+    let insert_result = sqlx::query(
     r#"
       INSERT INTO usage_events
         (tenant_id, event_type, idempotency_key, provider, model, prompt_tokens, completion_tokens, cost_usd)
@@ -894,67 +945,70 @@ pub async fn consume_daily_usage_event(
   .execute(&mut *tx)
   .await;
 
-  match insert_result {
-    Ok(_) => {
-      if used >= limit {
-        tx.rollback().await.map_err(|e| -> Error { Box::new(e) })?;
-        return Ok(ConsumeDailyUsageResult {
-          day_key,
-          used,
-          allowed: false,
-        });
-      }
+    match insert_result {
+        Ok(_) => {
+            if used >= limit {
+                tx.rollback().await.map_err(|e| -> Error { Box::new(e) })?;
+                return Ok(ConsumeDailyUsageResult {
+                    day_key,
+                    used,
+                    allowed: false,
+                });
+            }
 
-      sqlx::query(
-        r#"
+            sqlx::query(
+                r#"
           UPDATE usage_daily_counters
           SET used = used + 1
           WHERE tenant_id = ? AND day_key = ? AND event_type = ?;
         "#,
-      )
-      .bind(tenant_id)
-      .bind(day)
-      .bind(event_type)
-      .execute(&mut *tx)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?;
+            )
+            .bind(tenant_id)
+            .bind(day)
+            .bind(event_type)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?;
 
-      tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
+            tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
 
-      Ok(ConsumeDailyUsageResult {
-        day_key,
-        used: used + 1,
-        allowed: true,
-      })
+            Ok(ConsumeDailyUsageResult {
+                day_key,
+                used: used + 1,
+                allowed: true,
+            })
+        }
+        Err(err) => {
+            if err
+                .as_database_error()
+                .is_some_and(|e| e.is_unique_violation())
+            {
+                tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
+                return Ok(ConsumeDailyUsageResult {
+                    day_key,
+                    used,
+                    allowed: true,
+                });
+            }
+
+            tx.rollback().await.map_err(|e| -> Error { Box::new(e) })?;
+            Err(Box::new(err))
+        }
     }
-    Err(err) => {
-      if err.as_database_error().is_some_and(|e| e.is_unique_violation()) {
-        tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
-        return Ok(ConsumeDailyUsageResult {
-          day_key,
-          used,
-          allowed: true,
-        });
-      }
-
-      tx.rollback().await.map_err(|e| -> Error { Box::new(e) })?;
-      Err(Box::new(err))
-    }
-  }
 }
 
 pub async fn insert_usage_event(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  event_type: &str,
-  idempotency_key: &str,
-  provider: &str,
-  model: &str,
-  prompt_tokens: i32,
-  completion_tokens: i32,
-  cost_usd: f64,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    event_type: &str,
+    idempotency_key: &str,
+    provider: &str,
+    model: &str,
+    prompt_tokens: i32,
+    completion_tokens: i32,
+    cost_usd: f64,
 ) -> Result<(), sqlx::Error> {
-  sqlx::query(
+    sqlx::query(
     r#"
       INSERT INTO usage_events
         (tenant_id, event_type, idempotency_key, provider, model, prompt_tokens, completion_tokens, cost_usd)
@@ -973,49 +1027,49 @@ pub async fn insert_usage_event(
   .execute(pool)
   .await?;
 
-  Ok(())
+    Ok(())
 }
 
 pub async fn ensure_trial_started(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  now_ms: i64,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    now_ms: i64,
 ) -> Result<i64, Error> {
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       INSERT INTO tenant_trials (tenant_id, trial_started_at_ms)
       VALUES (?, ?)
       ON DUPLICATE KEY UPDATE trial_started_at_ms = trial_started_at_ms;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(now_ms)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(now_ms)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  let trial_started_at_ms: i64 = sqlx::query_scalar(
-    r#"
+    let trial_started_at_ms: i64 = sqlx::query_scalar(
+        r#"
       SELECT trial_started_at_ms
       FROM tenant_trials
       WHERE tenant_id = ?
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .fetch_one(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(trial_started_at_ms)
+    Ok(trial_started_at_ms)
 }
 
 pub async fn fetch_youtube_channel_id(
-  pool: &MySqlPool,
-  tenant_id: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
 ) -> Result<Option<String>, Error> {
-  let row = sqlx::query_as::<_, (Option<String>,)>(
-    r#"
+    let row = sqlx::query_as::<_, (Option<String>,)>(
+        r#"
       SELECT channel_id
       FROM channel_connections
       WHERE tenant_id = ?
@@ -1025,21 +1079,21 @@ pub async fn fetch_youtube_channel_id(
       ORDER BY updated_at DESC
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.and_then(|(channel_id,)| channel_id))
+    Ok(row.and_then(|(channel_id,)| channel_id))
 }
 
 pub async fn fetch_youtube_content_owner_id(
-  pool: &MySqlPool,
-  tenant_id: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
 ) -> Result<Option<String>, Error> {
-  let row = sqlx::query_as::<_, (Option<String>,)>(
-    r#"
+    let row = sqlx::query_as::<_, (Option<String>,)>(
+        r#"
       SELECT content_owner_id
       FROM channel_connections
       WHERE tenant_id = ?
@@ -1049,98 +1103,100 @@ pub async fn fetch_youtube_content_owner_id(
       ORDER BY updated_at DESC
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.and_then(|(content_owner_id,)| content_owner_id))
+    Ok(row.and_then(|(content_owner_id,)| content_owner_id))
 }
 
 pub async fn set_youtube_channel_id(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
 ) -> Result<(), Error> {
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       UPDATE channel_connections
       SET channel_id = ?,
           updated_at = CURRENT_TIMESTAMP(3)
       WHERE tenant_id = ? AND oauth_provider = 'youtube';
     "#,
-  )
-  .bind(channel_id)
-  .bind(tenant_id)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(channel_id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 pub async fn set_youtube_content_owner_id(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  content_owner_id: Option<&str>,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    content_owner_id: Option<&str>,
 ) -> Result<(), Error> {
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       UPDATE channel_connections
       SET content_owner_id = ?
       WHERE tenant_id = ? AND oauth_provider = 'youtube';
     "#,
-  )
-  .bind(content_owner_id)
-  .bind(tenant_id)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(content_owner_id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
 pub struct YoutubeOAuthAppConfig {
-  pub client_id: String,
-  pub client_secret: Option<String>,
-  pub redirect_uri: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
 }
 
 pub async fn fetch_youtube_oauth_app_config(
-  pool: &MySqlPool,
-  tenant_id: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
 ) -> Result<Option<YoutubeOAuthAppConfig>, Error> {
-  let row = sqlx::query_as::<_, (String, Option<String>, String)>(
-    r#"
+    let row = sqlx::query_as::<_, (String, Option<String>, String)>(
+        r#"
       SELECT client_id, client_secret, redirect_uri
       FROM oauth_apps
       WHERE tenant_id = ? AND provider = 'youtube'
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.map(|(client_id, client_secret, redirect_uri)| YoutubeOAuthAppConfig {
-    client_id,
-    client_secret,
-    redirect_uri,
-  }))
+    Ok(row.map(
+        |(client_id, client_secret, redirect_uri)| YoutubeOAuthAppConfig {
+            client_id,
+            client_secret,
+            redirect_uri,
+        },
+    ))
 }
 
 pub async fn upsert_youtube_oauth_app_config(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  client_id: &str,
-  client_secret: Option<&str>,
-  redirect_uri: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    redirect_uri: &str,
 ) -> Result<(), Error> {
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       INSERT INTO oauth_apps (tenant_id, provider, client_id, client_secret, redirect_uri)
       VALUES (?, 'youtube', ?, ?, ?)
       ON DUPLICATE KEY UPDATE
@@ -1149,91 +1205,92 @@ pub async fn upsert_youtube_oauth_app_config(
         redirect_uri = VALUES(redirect_uri),
         updated_at = CURRENT_TIMESTAMP(3);
     "#,
-  )
-  .bind(tenant_id)
-  .bind(client_id)
-  .bind(client_secret)
-  .bind(redirect_uri)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(client_id)
+    .bind(client_secret)
+    .bind(redirect_uri)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 pub fn youtube_oauth_app_config_from_env() -> Result<YoutubeOAuthAppConfig, Error> {
-  let client_id = std::env::var("YOUTUBE_CLIENT_ID")
-    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_ID")) as Error)?;
-  let client_secret = std::env::var("YOUTUBE_CLIENT_SECRET")
-    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_SECRET")) as Error)?;
-  let redirect_uri = std::env::var("YOUTUBE_REDIRECT_URI")
-    .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_REDIRECT_URI")) as Error)?;
+    let client_id = std::env::var("YOUTUBE_CLIENT_ID")
+        .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_ID")) as Error)?;
+    let client_secret = std::env::var("YOUTUBE_CLIENT_SECRET")
+        .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_SECRET")) as Error)?;
+    let redirect_uri = std::env::var("YOUTUBE_REDIRECT_URI")
+        .map_err(|_| Box::new(std::io::Error::other("Missing YOUTUBE_REDIRECT_URI")) as Error)?;
 
-  let client_id = client_id.trim().to_string();
-  let client_secret = client_secret.trim().to_string();
-  let redirect_uri = redirect_uri.trim().to_string();
+    let client_id = client_id.trim().to_string();
+    let client_secret = client_secret.trim().to_string();
+    let redirect_uri = redirect_uri.trim().to_string();
 
-  if client_id.is_empty() {
-    return Err(Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_ID")) as Error);
-  }
-  if client_secret.is_empty() {
-    return Err(Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_SECRET")) as Error);
-  }
-  if redirect_uri.is_empty() {
-    return Err(Box::new(std::io::Error::other("Missing YOUTUBE_REDIRECT_URI")) as Error);
-  }
+    if client_id.is_empty() {
+        return Err(Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_ID")) as Error);
+    }
+    if client_secret.is_empty() {
+        return Err(Box::new(std::io::Error::other("Missing YOUTUBE_CLIENT_SECRET")) as Error);
+    }
+    if redirect_uri.is_empty() {
+        return Err(Box::new(std::io::Error::other("Missing YOUTUBE_REDIRECT_URI")) as Error);
+    }
 
-  Ok(YoutubeOAuthAppConfig {
-    client_id,
-    client_secret: Some(client_secret),
-    redirect_uri,
-  })
+    Ok(YoutubeOAuthAppConfig {
+        client_id,
+        client_secret: Some(client_secret),
+        redirect_uri,
+    })
 }
 
 pub async fn fetch_or_seed_youtube_oauth_app_config(
-  pool: &MySqlPool,
-  tenant_id: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
 ) -> Result<Option<YoutubeOAuthAppConfig>, Error> {
-  let existing = fetch_youtube_oauth_app_config(pool, tenant_id).await?;
-  if existing.is_some() {
-    return Ok(existing);
-  }
+    let existing = fetch_youtube_oauth_app_config(pool, tenant_id).await?;
+    if existing.is_some() {
+        return Ok(existing);
+    }
 
-  let defaults = youtube_oauth_app_config_from_env();
-  let Ok(defaults) = defaults else {
-    return Ok(None);
-  };
+    let defaults = youtube_oauth_app_config_from_env();
+    let Ok(defaults) = defaults else {
+        return Ok(None);
+    };
 
-  let client_id = defaults.client_id.trim();
-  let redirect_uri = defaults.redirect_uri.trim();
-  let client_secret = defaults
-    .client_secret
-    .as_deref()
-    .map(str::trim)
-    .filter(|v| !v.is_empty());
+    let client_id = defaults.client_id.trim();
+    let redirect_uri = defaults.redirect_uri.trim();
+    let client_secret = defaults
+        .client_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
 
-  if client_id.is_empty() || redirect_uri.is_empty() || client_secret.is_none() {
-    return Ok(None);
-  }
+    if client_id.is_empty() || redirect_uri.is_empty() || client_secret.is_none() {
+        return Ok(None);
+    }
 
-  upsert_youtube_oauth_app_config(pool, tenant_id, client_id, client_secret, redirect_uri).await?;
-  Ok(Some(defaults))
+    upsert_youtube_oauth_app_config(pool, tenant_id, client_id, client_secret, redirect_uri)
+        .await?;
+    Ok(Some(defaults))
 }
 
 #[derive(Debug, Clone)]
 pub struct YoutubeConnectionTokens {
-  pub access_token: String,
-  pub refresh_token: Option<String>,
-  pub expires_at: Option<DateTime<Utc>>,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 pub async fn fetch_youtube_connection_tokens(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
 ) -> Result<Option<YoutubeConnectionTokens>, Error> {
-  let row = sqlx::query_as::<_, (String, Option<String>, Option<DateTime<Utc>>)>(
-    r#"
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<DateTime<Utc>>)>(
+        r#"
       SELECT access_token, refresh_token, expires_at
       FROM channel_connections
       WHERE tenant_id = ?
@@ -1241,32 +1298,34 @@ pub async fn fetch_youtube_connection_tokens(
         AND channel_id = ?
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.map(|(access_token, refresh_token, expires_at)| YoutubeConnectionTokens {
-    access_token,
-    refresh_token,
-    expires_at,
-  }))
+    Ok(row.map(
+        |(access_token, refresh_token, expires_at)| YoutubeConnectionTokens {
+            access_token,
+            refresh_token,
+            expires_at,
+        },
+    ))
 }
 
 pub async fn update_youtube_connection_tokens(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  tokens: &crate::providers::youtube::YoutubeOAuthTokens,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    tokens: &crate::providers::youtube::YoutubeOAuthTokens,
 ) -> Result<(), Error> {
-  let expires_at = tokens
-    .expires_in_seconds
-    .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
+    let expires_at = tokens
+        .expires_in_seconds
+        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       UPDATE channel_connections
       SET access_token = ?,
           refresh_token = COALESCE(?, refresh_token),
@@ -1278,33 +1337,33 @@ pub async fn update_youtube_connection_tokens(
         AND oauth_provider = 'youtube'
         AND channel_id = ?;
     "#,
-  )
-  .bind(&tokens.access_token)
-  .bind(tokens.refresh_token.as_deref())
-  .bind(&tokens.token_type)
-  .bind(tokens.scope.as_deref())
-  .bind(expires_at)
-  .bind(tenant_id)
-  .bind(channel_id)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(&tokens.access_token)
+    .bind(tokens.refresh_token.as_deref())
+    .bind(&tokens.token_type)
+    .bind(tokens.scope.as_deref())
+    .bind(expires_at)
+    .bind(tenant_id)
+    .bind(channel_id)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 pub async fn upsert_video_daily_metric(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  dt: chrono::NaiveDate,
-  video_id: &str,
-  estimated_revenue_usd: f64,
-  impressions: i64,
-  impressions_ctr: Option<f64>,
-  views: i64,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    dt: chrono::NaiveDate,
+    video_id: &str,
+    estimated_revenue_usd: f64,
+    impressions: i64,
+    impressions_ctr: Option<f64>,
+    views: i64,
 ) -> Result<(), Error> {
-  sqlx::query(
+    sqlx::query(
     r#"
       INSERT INTO video_daily_metrics
         (tenant_id, channel_id, dt, video_id, estimated_revenue_usd, impressions, impressions_ctr, views)
@@ -1330,21 +1389,21 @@ pub async fn upsert_video_daily_metric(
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 pub async fn upsert_video_daily_reach_metrics(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  dt: chrono::NaiveDate,
-  video_id: &str,
-  impressions: i64,
-  impressions_ctr: Option<f64>,
-  views: i64,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    dt: chrono::NaiveDate,
+    video_id: &str,
+    impressions: i64,
+    impressions_ctr: Option<f64>,
+    views: i64,
 ) -> Result<(), Error> {
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       INSERT INTO video_daily_metrics
         (tenant_id, channel_id, dt, video_id, impressions, impressions_ctr, views)
       VALUES
@@ -1355,30 +1414,30 @@ pub async fn upsert_video_daily_reach_metrics(
         views = CASE WHEN VALUES(views) > 0 THEN VALUES(views) ELSE views END,
         updated_at = CURRENT_TIMESTAMP(3);
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(dt)
-  .bind(video_id)
-  .bind(impressions)
-  .bind(impressions_ctr)
-  .bind(views)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(dt)
+    .bind(video_id)
+    .bind(impressions)
+    .bind(impressions_ctr)
+    .bind(views)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 pub async fn fetch_new_video_publish_counts_by_dt(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  start_dt: chrono::NaiveDate,
-  end_dt: chrono::NaiveDate,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    start_dt: chrono::NaiveDate,
+    end_dt: chrono::NaiveDate,
 ) -> Result<Vec<(chrono::NaiveDate, i64)>, Error> {
-  let rows = sqlx::query_as::<_, (chrono::NaiveDate, i64)>(
-    r#"
+    let rows = sqlx::query_as::<_, (chrono::NaiveDate, i64)>(
+        r#"
       SELECT first_dt AS dt, COUNT(*) AS new_videos
       FROM (
         SELECT video_id, MIN(dt) AS first_dt
@@ -1392,28 +1451,28 @@ pub async fn fetch_new_video_publish_counts_by_dt(
       GROUP BY first_dt
       ORDER BY first_dt ASC;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(start_dt)
-  .bind(end_dt)
-  .fetch_all(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(start_dt)
+    .bind(end_dt)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(rows)
+    Ok(rows)
 }
 
 pub async fn upsert_observed_action(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  dt: chrono::NaiveDate,
-  action_type: &str,
-  action_meta_json: Option<&str>,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    dt: chrono::NaiveDate,
+    action_type: &str,
+    action_meta_json: Option<&str>,
 ) -> Result<(), Error> {
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       INSERT INTO observed_actions
         (tenant_id, channel_id, dt, action_type, action_meta_json)
       VALUES
@@ -1421,27 +1480,27 @@ pub async fn upsert_observed_action(
       ON DUPLICATE KEY UPDATE
         action_meta_json = VALUES(action_meta_json);
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(dt)
-  .bind(action_type)
-  .bind(action_meta_json)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(dt)
+    .bind(action_type)
+    .bind(action_meta_json)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 pub async fn decision_daily_exists(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  as_of_dt: chrono::NaiveDate,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    as_of_dt: chrono::NaiveDate,
 ) -> Result<bool, Error> {
-  let row = sqlx::query_as::<_, (i32,)>(
-    r#"
+    let row = sqlx::query_as::<_, (i32,)>(
+        r#"
       SELECT 1
       FROM decision_daily
       WHERE tenant_id = ?
@@ -1449,26 +1508,26 @@ pub async fn decision_daily_exists(
         AND as_of_dt = ?
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(as_of_dt)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(as_of_dt)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.is_some())
+    Ok(row.is_some())
 }
 
 pub async fn fetch_revenue_sum_usd_7d(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  start_dt: chrono::NaiveDate,
-  end_dt: chrono::NaiveDate,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    start_dt: chrono::NaiveDate,
+    end_dt: chrono::NaiveDate,
 ) -> Result<f64, Error> {
-  let (total_rows, total_sum_usd): (i64, f64) = sqlx::query_as(
-    r#"
+    let (total_rows, total_sum_usd): (i64, f64) = sqlx::query_as(
+        r#"
       SELECT CAST(COUNT(*) AS SIGNED) AS rows_n,
              COALESCE(SUM(CAST(estimated_revenue_usd AS DOUBLE)), 0) AS revenue_sum_usd
       FROM video_daily_metrics
@@ -1477,21 +1536,21 @@ pub async fn fetch_revenue_sum_usd_7d(
         AND dt BETWEEN ? AND ?
         AND video_id IN ('__CHANNEL_TOTAL__','csv_channel_total');
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(start_dt)
-  .bind(end_dt)
-  .fetch_one(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(start_dt)
+    .bind(end_dt)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  if total_rows > 0 {
-    return Ok(total_sum_usd);
-  }
+    if total_rows > 0 {
+        return Ok(total_sum_usd);
+    }
 
-  let (sum_usd,): (f64,) = sqlx::query_as(
-    r#"
+    let (sum_usd,): (f64,) = sqlx::query_as(
+        r#"
       SELECT COALESCE(SUM(CAST(estimated_revenue_usd AS DOUBLE)), 0) AS revenue_sum_usd
       FROM video_daily_metrics
       WHERE tenant_id = ?
@@ -1499,29 +1558,29 @@ pub async fn fetch_revenue_sum_usd_7d(
         AND dt BETWEEN ? AND ?
         AND video_id NOT IN ('__CHANNEL_TOTAL__','csv_channel_total');
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(start_dt)
-  .bind(end_dt)
-  .fetch_one(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(start_dt)
+    .bind(end_dt)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(sum_usd)
+    Ok(sum_usd)
 }
 
 pub async fn fetch_top_video_ids_by_revenue(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  start_dt: chrono::NaiveDate,
-  end_dt: chrono::NaiveDate,
-  limit: i64,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    start_dt: chrono::NaiveDate,
+    end_dt: chrono::NaiveDate,
+    limit: i64,
 ) -> Result<Vec<String>, Error> {
-  let limit = limit.clamp(1, 50);
-  let rows = sqlx::query_as::<_, (String,)>(
-    r#"
+    let limit = limit.clamp(1, 50);
+    let rows = sqlx::query_as::<_, (String,)>(
+        r#"
       SELECT video_id
       FROM video_daily_metrics
       WHERE tenant_id = ?
@@ -1532,31 +1591,31 @@ pub async fn fetch_top_video_ids_by_revenue(
       ORDER BY SUM(CAST(estimated_revenue_usd AS DOUBLE)) DESC
       LIMIT ?;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(start_dt)
-  .bind(end_dt)
-  .bind(limit)
-  .fetch_all(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(start_dt)
+    .bind(end_dt)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(rows.into_iter().map(|(video_id,)| video_id).collect())
+    Ok(rows.into_iter().map(|(video_id,)| video_id).collect())
 }
 
 pub async fn upsert_decision_outcome(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  decision_dt: chrono::NaiveDate,
-  outcome_dt: chrono::NaiveDate,
-  revenue_change_pct_7d: Option<f64>,
-  catastrophic_flag: bool,
-  new_top_asset_flag: bool,
-  notes: Option<&str>,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    decision_dt: chrono::NaiveDate,
+    outcome_dt: chrono::NaiveDate,
+    revenue_change_pct_7d: Option<f64>,
+    catastrophic_flag: bool,
+    new_top_asset_flag: bool,
+    notes: Option<&str>,
 ) -> Result<(), Error> {
-  sqlx::query(
+    sqlx::query(
     r#"
       INSERT INTO decision_outcome
         (tenant_id, channel_id, decision_dt, outcome_dt, revenue_change_pct_7d, catastrophic_flag, new_top_asset_flag, notes)
@@ -1581,17 +1640,17 @@ pub async fn upsert_decision_outcome(
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 pub async fn fetch_policy_params_json(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  version: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    version: &str,
 ) -> Result<Option<String>, Error> {
-  let row = sqlx::query_as::<_, (String,)>(
-    r#"
+    let row = sqlx::query_as::<_, (String,)>(
+        r#"
       SELECT params_json
       FROM policy_params
       WHERE tenant_id = ?
@@ -1599,27 +1658,27 @@ pub async fn fetch_policy_params_json(
         AND version = ?
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(version)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(version)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.map(|(json,)| json))
+    Ok(row.map(|(json,)| json))
 }
 
 pub async fn upsert_policy_params(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  version: &str,
-  params_json: &str,
-  created_by: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    version: &str,
+    params_json: &str,
+    created_by: &str,
 ) -> Result<(), Error> {
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       INSERT INTO policy_params
         (tenant_id, channel_id, version, params_json, created_by)
       VALUES
@@ -1628,29 +1687,29 @@ pub async fn upsert_policy_params(
         params_json = VALUES(params_json),
         created_by = VALUES(created_by);
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(version)
-  .bind(params_json)
-  .bind(created_by)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(version)
+    .bind(params_json)
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 pub async fn upsert_policy_eval_report(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  candidate_version: &str,
-  replay_metrics_json: &str,
-  approved: bool,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    candidate_version: &str,
+    replay_metrics_json: &str,
+    approved: bool,
 ) -> Result<(), Error> {
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       INSERT INTO policy_eval_report
         (tenant_id, channel_id, candidate_version, replay_metrics_json, approved)
       VALUES
@@ -1659,102 +1718,633 @@ pub async fn upsert_policy_eval_report(
         replay_metrics_json = VALUES(replay_metrics_json),
         approved = VALUES(approved);
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(candidate_version)
-  .bind(replay_metrics_json)
-  .bind(if approved { 1 } else { 0 })
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(candidate_version)
+    .bind(replay_metrics_json)
+    .bind(if approved { 1 } else { 0 })
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
-pub async fn fetch_tenant_gemini_model(pool: &MySqlPool, tenant_id: &str) -> Result<Option<String>, Error> {
-  let row = sqlx::query_as::<_, (String,)>(
-    r#"
-      SELECT gemini_model
-      FROM tenant_llm_settings
-      WHERE tenant_id = ?
-      LIMIT 1;
-    "#,
-  )
-  .bind(tenant_id)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
-
-  Ok(row.map(|(model,)| model))
+#[derive(Debug, Clone)]
+pub struct TenantAiProviderSettingRow {
+    pub tenant_id: String,
+    pub provider: String,
+    pub status: String,
+    pub default_model: String,
+    pub model_allowlist_json: Option<String>,
+    pub encrypted_api_key: String,
+    pub encrypted_dek: Option<String>,
+    pub key_version: String,
+    pub key_fingerprint: String,
+    pub last_test_status: Option<String>,
+    pub last_test_error: Option<String>,
+    pub last_test_at: Option<DateTime<Utc>>,
+    pub created_by: String,
+    pub updated_by: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
-pub async fn upsert_tenant_gemini_model(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  model: &str,
-  updated_by: &str,
+#[derive(Debug, Clone)]
+pub struct TenantAiRoutingPolicyRow {
+    pub tenant_id: String,
+    pub default_provider: String,
+    pub monthly_budget_usd: Option<f64>,
+    pub updated_by: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub async fn upsert_tenant_ai_provider_setting(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    provider: &str,
+    status: &str,
+    default_model: &str,
+    model_allowlist_json: Option<&str>,
+    encrypted_api_key: &str,
+    encrypted_dek: Option<&str>,
+    key_version: &str,
+    key_fingerprint: &str,
+    created_by: &str,
+    updated_by: &str,
 ) -> Result<(), Error> {
-  sqlx::query(
-    r#"
-      INSERT INTO tenant_llm_settings
-        (tenant_id, gemini_model, updated_by)
+    sqlx::query(
+        r#"
+      INSERT INTO tenant_ai_provider_settings
+        (
+          tenant_id, provider, status, default_model, model_allowlist_json,
+          encrypted_api_key, encrypted_dek, key_version, key_fingerprint,
+          created_by, updated_by
+        )
       VALUES
-        (?, ?, ?)
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
-        gemini_model = VALUES(gemini_model),
+        status = VALUES(status),
+        default_model = VALUES(default_model),
+        model_allowlist_json = VALUES(model_allowlist_json),
+        encrypted_api_key = VALUES(encrypted_api_key),
+        encrypted_dek = VALUES(encrypted_dek),
+        key_version = VALUES(key_version),
+        key_fingerprint = VALUES(key_fingerprint),
         updated_by = VALUES(updated_by),
         updated_at = CURRENT_TIMESTAMP(3);
     "#,
-  )
-  .bind(tenant_id)
-  .bind(model)
-  .bind(updated_by)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(provider)
+    .bind(status)
+    .bind(default_model)
+    .bind(model_allowlist_json)
+    .bind(encrypted_api_key)
+    .bind(encrypted_dek)
+    .bind(key_version)
+    .bind(key_fingerprint)
+    .bind(created_by)
+    .bind(updated_by)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
+}
+
+pub async fn fetch_tenant_ai_provider_settings(
+    pool: &MySqlPool,
+    tenant_id: &str,
+) -> Result<Vec<TenantAiProviderSettingRow>, Error> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            String,
+            String,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        ),
+    >(
+        r#"
+      SELECT
+        tenant_id,
+        provider,
+        status,
+        default_model,
+        model_allowlist_json,
+        encrypted_api_key,
+        encrypted_dek,
+        key_version,
+        key_fingerprint,
+        last_test_status,
+        last_test_error,
+        last_test_at,
+        created_by,
+        updated_by,
+        created_at,
+        updated_at
+      FROM tenant_ai_provider_settings
+      WHERE tenant_id = ?
+      ORDER BY provider ASC;
+    "#,
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                tenant_id,
+                provider,
+                status,
+                default_model,
+                model_allowlist_json,
+                encrypted_api_key,
+                encrypted_dek,
+                key_version,
+                key_fingerprint,
+                last_test_status,
+                last_test_error,
+                last_test_at,
+                created_by,
+                updated_by,
+                created_at,
+                updated_at,
+            )| TenantAiProviderSettingRow {
+                tenant_id,
+                provider,
+                status,
+                default_model,
+                model_allowlist_json,
+                encrypted_api_key,
+                encrypted_dek,
+                key_version,
+                key_fingerprint,
+                last_test_status,
+                last_test_error,
+                last_test_at,
+                created_by,
+                updated_by,
+                created_at,
+                updated_at,
+            },
+        )
+        .collect())
+}
+
+pub async fn fetch_tenant_ai_provider_setting(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    provider: &str,
+) -> Result<Option<TenantAiProviderSettingRow>, Error> {
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            String,
+            String,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        ),
+    >(
+        r#"
+      SELECT
+        tenant_id,
+        provider,
+        status,
+        default_model,
+        model_allowlist_json,
+        encrypted_api_key,
+        encrypted_dek,
+        key_version,
+        key_fingerprint,
+        last_test_status,
+        last_test_error,
+        last_test_at,
+        created_by,
+        updated_by,
+        created_at,
+        updated_at
+      FROM tenant_ai_provider_settings
+      WHERE tenant_id = ?
+        AND provider = ?
+      LIMIT 1;
+    "#,
+    )
+    .bind(tenant_id)
+    .bind(provider)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    Ok(row.map(
+        |(
+            tenant_id,
+            provider,
+            status,
+            default_model,
+            model_allowlist_json,
+            encrypted_api_key,
+            encrypted_dek,
+            key_version,
+            key_fingerprint,
+            last_test_status,
+            last_test_error,
+            last_test_at,
+            created_by,
+            updated_by,
+            created_at,
+            updated_at,
+        )| TenantAiProviderSettingRow {
+            tenant_id,
+            provider,
+            status,
+            default_model,
+            model_allowlist_json,
+            encrypted_api_key,
+            encrypted_dek,
+            key_version,
+            key_fingerprint,
+            last_test_status,
+            last_test_error,
+            last_test_at,
+            created_by,
+            updated_by,
+            created_at,
+            updated_at,
+        },
+    ))
+}
+
+pub async fn fetch_active_tenant_ai_provider_setting(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    provider: Option<&str>,
+) -> Result<Option<TenantAiProviderSettingRow>, Error> {
+    let row = if let Some(provider) = provider {
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<DateTime<Utc>>,
+                String,
+                String,
+                DateTime<Utc>,
+                DateTime<Utc>,
+            ),
+        >(
+            r#"
+        SELECT
+          tenant_id,
+          provider,
+          status,
+          default_model,
+          model_allowlist_json,
+          encrypted_api_key,
+          encrypted_dek,
+          key_version,
+          key_fingerprint,
+          last_test_status,
+          last_test_error,
+          last_test_at,
+          created_by,
+          updated_by,
+          created_at,
+          updated_at
+        FROM tenant_ai_provider_settings
+        WHERE tenant_id = ?
+          AND provider = ?
+          AND status = 'active'
+        LIMIT 1;
+      "#,
+        )
+        .bind(tenant_id)
+        .bind(provider)
+        .fetch_optional(pool)
+        .await
+    } else {
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<DateTime<Utc>>,
+                String,
+                String,
+                DateTime<Utc>,
+                DateTime<Utc>,
+            ),
+        >(
+            r#"
+        SELECT
+          tenant_id,
+          provider,
+          status,
+          default_model,
+          model_allowlist_json,
+          encrypted_api_key,
+          encrypted_dek,
+          key_version,
+          key_fingerprint,
+          last_test_status,
+          last_test_error,
+          last_test_at,
+          created_by,
+          updated_by,
+          created_at,
+          updated_at
+        FROM tenant_ai_provider_settings
+        WHERE tenant_id = ?
+          AND status = 'active'
+        ORDER BY updated_at DESC
+        LIMIT 1;
+      "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await
+    }
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    Ok(row.map(
+        |(
+            tenant_id,
+            provider,
+            status,
+            default_model,
+            model_allowlist_json,
+            encrypted_api_key,
+            encrypted_dek,
+            key_version,
+            key_fingerprint,
+            last_test_status,
+            last_test_error,
+            last_test_at,
+            created_by,
+            updated_by,
+            created_at,
+            updated_at,
+        )| TenantAiProviderSettingRow {
+            tenant_id,
+            provider,
+            status,
+            default_model,
+            model_allowlist_json,
+            encrypted_api_key,
+            encrypted_dek,
+            key_version,
+            key_fingerprint,
+            last_test_status,
+            last_test_error,
+            last_test_at,
+            created_by,
+            updated_by,
+            created_at,
+            updated_at,
+        },
+    ))
+}
+
+pub async fn update_tenant_ai_provider_test_status(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    provider: &str,
+    test_status: &str,
+    test_error: Option<&str>,
+) -> Result<(), Error> {
+    sqlx::query(
+        r#"
+      UPDATE tenant_ai_provider_settings
+      SET last_test_status = ?,
+          last_test_error = ?,
+          last_test_at = CURRENT_TIMESTAMP(3),
+          updated_at = CURRENT_TIMESTAMP(3)
+      WHERE tenant_id = ?
+        AND provider = ?;
+    "#,
+    )
+    .bind(test_status)
+    .bind(test_error)
+    .bind(tenant_id)
+    .bind(provider)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    Ok(())
+}
+
+pub async fn set_tenant_ai_provider_status(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    provider: &str,
+    status: &str,
+    updated_by: &str,
+) -> Result<(), Error> {
+    sqlx::query(
+        r#"
+      UPDATE tenant_ai_provider_settings
+      SET status = ?,
+          updated_by = ?,
+          updated_at = CURRENT_TIMESTAMP(3)
+      WHERE tenant_id = ?
+        AND provider = ?;
+    "#,
+    )
+    .bind(status)
+    .bind(updated_by)
+    .bind(tenant_id)
+    .bind(provider)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    Ok(())
+}
+
+pub async fn insert_tenant_ai_provider_audit(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    provider: &str,
+    action: &str,
+    actor: &str,
+    request_id: Option<&str>,
+    before_json: Option<&str>,
+    after_json: Option<&str>,
+) -> Result<(), Error> {
+    sqlx::query(
+        r#"
+      INSERT INTO tenant_ai_provider_audit
+        (tenant_id, provider, action, actor, request_id, before_json, after_json)
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?);
+    "#,
+    )
+    .bind(tenant_id)
+    .bind(provider)
+    .bind(action)
+    .bind(actor)
+    .bind(request_id)
+    .bind(before_json)
+    .bind(after_json)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    Ok(())
+}
+
+pub async fn fetch_tenant_ai_routing_policy(
+    pool: &MySqlPool,
+    tenant_id: &str,
+) -> Result<Option<TenantAiRoutingPolicyRow>, Error> {
+    let row = sqlx::query_as::<_, (String, String, Option<f64>, String, DateTime<Utc>)>(
+        r#"
+      SELECT
+        tenant_id,
+        default_provider,
+        CAST(monthly_budget_usd AS DOUBLE) AS monthly_budget_usd,
+        updated_by,
+        updated_at
+      FROM tenant_ai_routing_policy
+      WHERE tenant_id = ?
+      LIMIT 1;
+    "#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    Ok(row.map(
+        |(tenant_id, default_provider, monthly_budget_usd, updated_by, updated_at)| {
+            TenantAiRoutingPolicyRow {
+            tenant_id,
+            default_provider,
+            monthly_budget_usd,
+            updated_by,
+            updated_at,
+        }
+        },
+    ))
+}
+
+pub async fn upsert_tenant_ai_routing_policy(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    default_provider: &str,
+    monthly_budget_usd: Option<f64>,
+    updated_by: &str,
+) -> Result<(), Error> {
+    sqlx::query(
+        r#"
+      INSERT INTO tenant_ai_routing_policy
+        (tenant_id, default_provider, monthly_budget_usd, updated_by)
+      VALUES
+        (?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        default_provider = VALUES(default_provider),
+        monthly_budget_usd = VALUES(monthly_budget_usd),
+        updated_by = VALUES(updated_by),
+        updated_at = CURRENT_TIMESTAMP(3);
+    "#,
+    )
+    .bind(tenant_id)
+    .bind(default_provider)
+    .bind(monthly_budget_usd)
+    .bind(updated_by)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
 pub struct SubscriptionRow {
-  pub status: String,
-  pub current_period_end: Option<DateTime<Utc>>,
+    pub status: String,
+    pub current_period_end: Option<DateTime<Utc>>,
 }
 
 pub async fn fetch_subscription(
-  pool: &MySqlPool,
-  tenant_id: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
 ) -> Result<Option<SubscriptionRow>, Error> {
-  let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>)>(
-    r#"
+    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>)>(
+        r#"
       SELECT status, current_period_end
       FROM subscriptions
       WHERE tenant_id = ?
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.map(|(status, current_period_end)| SubscriptionRow {
-    status,
-    current_period_end,
-  }))
+    Ok(row.map(|(status, current_period_end)| SubscriptionRow {
+        status,
+        current_period_end,
+    }))
 }
 
 pub async fn upsert_subscription(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  status: &str,
-  provider_customer_id: Option<&str>,
-  provider_subscription_id: Option<&str>,
-  current_period_end: Option<DateTime<Utc>>,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    status: &str,
+    provider_customer_id: Option<&str>,
+    provider_subscription_id: Option<&str>,
+    current_period_end: Option<DateTime<Utc>>,
 ) -> Result<(), Error> {
-  sqlx::query(
+    sqlx::query(
     r#"
       INSERT INTO subscriptions
         (tenant_id, status, provider, provider_customer_id, provider_subscription_id, current_period_end)
@@ -1777,20 +2367,20 @@ pub async fn upsert_subscription(
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 pub async fn upsert_youtube_connection(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  tokens: &crate::providers::youtube::YoutubeOAuthTokens,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    tokens: &crate::providers::youtube::YoutubeOAuthTokens,
 ) -> Result<(), sqlx::Error> {
-  let expires_at = tokens
-    .expires_in_seconds
-    .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
+    let expires_at = tokens
+        .expires_in_seconds
+        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
 
-  sqlx::query(
+    sqlx::query(
     r#"
       INSERT INTO channel_connections
         (tenant_id, oauth_provider, channel_id, access_token, refresh_token, token_type, scope, expires_at)
@@ -1816,95 +2406,95 @@ pub async fn upsert_youtube_connection(
   .execute(pool)
   .await?;
 
-  Ok(())
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
 pub struct GeoMonitorProjectRow {
-  pub id: i64,
-  pub tenant_id: String,
-  pub name: String,
-  pub website: Option<String>,
-  pub brand_aliases_json: Option<String>,
-  pub competitor_names_json: Option<String>,
-  pub schedule: String,
-  pub enabled: bool,
+    pub id: i64,
+    pub tenant_id: String,
+    pub name: String,
+    pub website: Option<String>,
+    pub brand_aliases_json: Option<String>,
+    pub competitor_names_json: Option<String>,
+    pub schedule: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct GeoMonitorPromptRow {
-  pub id: i64,
-  pub project_id: i64,
-  pub theme: Option<String>,
-  pub prompt_text: String,
-  pub enabled: bool,
-  pub sort_order: i32,
+    pub id: i64,
+    pub project_id: i64,
+    pub theme: Option<String>,
+    pub prompt_text: String,
+    pub enabled: bool,
+    pub sort_order: i32,
 }
 
 #[derive(Debug, Clone)]
 pub struct GeoMonitorRunRow {
-  pub id: i64,
-  pub tenant_id: String,
-  pub project_id: i64,
-  pub run_for_dt: chrono::NaiveDate,
-  pub provider: String,
-  pub model: String,
-  pub status: String,
-  pub prompt_total: i32,
-  pub started_at: DateTime<Utc>,
-  pub finished_at: Option<DateTime<Utc>>,
+    pub id: i64,
+    pub tenant_id: String,
+    pub project_id: i64,
+    pub run_for_dt: chrono::NaiveDate,
+    pub provider: String,
+    pub model: String,
+    pub status: String,
+    pub prompt_total: i32,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GeoMonitorRunSummary {
-  pub results_total: i64,
-  pub presence_count: i64,
-  pub top3_count: i64,
-  pub top5_count: i64,
-  pub error_count: i64,
-  pub cost_usd: f64,
+    pub results_total: i64,
+    pub presence_count: i64,
+    pub top3_count: i64,
+    pub top5_count: i64,
+    pub error_count: i64,
+    pub cost_usd: f64,
 }
 
 pub async fn create_geo_monitor_project(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  name: &str,
-  website: Option<&str>,
-  brand_aliases_json: Option<&str>,
-  competitor_names_json: Option<&str>,
-  schedule: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    name: &str,
+    website: Option<&str>,
+    brand_aliases_json: Option<&str>,
+    competitor_names_json: Option<&str>,
+    schedule: &str,
 ) -> Result<i64, Error> {
-  let schedule = match schedule.trim() {
-    "daily" | "Daily" | "DAILY" => "daily",
-    _ => "weekly",
-  };
+    let schedule = match schedule.trim() {
+        "daily" | "Daily" | "DAILY" => "daily",
+        _ => "weekly",
+    };
 
-  let res = sqlx::query(
-    r#"
+    let res = sqlx::query(
+        r#"
       INSERT INTO geo_monitor_projects
         (tenant_id, name, website, brand_aliases_json, competitor_names_json, schedule, enabled)
       VALUES
         (?, ?, ?, ?, ?, ?, 1);
     "#,
-  )
-  .bind(tenant_id)
-  .bind(name)
-  .bind(website)
-  .bind(brand_aliases_json)
-  .bind(competitor_names_json)
-  .bind(schedule)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(name)
+    .bind(website)
+    .bind(brand_aliases_json)
+    .bind(competitor_names_json)
+    .bind(schedule)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(res.last_insert_id() as i64)
+    Ok(res.last_insert_id() as i64)
 }
 
 pub async fn list_geo_monitor_projects(
-  pool: &MySqlPool,
-  tenant_id: &str,
+    pool: &MySqlPool,
+    tenant_id: &str,
 ) -> Result<Vec<GeoMonitorProjectRow>, Error> {
-  let rows: Vec<(i64, String, String, Option<String>, Option<String>, Option<String>, String, i8)> =
+    let rows: Vec<(i64, String, String, Option<String>, Option<String>, Option<String>, String, i8)> =
     sqlx::query_as(
       r#"
         SELECT id, tenant_id, name, website, brand_aliases_json, competitor_names_json, schedule, enabled
@@ -1918,33 +2508,40 @@ pub async fn list_geo_monitor_projects(
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(
-    rows
-      .into_iter()
-      .map(
-        |(id, tenant_id, name, website, brand_aliases_json, competitor_names_json, schedule, enabled)| {
-          GeoMonitorProjectRow {
-            id,
-            tenant_id,
-            name,
-            website,
-            brand_aliases_json,
-            competitor_names_json,
-            schedule,
-            enabled: enabled != 0,
-          }
-        },
-      )
-      .collect(),
-  )
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                tenant_id,
+                name,
+                website,
+                brand_aliases_json,
+                competitor_names_json,
+                schedule,
+                enabled,
+            )| {
+                GeoMonitorProjectRow {
+                    id,
+                    tenant_id,
+                    name,
+                    website,
+                    brand_aliases_json,
+                    competitor_names_json,
+                    schedule,
+                    enabled: enabled != 0,
+                }
+            },
+        )
+        .collect())
 }
 
 pub async fn fetch_geo_monitor_project(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  project_id: i64,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    project_id: i64,
 ) -> Result<Option<GeoMonitorProjectRow>, Error> {
-  let row: Option<(
+    let row: Option<(
     i64,
     String,
     String,
@@ -1967,140 +2564,151 @@ pub async fn fetch_geo_monitor_project(
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.map(
-    |(id, tenant_id, name, website, brand_aliases_json, competitor_names_json, schedule, enabled)| {
-      GeoMonitorProjectRow {
-        id,
-        tenant_id,
-        name,
-        website,
-        brand_aliases_json,
-        competitor_names_json,
-        schedule,
-        enabled: enabled != 0,
-      }
-    },
-  ))
+    Ok(row.map(
+        |(
+            id,
+            tenant_id,
+            name,
+            website,
+            brand_aliases_json,
+            competitor_names_json,
+            schedule,
+            enabled,
+        )| {
+            GeoMonitorProjectRow {
+                id,
+                tenant_id,
+                name,
+                website,
+                brand_aliases_json,
+                competitor_names_json,
+                schedule,
+                enabled: enabled != 0,
+            }
+        },
+    ))
 }
 
 pub async fn replace_geo_monitor_prompts(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  project_id: i64,
-  prompts: &[(Option<String>, String)],
+    pool: &MySqlPool,
+    tenant_id: &str,
+    project_id: i64,
+    prompts: &[(Option<String>, String)],
 ) -> Result<(), Error> {
-  let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
+    let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
 
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       DELETE FROM geo_monitor_prompts
       WHERE tenant_id = ? AND project_id = ?;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(project_id)
-  .execute(&mut *tx)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(project_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  for (idx, (theme, prompt_text)) in prompts.iter().enumerate() {
-    sqlx::query(
-      r#"
+    for (idx, (theme, prompt_text)) in prompts.iter().enumerate() {
+        sqlx::query(
+            r#"
         INSERT INTO geo_monitor_prompts
           (tenant_id, project_id, theme, prompt_text, enabled, sort_order)
         VALUES
           (?, ?, ?, ?, 1, ?);
       "#,
-    )
-    .bind(tenant_id)
-    .bind(project_id)
-    .bind(theme.as_deref())
-    .bind(prompt_text)
-    .bind(idx as i32)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
-  }
+        )
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(theme.as_deref())
+        .bind(prompt_text)
+        .bind(idx as i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+    }
 
-  tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
-  Ok(())
+    tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
+    Ok(())
 }
 
 pub async fn list_geo_monitor_prompts(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  project_id: i64,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    project_id: i64,
 ) -> Result<Vec<GeoMonitorPromptRow>, Error> {
-  let rows: Vec<(i64, i64, Option<String>, String, i8, i32)> = sqlx::query_as(
-    r#"
+    let rows: Vec<(i64, i64, Option<String>, String, i8, i32)> = sqlx::query_as(
+        r#"
       SELECT id, project_id, theme, prompt_text, enabled, sort_order
       FROM geo_monitor_prompts
       WHERE tenant_id = ? AND project_id = ?
       ORDER BY sort_order ASC, id ASC;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(project_id)
-  .fetch_all(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(
-    rows
-      .into_iter()
-      .map(|(id, project_id, theme, prompt_text, enabled, sort_order)| GeoMonitorPromptRow {
-        id,
-        project_id,
-        theme,
-        prompt_text,
-        enabled: enabled != 0,
-        sort_order,
-      })
-      .collect(),
-  )
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, project_id, theme, prompt_text, enabled, sort_order)| GeoMonitorPromptRow {
+                id,
+                project_id,
+                theme,
+                prompt_text,
+                enabled: enabled != 0,
+                sort_order,
+            },
+        )
+        .collect())
 }
 
 pub async fn fetch_geo_monitor_prompt(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  project_id: i64,
-  prompt_id: i64,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    project_id: i64,
+    prompt_id: i64,
 ) -> Result<Option<GeoMonitorPromptRow>, Error> {
-  let row: Option<(i64, i64, Option<String>, String, i8, i32)> = sqlx::query_as(
-    r#"
+    let row: Option<(i64, i64, Option<String>, String, i8, i32)> = sqlx::query_as(
+        r#"
       SELECT id, project_id, theme, prompt_text, enabled, sort_order
       FROM geo_monitor_prompts
       WHERE tenant_id = ? AND project_id = ? AND id = ?
       LIMIT 1;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(project_id)
-  .bind(prompt_id)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(project_id)
+    .bind(prompt_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.map(|(id, project_id, theme, prompt_text, enabled, sort_order)| GeoMonitorPromptRow {
-    id,
-    project_id,
-    theme,
-    prompt_text,
-    enabled: enabled != 0,
-    sort_order,
-  }))
+    Ok(row.map(
+        |(id, project_id, theme, prompt_text, enabled, sort_order)| GeoMonitorPromptRow {
+            id,
+            project_id,
+            theme,
+            prompt_text,
+            enabled: enabled != 0,
+            sort_order,
+        },
+    ))
 }
 
 pub async fn ensure_geo_monitor_run(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  project_id: i64,
-  run_for_dt: chrono::NaiveDate,
-  provider: &str,
-  model: &str,
-  prompt_total: i32,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    project_id: i64,
+    run_for_dt: chrono::NaiveDate,
+    provider: &str,
+    model: &str,
+    prompt_total: i32,
 ) -> Result<GeoMonitorRunRow, Error> {
-  let existing: Option<(
+    let existing: Option<(
     i64,
     String,
     i64,
@@ -2126,69 +2734,69 @@ pub async fn ensure_geo_monitor_run(
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  if let Some((
-    id,
-    tenant_id,
-    project_id,
-    run_for_dt,
-    provider,
-    model,
-    status,
-    prompt_total_db,
-    started_at,
-    finished_at,
-  )) = existing
-  {
-    // Best-effort: keep prompt_total up to date for current prompt set, but do not reset existing runs.
-    if prompt_total_db != prompt_total && prompt_total > 0 {
-      sqlx::query(
-        r#"
+    if let Some((
+        id,
+        tenant_id,
+        project_id,
+        run_for_dt,
+        provider,
+        model,
+        status,
+        prompt_total_db,
+        started_at,
+        finished_at,
+    )) = existing
+    {
+        // Best-effort: keep prompt_total up to date for current prompt set, but do not reset existing runs.
+        if prompt_total_db != prompt_total && prompt_total > 0 {
+            sqlx::query(
+                r#"
           UPDATE geo_monitor_runs
           SET prompt_total = ?, updated_at = CURRENT_TIMESTAMP(3)
           WHERE id = ?;
         "#,
-      )
-      .bind(prompt_total)
-      .bind(id)
-      .execute(pool)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?;
+            )
+            .bind(prompt_total)
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?;
+        }
+
+        return Ok(GeoMonitorRunRow {
+            id,
+            tenant_id,
+            project_id,
+            run_for_dt,
+            provider,
+            model,
+            status,
+            prompt_total: prompt_total_db,
+            started_at,
+            finished_at,
+        });
     }
 
-    return Ok(GeoMonitorRunRow {
-      id,
-      tenant_id,
-      project_id,
-      run_for_dt,
-      provider,
-      model,
-      status,
-      prompt_total: prompt_total_db,
-      started_at,
-      finished_at,
-    });
-  }
-
-  let res = sqlx::query(
-    r#"
+    let res = sqlx::query(
+        r#"
       INSERT INTO geo_monitor_runs
         (tenant_id, project_id, run_for_dt, provider, model, status, prompt_total)
       VALUES
         (?, ?, ?, ?, ?, 'running', ?);
     "#,
-  )
-  .bind(tenant_id)
-  .bind(project_id)
-  .bind(run_for_dt)
-  .bind(provider)
-  .bind(model)
-  .bind(prompt_total)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(project_id)
+    .bind(run_for_dt)
+    .bind(provider)
+    .bind(model)
+    .bind(prompt_total)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  let id = res.last_insert_id() as i64;
-  let row: (
+    let id = res.last_insert_id() as i64;
+    let row: (
     i64,
     String,
     i64,
@@ -2212,59 +2820,60 @@ pub async fn ensure_geo_monitor_run(
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(GeoMonitorRunRow {
-    id: row.0,
-    tenant_id: row.1,
-    project_id: row.2,
-    run_for_dt: row.3,
-    provider: row.4,
-    model: row.5,
-    status: row.6,
-    prompt_total: row.7,
-    started_at: row.8,
-    finished_at: row.9,
-  })
+    Ok(GeoMonitorRunRow {
+        id: row.0,
+        tenant_id: row.1,
+        project_id: row.2,
+        run_for_dt: row.3,
+        provider: row.4,
+        model: row.5,
+        status: row.6,
+        prompt_total: row.7,
+        started_at: row.8,
+        finished_at: row.9,
+    })
 }
 
 pub async fn enqueue_geo_monitor_prompt_tasks(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  project_id: i64,
-  run_for_dt: chrono::NaiveDate,
-  prompt_ids: &[i64],
+    pool: &MySqlPool,
+    tenant_id: &str,
+    project_id: i64,
+    run_for_dt: chrono::NaiveDate,
+    prompt_ids: &[i64],
 ) -> Result<u64, Error> {
-  let mut inserted: u64 = 0;
-  for prompt_id in prompt_ids.iter().copied() {
-    let dedupe_key = format!("{tenant_id}:geo_monitor_prompt:{project_id}:{run_for_dt}:{prompt_id}");
-    let channel_id = format!("{project_id}:{prompt_id}");
+    let mut inserted: u64 = 0;
+    for prompt_id in prompt_ids.iter().copied() {
+        let dedupe_key =
+            format!("{tenant_id}:geo_monitor_prompt:{project_id}:{run_for_dt}:{prompt_id}");
+        let channel_id = format!("{project_id}:{prompt_id}");
 
-    let res = sqlx::query(
-      r#"
+        let res = sqlx::query(
+            r#"
         INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status)
         VALUES (?, 'geo_monitor_prompt', ?, ?, ?, 'pending')
         ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP(3);
       "#,
-    )
-    .bind(tenant_id)
-    .bind(channel_id)
-    .bind(run_for_dt)
-    .bind(dedupe_key)
-    .execute(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
+        )
+        .bind(tenant_id)
+        .bind(channel_id)
+        .bind(run_for_dt)
+        .bind(dedupe_key)
+        .execute(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
 
-    inserted = inserted.saturating_add(res.rows_affected());
-  }
+        inserted = inserted.saturating_add(res.rows_affected());
+    }
 
-  Ok(inserted)
+    Ok(inserted)
 }
 
 pub async fn fetch_latest_geo_monitor_run(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  project_id: i64,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    project_id: i64,
 ) -> Result<Option<GeoMonitorRunRow>, Error> {
-  let row: Option<(
+    let row: Option<(
     i64,
     String,
     i64,
@@ -2290,35 +2899,35 @@ pub async fn fetch_latest_geo_monitor_run(
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(row.map(|row| GeoMonitorRunRow {
-    id: row.0,
-    tenant_id: row.1,
-    project_id: row.2,
-    run_for_dt: row.3,
-    provider: row.4,
-    model: row.5,
-    status: row.6,
-    prompt_total: row.7,
-    started_at: row.8,
-    finished_at: row.9,
-  }))
+    Ok(row.map(|row| GeoMonitorRunRow {
+        id: row.0,
+        tenant_id: row.1,
+        project_id: row.2,
+        run_for_dt: row.3,
+        provider: row.4,
+        model: row.5,
+        status: row.6,
+        prompt_total: row.7,
+        started_at: row.8,
+        finished_at: row.9,
+    }))
 }
 
 pub async fn insert_geo_monitor_run_result(
-  pool: &MySqlPool,
-  tenant_id: &str,
-  project_id: i64,
-  run_for_dt: chrono::NaiveDate,
-  run_id: i64,
-  prompt_id: i64,
-  prompt_text: &str,
-  output_text: Option<&str>,
-  presence: bool,
-  rank_int: Option<i32>,
-  cost_usd: f64,
-  error: Option<&str>,
+    pool: &MySqlPool,
+    tenant_id: &str,
+    project_id: i64,
+    run_for_dt: chrono::NaiveDate,
+    run_id: i64,
+    prompt_id: i64,
+    prompt_text: &str,
+    output_text: Option<&str>,
+    presence: bool,
+    rank_int: Option<i32>,
+    cost_usd: f64,
+    error: Option<&str>,
 ) -> Result<bool, Error> {
-  let res = sqlx::query(
+    let res = sqlx::query(
     r#"
       INSERT IGNORE INTO geo_monitor_run_results
         (tenant_id, project_id, run_for_dt, run_id, prompt_id, prompt_text, output_text, presence, rank_int, cost_usd, error)
@@ -2341,67 +2950,67 @@ pub async fn insert_geo_monitor_run_result(
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(res.rows_affected() > 0)
+    Ok(res.rows_affected() > 0)
 }
 
 pub async fn finalize_geo_monitor_run_if_complete(
-  pool: &MySqlPool,
-  run_id: i64,
+    pool: &MySqlPool,
+    run_id: i64,
 ) -> Result<bool, Error> {
-  let run: Option<(i32, Option<DateTime<Utc>>)> = sqlx::query_as(
-    r#"
+    let run: Option<(i32, Option<DateTime<Utc>>)> = sqlx::query_as(
+        r#"
       SELECT prompt_total, finished_at
       FROM geo_monitor_runs
       WHERE id = ?
       LIMIT 1;
     "#,
-  )
-  .bind(run_id)
-  .fetch_optional(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  let Some((prompt_total, finished_at)) = run else {
-    return Ok(false);
-  };
-  if finished_at.is_some() || prompt_total <= 0 {
-    return Ok(false);
-  }
+    let Some((prompt_total, finished_at)) = run else {
+        return Ok(false);
+    };
+    if finished_at.is_some() || prompt_total <= 0 {
+        return Ok(false);
+    }
 
-  let results_total: i64 = sqlx::query_scalar(
-    r#"
+    let results_total: i64 = sqlx::query_scalar(
+        r#"
       SELECT COUNT(*) FROM geo_monitor_run_results WHERE run_id = ?;
     "#,
-  )
-  .bind(run_id)
-  .fetch_one(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  if results_total < prompt_total as i64 {
-    return Ok(false);
-  }
+    if results_total < prompt_total as i64 {
+        return Ok(false);
+    }
 
-  let updated = sqlx::query(
-    r#"
+    let updated = sqlx::query(
+        r#"
       UPDATE geo_monitor_runs
       SET status='completed', finished_at=COALESCE(finished_at, CURRENT_TIMESTAMP(3))
       WHERE id = ? AND finished_at IS NULL;
     "#,
-  )
-  .bind(run_id)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(run_id)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(updated.rows_affected() > 0)
+    Ok(updated.rows_affected() > 0)
 }
 
 pub async fn fetch_geo_monitor_run_summary(
-  pool: &MySqlPool,
-  run_id: i64,
+    pool: &MySqlPool,
+    run_id: i64,
 ) -> Result<GeoMonitorRunSummary, Error> {
-  let row: (i64, i64, i64, i64, i64, f64) = sqlx::query_as(
+    let row: (i64, i64, i64, i64, i64, f64) = sqlx::query_as(
     r#"
       SELECT
         COUNT(*) AS results_total,
@@ -2419,23 +3028,35 @@ pub async fn fetch_geo_monitor_run_summary(
   .await
   .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(GeoMonitorRunSummary {
-    results_total: row.0,
-    presence_count: row.1,
-    top3_count: row.2,
-    top5_count: row.3,
-    error_count: row.4,
-    cost_usd: row.5,
-  })
+    Ok(GeoMonitorRunSummary {
+        results_total: row.0,
+        presence_count: row.1,
+        top3_count: row.2,
+        top5_count: row.3,
+        error_count: row.4,
+        cost_usd: row.5,
+    })
 }
 
 pub async fn fetch_geo_monitor_run_results(
-  pool: &MySqlPool,
-  run_id: i64,
-  limit: i64,
-) -> Result<Vec<(i64, i64, String, Option<String>, bool, Option<i32>, f64, Option<String>)>, Error> {
-  let limit = limit.clamp(1, 200);
-  let rows: Vec<(i64, i64, String, Option<String>, i8, Option<i32>, f64, Option<String>)> =
+    pool: &MySqlPool,
+    run_id: i64,
+    limit: i64,
+) -> Result<
+    Vec<(
+        i64,
+        i64,
+        String,
+        Option<String>,
+        bool,
+        Option<i32>,
+        f64,
+        Option<String>,
+    )>,
+    Error,
+> {
+    let limit = limit.clamp(1, 200);
+    let rows: Vec<(i64, i64, String, Option<String>, i8, Option<i32>, f64, Option<String>)> =
     sqlx::query_as(
       r#"
         SELECT prompt_id, id, prompt_text, output_text, presence, rank_int, CAST(cost_usd AS DOUBLE) AS cost_usd, error
@@ -2451,147 +3072,195 @@ pub async fn fetch_geo_monitor_run_results(
     .await
     .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(
-    rows
-      .into_iter()
-      .map(|(prompt_id, id, prompt_text, output_text, presence, rank_int, cost_usd, error)| {
-        (
-          prompt_id,
-          id,
-          prompt_text,
-          output_text,
-          presence != 0,
-          rank_int,
-          cost_usd,
-          error,
+    Ok(rows
+        .into_iter()
+        .map(
+            |(prompt_id, id, prompt_text, output_text, presence, rank_int, cost_usd, error)| {
+                (
+                    prompt_id,
+                    id,
+                    prompt_text,
+                    output_text,
+                    presence != 0,
+                    rank_int,
+                    cost_usd,
+                    error,
+                )
+            },
         )
-      })
-      .collect(),
-  )
+        .collect())
 }
 
 pub fn sanitize_sql_identifier(header: &str) -> String {
-  let mut out = String::with_capacity(header.len());
-  let mut prev_underscore = false;
+    let mut out = String::with_capacity(header.len());
+    let mut prev_underscore = false;
 
-  for ch in header.chars() {
-    let c = ch.to_ascii_lowercase();
-    if c.is_ascii_alphanumeric() {
-      out.push(c);
-      prev_underscore = false;
-    } else if !prev_underscore {
-      out.push('_');
-      prev_underscore = true;
+    for ch in header.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_underscore = false;
+        } else if !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
     }
-  }
 
-  let trimmed = out.trim_matches('_');
-  let mut normalized = if trimmed.is_empty() {
-    "c".to_string()
-  } else {
-    trimmed.to_string()
-  };
+    let trimmed = out.trim_matches('_');
+    let mut normalized = if trimmed.is_empty() {
+        "c".to_string()
+    } else {
+        trimmed.to_string()
+    };
 
-  if normalized
-    .chars()
-    .next()
-    .map(|c| c.is_ascii_digit())
-    .unwrap_or(false)
-  {
-    normalized = format!("c_{normalized}");
-  }
+    if normalized
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
+        normalized = format!("c_{normalized}");
+    }
 
-  if normalized.len() > 64 {
-    normalized.truncate(64);
-  }
+    if normalized.len() > 64 {
+        normalized.truncate(64);
+    }
 
-  normalized
+    normalized
 }
 
 pub fn dedupe_columns(headers: &[String]) -> Vec<String> {
-  let mut seen: HashMap<String, usize> = HashMap::new();
-  let mut out: Vec<String> = Vec::with_capacity(headers.len());
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<String> = Vec::with_capacity(headers.len());
 
-  for header in headers {
-    let base = sanitize_sql_identifier(header);
-    let count = seen.entry(base.clone()).or_insert(0);
-    *count += 1;
-    if *count == 1 {
-      out.push(base);
-    } else {
-      out.push(format!("{base}_{}", *count));
+    for header in headers {
+        let base = sanitize_sql_identifier(header);
+        let count = seen.entry(base.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            out.push(base);
+        } else {
+            out.push(format!("{base}_{}", *count));
+        }
     }
-  }
 
-  out
+    out
 }
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+    use super::*;
 
-  #[test]
-  fn utc_day_bounds_returns_midnight_and_next_midnight() {
-    let now = Utc.with_ymd_and_hms(2026, 1, 20, 16, 30, 0).unwrap();
-    let (start, end) = utc_day_bounds(now);
-    assert_eq!(start, Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap());
-    assert_eq!(end, Utc.with_ymd_and_hms(2026, 1, 21, 0, 0, 0).unwrap());
-  }
+    #[test]
+    fn utc_day_bounds_returns_midnight_and_next_midnight() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 20, 16, 30, 0).unwrap();
+        let (start, end) = utc_day_bounds(now);
+        assert_eq!(start, Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap());
+        assert_eq!(end, Utc.with_ymd_and_hms(2026, 1, 21, 0, 0, 0).unwrap());
+    }
 
-  #[test]
-  fn sanitize_sql_identifier_normalizes_headers() {
-    assert_eq!(
-      sanitize_sql_identifier("Total Revenue ($)"),
-      "total_revenue"
-    );
-    assert_eq!(sanitize_sql_identifier("123 Views"), "c_123_views");
-    assert_eq!(sanitize_sql_identifier("视频"), "c");
-  }
+    #[test]
+    fn sanitize_sql_identifier_normalizes_headers() {
+        assert_eq!(
+            sanitize_sql_identifier("Total Revenue ($)"),
+            "total_revenue"
+        );
+        assert_eq!(sanitize_sql_identifier("123 Views"), "c_123_views");
+        assert_eq!(sanitize_sql_identifier("视频"), "c");
+    }
 
-  #[test]
-  fn dedupe_columns_appends_suffixes_for_conflicts() {
-    let headers = vec!["Views".to_string(), "views".to_string(), "Views ".to_string()];
-    let deduped = dedupe_columns(&headers);
-    assert_eq!(deduped, vec!["views", "views_2", "views_3"]);
-  }
+    #[test]
+    fn dedupe_columns_appends_suffixes_for_conflicts() {
+        let headers = vec![
+            "Views".to_string(),
+            "views".to_string(),
+            "Views ".to_string(),
+        ];
+        let deduped = dedupe_columns(&headers);
+        assert_eq!(deduped, vec!["views", "views_2", "views_3"]);
+    }
 
-  #[test]
-  fn report_share_put_records_observed_action() {
-    let src_router = include_str!("../api/oauth/youtube/router.rs");
-    assert!(
-      src_router.contains("public_proof_link_created"),
-      "youtube report share put should record public proof link creation in observed_actions"
-    );
-  }
+    #[test]
+    fn report_share_put_records_observed_action() {
+        let src_router = include_str!("../api/oauth/youtube/router.rs");
+        assert!(
+            src_router.contains("public_proof_link_created"),
+            "youtube report share put should record public proof link creation in observed_actions"
+        );
+    }
 
-  #[test]
-  fn report_share_tracks_last_opened_at() {
-    let src_db = include_str!("db.rs");
-    let src_router = include_str!("../api/oauth/youtube/router.rs");
+    #[test]
+    fn report_share_tracks_last_opened_at() {
+        let src_db = include_str!("db.rs");
+        let src_router = include_str!("../api/oauth/youtube/router.rs");
 
-    let ddl_needle = [
-      "ALTER TABLE yt_report_shares\n      ADD COLUMN IF NOT EXISTS last_open",
-      "ed_at TIMESTAMP(3) NULL;",
-    ]
-    .concat();
-    assert!(
-      src_db.contains(&ddl_needle),
-      "ensure_schema() should add yt_report_shares.last_opened_at"
-    );
+        let ddl_needle = [
+            "ALTER TABLE yt_report_shares\n      ADD COLUMN IF NOT EXISTS last_open",
+            "ed_at TIMESTAMP(3) NULL;",
+        ]
+        .concat();
+        assert!(
+            src_db.contains(&ddl_needle),
+            "ensure_schema() should add yt_report_shares.last_opened_at"
+        );
 
-    let update_needle = "last_opened_at = CURRENT_TIMESTAMP(3)";
-    assert!(
-      src_router.contains(update_needle),
-      "youtube_report_share_get should update last_opened_at when a proof link is opened"
-    );
+        let update_needle = "last_opened_at = CURRENT_TIMESTAMP(3)";
+        assert!(
+            src_router.contains(update_needle),
+            "youtube_report_share_get should update last_opened_at when a proof link is opened"
+        );
 
-    assert!(
-      src_router.contains("\"hits\""),
-      "youtube_report_share_latest should expose hits"
-    );
-    assert!(
-      src_router.contains("\"last_opened_at\""),
-      "youtube_report_share_latest should expose last_opened_at"
-    );
-  }
+        assert!(
+            src_router.contains("\"hits\""),
+            "youtube_report_share_latest should expose hits"
+        );
+        assert!(
+            src_router.contains("\"last_opened_at\""),
+            "youtube_report_share_latest should expose last_opened_at"
+        );
+    }
+
+    #[test]
+    fn ai_settings_schema_and_dao_symbols_exist() {
+        let src_db = include_str!("db.rs");
+
+        let ddl_settings = ["CREATE TABLE IF NOT EXISTS tenant_ai_provider_", "settings"].concat();
+        let ddl_audit = ["CREATE TABLE IF NOT EXISTS tenant_ai_provider_", "audit"].concat();
+        let ddl_policy = ["CREATE TABLE IF NOT EXISTS tenant_ai_routing_", "policy"].concat();
+
+        assert!(
+            src_db.contains(&ddl_settings),
+            "ensure_schema() should create tenant_ai_provider_settings"
+        );
+        assert!(
+            src_db.contains(&ddl_audit),
+            "ensure_schema() should create tenant_ai_provider_audit"
+        );
+        assert!(
+            src_db.contains(&ddl_policy),
+            "ensure_schema() should create tenant_ai_routing_policy"
+        );
+
+        let upsert_setting_fn = ["pub async fn upsert_tenant_ai_provider_", "setting("].concat();
+        let fetch_settings_fn = ["pub async fn fetch_tenant_ai_provider_", "settings("].concat();
+        let upsert_policy_fn = ["pub async fn upsert_tenant_ai_routing_", "policy("].concat();
+        let insert_audit_fn = ["pub async fn insert_tenant_ai_provider_", "audit("].concat();
+
+        assert!(
+            src_db.contains(&upsert_setting_fn),
+            "db.rs should expose upsert_tenant_ai_provider_setting()"
+        );
+        assert!(
+            src_db.contains(&fetch_settings_fn),
+            "db.rs should expose fetch_tenant_ai_provider_settings()"
+        );
+        assert!(
+            src_db.contains(&upsert_policy_fn),
+            "db.rs should expose upsert_tenant_ai_routing_policy()"
+        );
+        assert!(
+            src_db.contains(&insert_audit_fn),
+            "db.rs should expose insert_tenant_ai_provider_audit()"
+        );
+    }
 }

@@ -6,16 +6,20 @@ use serde::{Deserialize, Serialize};
 use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 
 use bytes::Bytes;
-use globa_flux_rust::cost::compute_cost_usd;
+use globa_flux_rust::cost::{compute_cost_usd, ModelPricingUsdPerMToken};
 use globa_flux_rust::db::{
-    consume_daily_usage_event, fetch_tenant_gemini_model, fetch_usage_event, get_pool,
-    insert_usage_event, sum_spent_usd_today,
+    consume_daily_usage_event, fetch_active_tenant_ai_provider_setting,
+    fetch_tenant_ai_routing_policy, fetch_usage_event, get_pool, insert_usage_event,
+    sum_spent_usd_today,
 };
 use globa_flux_rust::providers::gemini::{
     generate_text as gemini_generate_text, pricing_for_model as gemini_pricing_for_model,
     stream_generate as gemini_stream_generate, GeminiConfig, GeminiStreamEvent,
 };
-use globa_flux_rust::providers::openai::{build_risk_check_prompt, RiskCheckMessageArgs};
+use globa_flux_rust::providers::openai::{
+    build_risk_check_prompt, pricing_for_model as openai_pricing_for_model, RiskCheckMessageArgs,
+};
+use globa_flux_rust::secrets::decrypt_secret;
 use globa_flux_rust::sse::sse_event;
 use sqlx::MySqlPool;
 use std::collections::HashMap;
@@ -24,7 +28,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-const GLOBAL_TENANT_ID: &str = "global";
 const DAILY_RISK_CHECK_EVENT_TYPE: &str = "chat_risk_check_count";
 
 #[derive(Clone)]
@@ -41,7 +44,6 @@ struct DailyLimitStatus {
     allowed: bool,
 }
 
-static GEMINI_MODEL_CACHE: OnceLock<Mutex<HashMap<String, TtlEntry<String>>>> = OnceLock::new();
 static SPENT_TODAY_CACHE: OnceLock<Mutex<HashMap<String, TtlEntry<f64>>>> = OnceLock::new();
 
 fn ttl_from_env_ms(key: &str, default_ms: u64) -> Duration {
@@ -85,25 +87,6 @@ fn cache_store<T: Clone>(
     }
 }
 
-async fn fetch_tenant_gemini_model_cached(
-    pool: &MySqlPool,
-    tenant_id: &str,
-) -> Result<Option<String>, Error> {
-    let ttl = ttl_from_env_ms("CHAT_GEMINI_MODEL_CACHE_TTL_MS", 5 * 60 * 1000);
-    let cache = GEMINI_MODEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = tenant_id.to_string();
-
-    if let Some(v) = cache_lookup(cache, &key) {
-        return Ok(Some(v));
-    }
-
-    let fetched = fetch_tenant_gemini_model(pool, tenant_id).await?;
-    if let Some(model) = fetched.as_ref() {
-        cache_store(cache, key, model.clone(), ttl);
-    }
-    Ok(fetched)
-}
-
 async fn sum_spent_usd_today_cached(
     pool: &MySqlPool,
     tenant_id: &str,
@@ -121,6 +104,435 @@ async fn sum_spent_usd_today_cached(
     let spent = sum_spent_usd_today(pool, tenant_id, now).await?;
     cache_store(cache, key, spent, ttl);
     Ok(spent)
+}
+
+#[derive(Clone)]
+enum ResolvedProviderConfig {
+    Gemini(GeminiConfig),
+    OpenAi {
+        api_key: String,
+        api_base_url: String,
+    },
+    Anthropic {
+        api_key: String,
+        api_base_url: String,
+    },
+}
+
+#[derive(Clone)]
+struct ResolvedAiRuntime {
+    provider: String,
+    model: String,
+    cfg: ResolvedProviderConfig,
+}
+
+fn pricing_for_resolved_runtime(runtime: &ResolvedAiRuntime) -> Option<ModelPricingUsdPerMToken> {
+    match runtime.provider.as_str() {
+        "gemini" => gemini_pricing_for_model(&runtime.model),
+        "openai" => openai_pricing_for_model(&runtime.model),
+        "anthropic" => {
+            if let (Ok(prompt), Ok(completion)) = (
+                std::env::var("ANTHROPIC_PRICE_PROMPT_USD_PER_M_TOKEN"),
+                std::env::var("ANTHROPIC_PRICE_COMPLETION_USD_PER_M_TOKEN"),
+            ) {
+                if let (Ok(prompt), Ok(completion)) =
+                    (prompt.parse::<f64>(), completion.parse::<f64>())
+                {
+                    return Some(ModelPricingUsdPerMToken { prompt, completion });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn openai_extract_text(json: &serde_json::Value) -> String {
+    if let Some(text) = json.get("output_text").and_then(|v| v.as_str()) {
+        return text.to_string();
+    }
+
+    let mut out = String::new();
+    let output = json
+        .get("output")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for item in output {
+        let parts = item
+            .get("content")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                out.push_str(text);
+            }
+        }
+    }
+    out
+}
+
+fn openai_extract_usage(json: &serde_json::Value) -> Option<Usage> {
+    let usage = json.get("usage")?;
+    let prompt_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let completion_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+    })
+}
+
+fn anthropic_extract_text(json: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let content = json
+        .get("content")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for part in content {
+        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+fn anthropic_extract_usage(json: &serde_json::Value) -> Option<Usage> {
+    let usage = json.get("usage")?;
+    let prompt_tokens = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let completion_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+    })
+}
+
+fn provider_v1_endpoint(base_url: &str, path: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        format!("{trimmed}/{path}")
+    } else {
+        format!("{trimmed}/v1/{path}")
+    }
+}
+
+fn normalize_supported_provider(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "gemini" | "openai" | "anthropic") {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+async fn openai_generate_text(
+    api_key: &str,
+    api_base_url: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    temperature: f64,
+    max_output_tokens: u32,
+    idempotency_key: Option<&str>,
+) -> Result<(String, Option<Usage>), Error> {
+    let url = provider_v1_endpoint(api_base_url, "responses");
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(
+            |e| -> Error { Box::new(std::io::Error::other(format!("invalid openai key: {e}"))) },
+        )?,
+    );
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    if let Some(key) = idempotency_key.filter(|v| !v.trim().is_empty()) {
+        headers.insert(
+            "Idempotency-Key",
+            reqwest::header::HeaderValue::from_str(key).map_err(|e| -> Error {
+                Box::new(std::io::Error::other(format!("invalid idempotency key: {e}")))
+            })?,
+        );
+    }
+
+    let payload = serde_json::json!({
+      "model": model,
+      "temperature": temperature,
+      "max_output_tokens": max_output_tokens,
+      "input": [
+        {
+          "role": "system",
+          "content": [{"type":"input_text","text": system}]
+        },
+        {
+          "role": "user",
+          "content": [{"type":"input_text","text": user}]
+        }
+      ]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(url)
+        .headers(headers)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?;
+    let status = resp.status();
+    let json = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?;
+
+    if !status.is_success() {
+        let message = json
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown_openai_error");
+        return Err(Box::new(std::io::Error::other(format!(
+            "OpenAI error (status {}): {}",
+            status.as_u16(),
+            message
+        ))));
+    }
+
+    Ok((openai_extract_text(&json), openai_extract_usage(&json)))
+}
+
+async fn anthropic_generate_text(
+    api_key: &str,
+    api_base_url: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    temperature: f64,
+    max_output_tokens: u32,
+) -> Result<(String, Option<Usage>), Error> {
+    let url = provider_v1_endpoint(api_base_url, "messages");
+
+    let payload = serde_json::json!({
+      "model": model,
+      "system": system,
+      "max_tokens": max_output_tokens,
+      "temperature": temperature,
+      "messages": [{"role":"user","content": user}]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?;
+    let status = resp.status();
+    let json = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?;
+
+    if !status.is_success() {
+        let message = json
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown_anthropic_error");
+        return Err(Box::new(std::io::Error::other(format!(
+            "Anthropic error (status {}): {}",
+            status.as_u16(),
+            message
+        ))));
+    }
+
+    Ok((anthropic_extract_text(&json), anthropic_extract_usage(&json)))
+}
+
+async fn generate_text_for_runtime(
+    runtime: &ResolvedAiRuntime,
+    system: &str,
+    user: &str,
+    temperature: f64,
+    max_output_tokens: u32,
+    idempotency_key: Option<&str>,
+) -> Result<(String, Usage), Error> {
+    let (text, usage_opt) = match &runtime.cfg {
+        ResolvedProviderConfig::Gemini(cfg) => {
+            let (text, usage) =
+                gemini_generate_text(cfg, system, user, temperature, max_output_tokens).await?;
+            let usage = usage.map(|u| Usage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+            });
+            (text, usage)
+        }
+        ResolvedProviderConfig::OpenAi {
+            api_key,
+            api_base_url,
+        } => {
+            openai_generate_text(
+                api_key,
+                api_base_url,
+                &runtime.model,
+                system,
+                user,
+                temperature,
+                max_output_tokens,
+                idempotency_key,
+            )
+            .await?
+        }
+        ResolvedProviderConfig::Anthropic {
+            api_key,
+            api_base_url,
+        } => {
+            anthropic_generate_text(
+                api_key,
+                api_base_url,
+                &runtime.model,
+                system,
+                user,
+                temperature,
+                max_output_tokens,
+            )
+            .await?
+        }
+    };
+
+    let usage = usage_opt.unwrap_or(Usage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+    });
+    Ok((text, usage))
+}
+
+async fn resolve_runtime_from_active_setting(
+    pool: &MySqlPool,
+    tenant_id: &str,
+    provider: &str,
+) -> Result<Option<ResolvedAiRuntime>, Error> {
+    let Some(setting) = fetch_active_tenant_ai_provider_setting(pool, tenant_id, Some(provider)).await?
+    else {
+        return Ok(None);
+    };
+
+    let api_key = decrypt_secret(&setting.encrypted_api_key, &setting.key_version)?;
+    if api_key.trim().is_empty() {
+        return Err(Box::new(std::io::Error::other(
+            "configured provider api_key is empty",
+        )));
+    }
+
+    let model = setting.default_model.trim().to_string();
+    if model.is_empty() {
+        return Err(Box::new(std::io::Error::other(
+            "configured default_model is empty",
+        )));
+    }
+
+    let cfg = match provider {
+        "gemini" => {
+            let api_base_url = std::env::var("GEMINI_API_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1".to_string());
+            ResolvedProviderConfig::Gemini(GeminiConfig {
+                api_key,
+                model: model.clone(),
+                api_base_url,
+            })
+        }
+        "openai" => {
+            let api_base_url = std::env::var("OPENAI_API_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            ResolvedProviderConfig::OpenAi {
+                api_key,
+                api_base_url,
+            }
+        }
+        "anthropic" => {
+            let api_base_url = std::env::var("ANTHROPIC_API_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
+            ResolvedProviderConfig::Anthropic {
+                api_key,
+                api_base_url,
+            }
+        }
+        _ => {
+            return Err(Box::new(std::io::Error::other(format!(
+                "provider '{}' is not supported in chat runtime yet",
+                provider
+            ))));
+        }
+    };
+
+    Ok(Some(ResolvedAiRuntime {
+        provider: provider.to_string(),
+        model,
+        cfg,
+    }))
+}
+
+async fn resolve_ai_runtime(
+    pool: &MySqlPool,
+    tenant_id: &str,
+) -> Result<ResolvedAiRuntime, Error> {
+    let policy = fetch_tenant_ai_routing_policy(pool, tenant_id).await?;
+    let preferred_provider = policy
+        .as_ref()
+        .map(|p| p.default_provider.as_str())
+        .and_then(normalize_supported_provider)
+        .unwrap_or_else(|| "gemini".to_string());
+    if let Some(raw_default) = policy
+        .as_ref()
+        .map(|p| p.default_provider.trim().to_ascii_lowercase())
+    {
+        if !raw_default.is_empty() && normalize_supported_provider(&raw_default).is_none() {
+            return Err(Box::new(std::io::Error::other(format!(
+                "default provider '{}' is not supported in chat runtime yet",
+                raw_default
+            ))));
+        }
+    }
+
+    match resolve_runtime_from_active_setting(pool, tenant_id, &preferred_provider).await {
+        Ok(Some(runtime)) => Ok(runtime),
+        Ok(None) => Err(Box::new(std::io::Error::other(format!(
+            "missing active tenant {} provider config",
+            preferred_provider
+        )))),
+        Err(err) => Err(err),
+    }
 }
 
 fn daily_limit_exceeded_response(
@@ -562,13 +974,6 @@ async fn handle_agent(
     idempotency_key: &str,
     body: Bytes,
 ) -> Result<Response<ResponseBody>, Error> {
-    let mut gemini_cfg = match GeminiConfig::from_env_optional()? {
-        Some(cfg) => cfg,
-        None => {
-            return config_error_response(stream, "Missing GEMINI_API_KEY");
-        }
-    };
-
     let parsed: AgentRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
         Box::new(std::io::Error::other(format!("invalid json body: {e}")))
     })?;
@@ -631,19 +1036,13 @@ async fn handle_agent(
     let spent_usd_today =
         sum_spent_usd_today_cached(pool, &parsed.tenant_id, chrono::Utc::now()).await?;
 
-    let db_model = match fetch_tenant_gemini_model_cached(pool, GLOBAL_TENANT_ID).await {
-        Ok(model) => model.unwrap_or_default(),
+    let runtime = match resolve_ai_runtime(pool, &parsed.tenant_id).await {
+        Ok(resolved) => resolved,
         Err(err) => {
             return config_error_response(stream, &err.to_string());
         }
     };
-    let db_model = db_model.trim().to_string();
-    if db_model.is_empty() {
-        return config_error_response(stream, "Missing gemini_model for tenant_id=global");
-    }
-    gemini_cfg.model = db_model.clone();
-
-    let model = gemini_cfg.model.clone();
+    let model = runtime.model.clone();
     let max_output_tokens: u32 = std::env::var("GEMINI_MAX_OUTPUT_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -653,8 +1052,8 @@ async fn handle_agent(
         .and_then(|v| v.parse().ok())
         .unwrap_or(2500);
 
-    let provider = "gemini".to_string();
-    let pricing = gemini_pricing_for_model(&model);
+    let provider = runtime.provider.clone();
+    let pricing = pricing_for_resolved_runtime(&runtime);
 
     let reserved_cost_usd = pricing
         .map(|p| compute_cost_usd(p, prompt_reserve_tokens, max_output_tokens))
@@ -706,8 +1105,11 @@ async fn handle_agent(
         let model2 = model.clone();
         let provider2 = provider.clone();
         let pricing2 = pricing;
-        let gemini_cfg2 = gemini_cfg.clone();
+        let runtime2 = runtime.clone();
+        let system2 = system.clone();
+        let user2 = user.clone();
         let max_output_tokens2 = max_output_tokens;
+        let temperature2 = temperature;
 
         tokio::spawn(async move {
             let output_shared = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
@@ -717,47 +1119,77 @@ async fn handle_agent(
             let usage_shared2 = std::sync::Arc::clone(&usage_shared);
             let tx2 = tx.clone();
 
-            let res = gemini_stream_generate(
-                &gemini_cfg2,
-                &system,
-                &user,
-                temperature,
-                max_output_tokens2,
-                move |event| {
-                    let output_shared2 = std::sync::Arc::clone(&output_shared2);
-                    let usage_shared2 = std::sync::Arc::clone(&usage_shared2);
-                    let tx2 = tx2.clone();
+            let res = match &runtime2.cfg {
+                ResolvedProviderConfig::Gemini(gemini_cfg2) => {
+                    gemini_stream_generate(
+                        gemini_cfg2,
+                        &system2,
+                        &user2,
+                        temperature2,
+                        max_output_tokens2,
+                        move |event| {
+                            let output_shared2 = std::sync::Arc::clone(&output_shared2);
+                            let usage_shared2 = std::sync::Arc::clone(&usage_shared2);
+                            let tx2 = tx2.clone();
 
-                    async move {
-                        match event {
-                            GeminiStreamEvent::Usage(u) => {
-                                *usage_shared2.lock().await = Some(Usage {
-                                    prompt_tokens: u.prompt_tokens,
-                                    completion_tokens: u.completion_tokens,
-                                });
-                                Ok(())
-                            }
-                            GeminiStreamEvent::Delta(delta) => {
-                                {
-                                    let mut out = output_shared2.lock().await;
-                                    out.push_str(&delta);
+                            async move {
+                                match event {
+                                    GeminiStreamEvent::Usage(u) => {
+                                        *usage_shared2.lock().await = Some(Usage {
+                                            prompt_tokens: u.prompt_tokens,
+                                            completion_tokens: u.completion_tokens,
+                                        });
+                                        Ok(())
+                                    }
+                                    GeminiStreamEvent::Delta(delta) => {
+                                        {
+                                            let mut out = output_shared2.lock().await;
+                                            out.push_str(&delta);
+                                        }
+
+                                        tx2.send(Ok(Frame::data(Bytes::from(sse_event(
+                                            "token",
+                                            &serde_json::json!({"text": delta}).to_string(),
+                                        )))))
+                                        .await
+                                        .map_err(|e| {
+                                            Box::new(std::io::Error::other(e.to_string())) as Error
+                                        })?;
+                                        Ok(())
+                                    }
                                 }
-
-                                tx2.send(Ok(Frame::data(Bytes::from(sse_event(
-                                    "token",
-                                    &serde_json::json!({"text": delta}).to_string(),
-                                )))))
-                                .await
-                                .map_err(|e| {
-                                    Box::new(std::io::Error::other(e.to_string())) as Error
-                                })?;
-                                Ok(())
                             }
+                        },
+                    )
+                    .await
+                }
+                _ => match generate_text_for_runtime(
+                    &runtime2,
+                    &system2,
+                    &user2,
+                    temperature2,
+                    max_output_tokens2,
+                    Some(&idempotency_key2),
+                )
+                .await
+                {
+                    Ok((text, usage)) => {
+                        {
+                            let mut out = output_shared.lock().await;
+                            out.push_str(&text);
                         }
+                        *usage_shared.lock().await = Some(usage);
+                        let _ = tx
+                            .send(Ok(Frame::data(Bytes::from(sse_event(
+                                "token",
+                                &serde_json::json!({"text": text}).to_string(),
+                            )))))
+                            .await;
+                        Ok(())
                     }
+                    Err(e) => Err(e),
                 },
-            )
-            .await;
+            };
 
             if let Err(e) = res {
                 let _ = tx
@@ -856,13 +1288,15 @@ async fn handle_agent(
             .body(ResponseBody::from(body))?);
     }
 
-    let (text, u) =
-        gemini_generate_text(&gemini_cfg, &system, &user, temperature, max_output_tokens).await?;
-
-    let usage = Usage {
-        prompt_tokens: u.as_ref().map(|x| x.prompt_tokens).unwrap_or(0),
-        completion_tokens: u.as_ref().map(|x| x.completion_tokens).unwrap_or(0),
-    };
+    let (text, usage) = generate_text_for_runtime(
+        &runtime,
+        &system,
+        &user,
+        temperature,
+        max_output_tokens,
+        Some(idempotency_key),
+    )
+    .await?;
     let cost_usd = pricing
         .map(|p| {
             compute_cost_usd(
@@ -971,13 +1405,6 @@ async fn handle_risk_check(
         return handle_agent(stream, &idempotency_key, body).await;
     }
 
-    let mut gemini_cfg = match GeminiConfig::from_env_optional()? {
-        Some(cfg) => cfg,
-        None => {
-            return config_error_response(stream, "Missing GEMINI_API_KEY");
-        }
-    };
-
     let parsed: RiskCheckRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
         Box::new(std::io::Error::other(format!("invalid json body: {e}")))
     })?;
@@ -1046,19 +1473,13 @@ async fn handle_risk_check(
         sum_spent_usd_today_cached(pool, &parsed.tenant_id, chrono::Utc::now()).await?;
     let temperature: f64 = 0.2;
 
-    let db_model = match fetch_tenant_gemini_model_cached(pool, GLOBAL_TENANT_ID).await {
-        Ok(model) => model.unwrap_or_default(),
+    let runtime = match resolve_ai_runtime(pool, &parsed.tenant_id).await {
+        Ok(resolved) => resolved,
         Err(err) => {
             return config_error_response(stream, &err.to_string());
         }
     };
-    let db_model = db_model.trim().to_string();
-    if db_model.is_empty() {
-        return config_error_response(stream, "Missing gemini_model for tenant_id=global");
-    }
-    gemini_cfg.model = db_model.clone();
-
-    let model = gemini_cfg.model.clone();
+    let model = runtime.model.clone();
     let max_output_tokens: u32 = std::env::var("GEMINI_MAX_OUTPUT_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1068,8 +1489,8 @@ async fn handle_risk_check(
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
 
-    let provider = "gemini".to_string();
-    let pricing = gemini_pricing_for_model(&model);
+    let provider = runtime.provider.clone();
+    let pricing = pricing_for_resolved_runtime(&runtime);
 
     let reserved_cost_usd = pricing
         .map(|p| compute_cost_usd(p, prompt_reserve_tokens, max_output_tokens))
@@ -1119,7 +1540,7 @@ async fn handle_risk_check(
         let model2 = model.clone();
         let provider2 = provider.clone();
         let pricing2 = pricing;
-        let gemini_cfg2 = gemini_cfg.clone();
+        let runtime2 = runtime.clone();
         let max_output_tokens2 = max_output_tokens;
         let temperature2 = temperature;
 
@@ -1136,47 +1557,77 @@ async fn handle_risk_check(
             let usage_shared2 = std::sync::Arc::clone(&usage_shared);
             let tx2 = tx.clone();
 
-            let res = gemini_stream_generate(
-                &gemini_cfg2,
-                &prompt.system,
-                &prompt.user,
-                temperature2,
-                max_output_tokens2,
-                move |event| {
-                    let output_shared2 = std::sync::Arc::clone(&output_shared2);
-                    let usage_shared2 = std::sync::Arc::clone(&usage_shared2);
-                    let tx2 = tx2.clone();
+            let res = match &runtime2.cfg {
+                ResolvedProviderConfig::Gemini(gemini_cfg2) => {
+                    gemini_stream_generate(
+                        gemini_cfg2,
+                        &prompt.system,
+                        &prompt.user,
+                        temperature2,
+                        max_output_tokens2,
+                        move |event| {
+                            let output_shared2 = std::sync::Arc::clone(&output_shared2);
+                            let usage_shared2 = std::sync::Arc::clone(&usage_shared2);
+                            let tx2 = tx2.clone();
 
-                    async move {
-                        match event {
-                            GeminiStreamEvent::Usage(u) => {
-                                *usage_shared2.lock().await = Some(Usage {
-                                    prompt_tokens: u.prompt_tokens,
-                                    completion_tokens: u.completion_tokens,
-                                });
-                                Ok(())
-                            }
-                            GeminiStreamEvent::Delta(delta) => {
-                                {
-                                    let mut out = output_shared2.lock().await;
-                                    out.push_str(&delta);
+                            async move {
+                                match event {
+                                    GeminiStreamEvent::Usage(u) => {
+                                        *usage_shared2.lock().await = Some(Usage {
+                                            prompt_tokens: u.prompt_tokens,
+                                            completion_tokens: u.completion_tokens,
+                                        });
+                                        Ok(())
+                                    }
+                                    GeminiStreamEvent::Delta(delta) => {
+                                        {
+                                            let mut out = output_shared2.lock().await;
+                                            out.push_str(&delta);
+                                        }
+
+                                        tx2.send(Ok(Frame::data(Bytes::from(sse_event(
+                                            "token",
+                                            &serde_json::json!({"text": delta}).to_string(),
+                                        )))))
+                                        .await
+                                        .map_err(|e| {
+                                            Box::new(std::io::Error::other(e.to_string())) as Error
+                                        })?;
+                                        Ok(())
+                                    }
                                 }
-
-                                tx2.send(Ok(Frame::data(Bytes::from(sse_event(
-                                    "token",
-                                    &serde_json::json!({"text": delta}).to_string(),
-                                )))))
-                                .await
-                                .map_err(|e| {
-                                    Box::new(std::io::Error::other(e.to_string())) as Error
-                                })?;
-                                Ok(())
                             }
+                        },
+                    )
+                    .await
+                }
+                _ => match generate_text_for_runtime(
+                    &runtime2,
+                    &prompt.system,
+                    &prompt.user,
+                    temperature2,
+                    max_output_tokens2,
+                    Some(&idempotency_key2),
+                )
+                .await
+                {
+                    Ok((text, usage)) => {
+                        {
+                            let mut out = output_shared.lock().await;
+                            out.push_str(&text);
                         }
+                        *usage_shared.lock().await = Some(usage);
+                        let _ = tx
+                            .send(Ok(Frame::data(Bytes::from(sse_event(
+                                "token",
+                                &serde_json::json!({"text": text}).to_string(),
+                            )))))
+                            .await;
+                        Ok(())
                     }
+                    Err(e) => Err(e),
                 },
-            )
-            .await;
+            };
 
             if let Err(e) = res {
                 let _ = tx
@@ -1276,19 +1727,15 @@ async fn handle_risk_check(
         action_type: &parsed.action_type,
         note: parsed.note.as_deref(),
     });
-    let (text, u) = gemini_generate_text(
-        &gemini_cfg,
+    let (text, usage) = generate_text_for_runtime(
+        &runtime,
         &prompt.system,
         &prompt.user,
         temperature,
         max_output_tokens,
+        Some(&idempotency_key),
     )
     .await?;
-
-    let usage = Usage {
-        prompt_tokens: u.as_ref().map(|x| x.prompt_tokens).unwrap_or(0),
-        completion_tokens: u.as_ref().map(|x| x.completion_tokens).unwrap_or(0),
-    };
     let cost_usd = pricing
         .map(|p| {
             compute_cost_usd(
@@ -1459,5 +1906,41 @@ mod tests {
             json.get("error").and_then(|v| v.as_str()),
             Some("config_error")
         );
+    }
+
+    #[test]
+    fn provider_v1_endpoint_handles_both_base_shapes() {
+        assert_eq!(
+            provider_v1_endpoint("https://api.openai.com/v1", "responses"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            provider_v1_endpoint("https://api.openai.com", "responses"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn extracts_openai_text_and_usage() {
+        let payload = serde_json::json!({
+          "output":[{"content":[{"type":"output_text","text":"hello world"}]}],
+          "usage":{"input_tokens":12,"output_tokens":34}
+        });
+        assert_eq!(openai_extract_text(&payload), "hello world");
+        let usage = openai_extract_usage(&payload).expect("usage");
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.completion_tokens, 34);
+    }
+
+    #[test]
+    fn extracts_anthropic_text_and_usage() {
+        let payload = serde_json::json!({
+          "content":[{"type":"text","text":"risk ok"}],
+          "usage":{"input_tokens":7,"output_tokens":9}
+        });
+        assert_eq!(anthropic_extract_text(&payload), "risk ok");
+        let usage = anthropic_extract_usage(&payload).expect("usage");
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(usage.completion_tokens, 9);
     }
 }

@@ -7,204 +7,639 @@ use sha2::Digest;
 use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 
 use globa_flux_rust::db::{
-  decision_daily_exists,
-  ensure_geo_monitor_run,
-  fetch_geo_monitor_project,
-  fetch_geo_monitor_prompt,
-  fetch_new_video_publish_counts_by_dt,
-  fetch_policy_params_json,
-  fetch_revenue_sum_usd_7d,
-  fetch_tenant_gemini_model,
-  fetch_top_video_ids_by_revenue,
-  fetch_youtube_channel_id,
-  fetch_youtube_connection_tokens,
-  fetch_or_seed_youtube_oauth_app_config,
-  get_pool,
-  finalize_geo_monitor_run_if_complete,
-  insert_geo_monitor_run_result,
-  insert_usage_event,
-  update_youtube_connection_tokens,
-  upsert_decision_outcome,
-  upsert_observed_action,
-  upsert_policy_eval_report,
-  upsert_policy_params,
-  upsert_video_daily_metric,
+    decision_daily_exists, ensure_geo_monitor_run, fetch_geo_monitor_project,
+    fetch_geo_monitor_prompt, fetch_new_video_publish_counts_by_dt,
+    fetch_or_seed_youtube_oauth_app_config, fetch_policy_params_json, fetch_revenue_sum_usd_7d,
+    fetch_active_tenant_ai_provider_setting, fetch_tenant_ai_routing_policy,
+    fetch_top_video_ids_by_revenue, fetch_youtube_channel_id,
+    fetch_youtube_connection_tokens, finalize_geo_monitor_run_if_complete, get_pool,
+    insert_geo_monitor_run_result, insert_usage_event, update_youtube_connection_tokens,
+    upsert_decision_outcome, upsert_observed_action, upsert_policy_eval_report,
+    upsert_policy_params, upsert_video_daily_metric,
 };
 use globa_flux_rust::decision_engine::{compute_decision, DecisionEngineConfig};
 use globa_flux_rust::outcome_engine::compute_outcome_label;
 use globa_flux_rust::providers::gemini::{
-  generate_text as gemini_generate_text, pricing_for_model as gemini_pricing_for_model, GeminiConfig,
+    generate_text as gemini_generate_text, pricing_for_model as gemini_pricing_for_model,
+    GeminiConfig,
 };
 use globa_flux_rust::providers::youtube::{refresh_tokens, youtube_oauth_client_from_config};
 use globa_flux_rust::providers::youtube_analytics::{
-  fetch_video_daily_metrics_for_channel, youtube_analytics_error_to_vercel_error,
-};
-use globa_flux_rust::providers::youtube_videos::{
-  set_video_thumbnail_from_url, update_video_publish_at, update_video_title,
+    fetch_video_daily_metrics_for_channel, youtube_analytics_error_to_vercel_error,
 };
 use globa_flux_rust::providers::youtube_reporting::{
-  download_report_file,
-  ensure_job_for_report_type,
-  list_report_types,
-  list_reports,
+    download_report_file, ensure_job_for_report_type, list_report_types, list_reports,
 };
-use globa_flux_rust::youtube_alerts::evaluate_youtube_alerts;
-use globa_flux_rust::{
-  cost::compute_cost_usd,
-  geo_monitor::{
-    contains_any_case_insensitive, extract_rank_from_markdown_list, normalize_aliases,
-    parse_string_list_json,
-  },
+use globa_flux_rust::providers::youtube_videos::{
+    set_video_thumbnail_from_url, update_video_publish_at, update_video_title,
 };
 use globa_flux_rust::reach_reporting::ingest_channel_reach_basic_a1;
+use globa_flux_rust::secrets::decrypt_secret;
+use globa_flux_rust::youtube_alerts::evaluate_youtube_alerts;
+use globa_flux_rust::{
+    cost::{compute_cost_usd, ModelPricingUsdPerMToken},
+    geo_monitor::{
+        contains_any_case_insensitive, extract_rank_from_markdown_list, normalize_aliases,
+        parse_string_list_json,
+    },
+};
+use globa_flux_rust::providers::openai::pricing_for_model as openai_pricing_for_model;
+use serde_json::Value;
 
 fn bearer_token(header_value: Option<&str>) -> Option<&str> {
-  let value = header_value?;
-  value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer "))
+    let value = header_value?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
 }
 
-fn json_response(status: StatusCode, value: serde_json::Value) -> Result<Response<ResponseBody>, Error> {
-  Ok(
-    Response::builder()
-      .status(status)
-      .header("content-type", "application/json; charset=utf-8")
-      .body(ResponseBody::from(value))?,
-  )
+fn json_response(
+    status: StatusCode,
+    value: serde_json::Value,
+) -> Result<Response<ResponseBody>, Error> {
+    Ok(Response::builder()
+        .status(status)
+        .header("content-type", "application/json; charset=utf-8")
+        .body(ResponseBody::from(value))?)
 }
 
 fn has_tidb_url() -> bool {
-  std::env::var("TIDB_DATABASE_URL")
-    .or_else(|_| std::env::var("DATABASE_URL"))
-    .map(|v| !v.is_empty())
-    .unwrap_or(false)
+    std::env::var("TIDB_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 fn truncate_string(value: &str, max_chars: usize) -> String {
-  if max_chars == 0 {
-    return String::new();
-  }
-  let mut out = String::new();
-  for (idx, ch) in value.chars().enumerate() {
-    if idx >= max_chars {
-      break;
+    if max_chars == 0 {
+        return String::new();
     }
-    out.push(ch);
-  }
-  out
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn youtube_reporting_enable_url_from_error(err_text: &str) -> Option<String> {
-  // Typical error contains:
-  // "... enable it by visiting https://console.developers.google.com/apis/api/youtubereporting.googleapis.com/overview?project=1076253714959 ..."
-  let find_digits_after = |haystack: &str, needle: &str| -> Option<String> {
-    let idx = haystack.find(needle)?;
-    let rest = &haystack[idx + needle.len()..];
-    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
-    if digits.len() < 6 {
-      return None;
-    }
-    Some(digits)
-  };
+    // Typical error contains:
+    // "... enable it by visiting https://console.developers.google.com/apis/api/youtubereporting.googleapis.com/overview?project=1076253714959 ..."
+    let find_digits_after = |haystack: &str, needle: &str| -> Option<String> {
+        let idx = haystack.find(needle)?;
+        let rest = &haystack[idx + needle.len()..];
+        let digits = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>();
+        if digits.len() < 6 {
+            return None;
+        }
+        Some(digits)
+    };
 
-  let project_id = find_digits_after(err_text, "project=")
-    .or_else(|| {
-      let lower = err_text.to_ascii_lowercase();
-      let idx = lower.find("project ")?;
-      let rest = &err_text[idx + "project ".len()..];
-      let digits = rest.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>();
-      if digits.len() < 6 { None } else { Some(digits) }
+    let project_id = find_digits_after(err_text, "project=").or_else(|| {
+        let lower = err_text.to_ascii_lowercase();
+        let idx = lower.find("project ")?;
+        let rest = &err_text[idx + "project ".len()..];
+        let digits = rest
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>();
+        if digits.len() < 6 {
+            None
+        } else {
+            Some(digits)
+        }
     })?;
 
-  Some(format!(
+    Some(format!(
     "https://console.developers.google.com/apis/api/youtubereporting.googleapis.com/overview?project={}",
     project_id
   ))
 }
 
 fn worker_id() -> String {
-  std::env::var("VERCEL_REGION")
-    .or_else(|_| std::env::var("VERCEL_ENV"))
-    .unwrap_or_else(|_| "local".to_string())
+    std::env::var("VERCEL_REGION")
+        .or_else(|_| std::env::var("VERCEL_ENV"))
+        .unwrap_or_else(|_| "local".to_string())
 }
 
 fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
-  let query = query?;
-  for part in query.split('&') {
-    let (k, v) = part.split_once('=')?;
-    if k == key {
-      return Some(v);
+    let query = query?;
+    for part in query.split('&') {
+        let (k, v) = part.split_once('=')?;
+        if k == key {
+            return Some(v);
+        }
     }
-  }
-  None
+    None
 }
 
-const GLOBAL_TENANT_ID: &str = "global";
 const YOUTUBE_REPORTING_BACKFILL_DAYS: i64 = 90;
 
+#[derive(Clone)]
+enum ResolvedProviderConfig {
+    Gemini(GeminiConfig),
+    OpenAi {
+        api_key: String,
+        api_base_url: String,
+    },
+    Anthropic {
+        api_key: String,
+        api_base_url: String,
+    },
+}
+
+#[derive(Clone)]
+struct ResolvedAiRuntime {
+    provider: String,
+    model: String,
+    cfg: ResolvedProviderConfig,
+}
+
+#[derive(Clone, Copy)]
+struct ProviderUsage {
+    prompt_tokens: i32,
+    completion_tokens: i32,
+}
+
+fn pricing_for_resolved_runtime(runtime: &ResolvedAiRuntime) -> Option<ModelPricingUsdPerMToken> {
+    match runtime.provider.as_str() {
+        "gemini" => gemini_pricing_for_model(&runtime.model),
+        "openai" => openai_pricing_for_model(&runtime.model),
+        "anthropic" => {
+            if let (Ok(prompt), Ok(completion)) = (
+                std::env::var("ANTHROPIC_PRICE_PROMPT_USD_PER_M_TOKEN"),
+                std::env::var("ANTHROPIC_PRICE_COMPLETION_USD_PER_M_TOKEN"),
+            ) {
+                if let (Ok(prompt), Ok(completion)) =
+                    (prompt.parse::<f64>(), completion.parse::<f64>())
+                {
+                    return Some(ModelPricingUsdPerMToken { prompt, completion });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn openai_extract_text(json: &Value) -> String {
+    if let Some(text) = json.get("output_text").and_then(|v| v.as_str()) {
+        return text.to_string();
+    }
+
+    let mut out = String::new();
+    let output = json
+        .get("output")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for item in output {
+        let parts = item
+            .get("content")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                out.push_str(text);
+            }
+        }
+    }
+    out
+}
+
+fn openai_extract_usage(json: &Value) -> Option<ProviderUsage> {
+    let usage = json.get("usage")?;
+    let prompt_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let completion_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    Some(ProviderUsage {
+        prompt_tokens,
+        completion_tokens,
+    })
+}
+
+fn anthropic_extract_text(json: &Value) -> String {
+    let mut out = String::new();
+    let content = json
+        .get("content")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for part in content {
+        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+fn anthropic_extract_usage(json: &Value) -> Option<ProviderUsage> {
+    let usage = json.get("usage")?;
+    let prompt_tokens = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let completion_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    Some(ProviderUsage {
+        prompt_tokens,
+        completion_tokens,
+    })
+}
+
+fn provider_v1_endpoint(base_url: &str, path: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        format!("{trimmed}/{path}")
+    } else {
+        format!("{trimmed}/v1/{path}")
+    }
+}
+
+fn normalize_supported_provider(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "gemini" | "openai" | "anthropic") {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+async fn openai_generate_text(
+    api_key: &str,
+    api_base_url: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    temperature: f64,
+    max_output_tokens: u32,
+    idempotency_key: Option<&str>,
+) -> Result<(String, Option<ProviderUsage>), Error> {
+    let url = provider_v1_endpoint(api_base_url, "responses");
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(
+            |e| -> Error { Box::new(std::io::Error::other(format!("invalid openai key: {e}"))) },
+        )?,
+    );
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    if let Some(key) = idempotency_key.filter(|v| !v.trim().is_empty()) {
+        headers.insert(
+            "Idempotency-Key",
+            reqwest::header::HeaderValue::from_str(key).map_err(|e| -> Error {
+                Box::new(std::io::Error::other(format!("invalid idempotency key: {e}")))
+            })?,
+        );
+    }
+
+    let payload = serde_json::json!({
+      "model": model,
+      "temperature": temperature,
+      "max_output_tokens": max_output_tokens,
+      "input": [
+        {
+          "role": "system",
+          "content": [{"type":"input_text","text": system}]
+        },
+        {
+          "role": "user",
+          "content": [{"type":"input_text","text": user}]
+        }
+      ]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(url)
+        .headers(headers)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?;
+    let status = resp.status();
+    let json = resp
+        .json::<Value>()
+        .await
+        .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?;
+
+    if !status.is_success() {
+        let message = json
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown_openai_error");
+        return Err(Box::new(std::io::Error::other(format!(
+            "OpenAI error (status {}): {}",
+            status.as_u16(),
+            message
+        ))));
+    }
+
+    Ok((openai_extract_text(&json), openai_extract_usage(&json)))
+}
+
+async fn anthropic_generate_text(
+    api_key: &str,
+    api_base_url: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    temperature: f64,
+    max_output_tokens: u32,
+) -> Result<(String, Option<ProviderUsage>), Error> {
+    let url = provider_v1_endpoint(api_base_url, "messages");
+
+    let payload = serde_json::json!({
+      "model": model,
+      "system": system,
+      "max_tokens": max_output_tokens,
+      "temperature": temperature,
+      "messages": [{"role":"user","content": user}]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?;
+    let status = resp.status();
+    let json = resp
+        .json::<Value>()
+        .await
+        .map_err(|e| -> Error { Box::new(std::io::Error::other(e.to_string())) })?;
+
+    if !status.is_success() {
+        let message = json
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown_anthropic_error");
+        return Err(Box::new(std::io::Error::other(format!(
+            "Anthropic error (status {}): {}",
+            status.as_u16(),
+            message
+        ))));
+    }
+
+    Ok((anthropic_extract_text(&json), anthropic_extract_usage(&json)))
+}
+
+async fn generate_text_for_runtime(
+    runtime: &ResolvedAiRuntime,
+    system: &str,
+    user: &str,
+    temperature: f64,
+    max_output_tokens: u32,
+    idempotency_key: Option<&str>,
+) -> Result<(String, ProviderUsage), Error> {
+    let (text, usage_opt) = match &runtime.cfg {
+        ResolvedProviderConfig::Gemini(cfg) => {
+            let (text, usage) =
+                gemini_generate_text(cfg, system, user, temperature, max_output_tokens).await?;
+            let usage = usage.map(|u| ProviderUsage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+            });
+            (text, usage)
+        }
+        ResolvedProviderConfig::OpenAi {
+            api_key,
+            api_base_url,
+        } => {
+            openai_generate_text(
+                api_key,
+                api_base_url,
+                &runtime.model,
+                system,
+                user,
+                temperature,
+                max_output_tokens,
+                idempotency_key,
+            )
+            .await?
+        }
+        ResolvedProviderConfig::Anthropic {
+            api_key,
+            api_base_url,
+        } => {
+            anthropic_generate_text(
+                api_key,
+                api_base_url,
+                &runtime.model,
+                system,
+                user,
+                temperature,
+                max_output_tokens,
+            )
+            .await?
+        }
+    };
+
+    let usage = usage_opt.unwrap_or(ProviderUsage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+    });
+    Ok((text, usage))
+}
+
+async fn resolve_runtime_from_active_setting(
+    pool: &sqlx::MySqlPool,
+    tenant_id: &str,
+    provider: &str,
+) -> Result<Option<ResolvedAiRuntime>, Error> {
+    let Some(setting) = fetch_active_tenant_ai_provider_setting(pool, tenant_id, Some(provider)).await?
+    else {
+        return Ok(None);
+    };
+
+    let api_key = decrypt_secret(&setting.encrypted_api_key, &setting.key_version)?;
+    if api_key.trim().is_empty() {
+        return Err(Box::new(std::io::Error::other(
+            "configured provider api_key is empty",
+        )));
+    }
+
+    let model = setting.default_model.trim().to_string();
+    if model.is_empty() {
+        return Err(Box::new(std::io::Error::other(
+            "configured default_model is empty",
+        )));
+    }
+
+    let cfg = match provider {
+        "gemini" => {
+            let api_base_url = std::env::var("GEMINI_API_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1".to_string());
+            ResolvedProviderConfig::Gemini(GeminiConfig {
+                api_key,
+                model: model.clone(),
+                api_base_url,
+            })
+        }
+        "openai" => {
+            let api_base_url = std::env::var("OPENAI_API_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            ResolvedProviderConfig::OpenAi {
+                api_key,
+                api_base_url,
+            }
+        }
+        "anthropic" => {
+            let api_base_url = std::env::var("ANTHROPIC_API_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
+            ResolvedProviderConfig::Anthropic {
+                api_key,
+                api_base_url,
+            }
+        }
+        _ => {
+            return Err(Box::new(std::io::Error::other(format!(
+                "provider '{}' is not supported in worker runtime yet",
+                provider
+            ))));
+        }
+    };
+
+    Ok(Some(ResolvedAiRuntime {
+        provider: provider.to_string(),
+        model,
+        cfg,
+    }))
+}
+
+async fn resolve_ai_runtime(
+    pool: &sqlx::MySqlPool,
+    tenant_id: &str,
+) -> Result<ResolvedAiRuntime, Error> {
+    let policy = fetch_tenant_ai_routing_policy(pool, tenant_id).await?;
+    let preferred_provider = policy
+        .as_ref()
+        .map(|p| p.default_provider.as_str())
+        .and_then(normalize_supported_provider)
+        .unwrap_or_else(|| "gemini".to_string());
+    if let Some(raw_default) = policy
+        .as_ref()
+        .map(|p| p.default_provider.trim().to_ascii_lowercase())
+    {
+        if !raw_default.is_empty() && normalize_supported_provider(&raw_default).is_none() {
+            return Err(Box::new(std::io::Error::other(format!(
+                "default provider '{}' is not supported in worker runtime yet",
+                raw_default
+            ))));
+        }
+    }
+
+    match resolve_runtime_from_active_setting(pool, tenant_id, &preferred_provider).await {
+        Ok(Some(runtime)) => Ok(runtime),
+        Ok(None) => Err(Box::new(std::io::Error::other(format!(
+            "missing active tenant {} provider config",
+            preferred_provider
+        )))),
+        Err(err) => Err(err),
+    }
+}
+
 fn parse_youtube_reporting_report_task_key(value: &str) -> Option<(String, String)> {
-  let (content_owner_id, report_id) = value.split_once(':')?;
-  if content_owner_id.is_empty() || report_id.is_empty() {
-    return None;
-  }
-  Some((content_owner_id.to_string(), report_id.to_string()))
+    let (content_owner_id, report_id) = value.split_once(':')?;
+    if content_owner_id.is_empty() || report_id.is_empty() {
+        return None;
+    }
+    Some((content_owner_id.to_string(), report_id.to_string()))
 }
 
 fn parse_video_ids_json(raw: &str) -> Vec<String> {
-  serde_json::from_str::<Vec<String>>(raw)
-    .unwrap_or_default()
-    .into_iter()
-    .map(|v| v.trim().to_string())
-    .filter(|v| !v.is_empty())
-    .collect()
+    serde_json::from_str::<Vec<String>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
 }
 
 fn json_string_field(payload: &serde_json::Value, key: &str) -> Option<String> {
-  payload
-    .get(key)
-    .and_then(|v| v.as_str())
-    .map(|v| v.trim().to_string())
-    .filter(|v| !v.is_empty())
+    payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct AggMetrics {
-  revenue_usd: f64,
-  impressions: i64,
-  ctr_num: f64,
-  ctr_denom: i64,
-  views: i64,
+    revenue_usd: f64,
+    impressions: i64,
+    ctr_num: f64,
+    ctr_denom: i64,
+    views: i64,
 }
 
 fn agg_ctr(m: AggMetrics) -> Option<f64> {
-  if m.ctr_denom > 0 {
-    Some(m.ctr_num / (m.ctr_denom as f64))
-  } else {
-    None
-  }
+    if m.ctr_denom > 0 {
+        Some(m.ctr_num / (m.ctr_denom as f64))
+    } else {
+        None
+    }
 }
 
 fn agg_rpm(m: AggMetrics) -> Option<f64> {
-  if m.views > 0 {
-    Some((m.revenue_usd / (m.views as f64)) * 1000.0)
-  } else {
-    None
-  }
+    if m.views > 0 {
+        Some((m.revenue_usd / (m.views as f64)) * 1000.0)
+    } else {
+        None
+    }
 }
 
 async fn aggregate_metrics_for_videos(
-  pool: &sqlx::MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  video_ids: &[String],
-  start_dt: NaiveDate,
-  end_dt: NaiveDate,
+    pool: &sqlx::MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    video_ids: &[String],
+    start_dt: NaiveDate,
+    end_dt: NaiveDate,
 ) -> Result<AggMetrics, Error> {
-  if start_dt > end_dt || video_ids.is_empty() {
-    return Ok(AggMetrics::default());
-  }
+    if start_dt > end_dt || video_ids.is_empty() {
+        return Ok(AggMetrics::default());
+    }
 
-  let mut qb = sqlx::QueryBuilder::<sqlx::MySql>::new(
-    r#"
+    let mut qb = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        r#"
       SELECT CAST(COALESCE(SUM(estimated_revenue_usd), 0) AS DOUBLE) AS revenue_usd,
              CAST(COALESCE(SUM(impressions), 0) AS SIGNED) AS impressions,
              CAST(COALESCE(SUM(impressions_ctr * impressions), 0) AS DOUBLE) AS ctr_num,
@@ -213,50 +648,50 @@ async fn aggregate_metrics_for_videos(
       FROM video_daily_metrics
       WHERE tenant_id =
     "#,
-  );
-  qb.push_bind(tenant_id);
-  qb.push(" AND channel_id = ");
-  qb.push_bind(channel_id);
-  qb.push(" AND dt BETWEEN ");
-  qb.push_bind(start_dt);
-  qb.push(" AND ");
-  qb.push_bind(end_dt);
-  qb.push(" AND video_id IN (");
-  {
-    let mut separated = qb.separated(", ");
-    for vid in video_ids {
-      separated.push_bind(vid);
+    );
+    qb.push_bind(tenant_id);
+    qb.push(" AND channel_id = ");
+    qb.push_bind(channel_id);
+    qb.push(" AND dt BETWEEN ");
+    qb.push_bind(start_dt);
+    qb.push(" AND ");
+    qb.push_bind(end_dt);
+    qb.push(" AND video_id IN (");
+    {
+        let mut separated = qb.separated(", ");
+        for vid in video_ids {
+            separated.push_bind(vid);
+        }
     }
-  }
-  qb.push(");");
+    qb.push(");");
 
-  let (revenue_usd, impressions, ctr_num, ctr_denom, views) = qb
-    .build_query_as::<(f64, i64, f64, i64, i64)>()
-    .fetch_one(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
+    let (revenue_usd, impressions, ctr_num, ctr_denom, views) = qb
+        .build_query_as::<(f64, i64, f64, i64, i64)>()
+        .fetch_one(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(AggMetrics {
-    revenue_usd,
-    impressions,
-    ctr_num,
-    ctr_denom,
-    views,
-  })
+    Ok(AggMetrics {
+        revenue_usd,
+        impressions,
+        ctr_num,
+        ctr_denom,
+        views,
+    })
 }
 
 async fn upsert_alert(
-  pool: &sqlx::MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  alert_key: &str,
-  kind: &str,
-  severity: &str,
-  message: &str,
-  details_json: Option<&str>,
+    pool: &sqlx::MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    alert_key: &str,
+    kind: &str,
+    severity: &str,
+    message: &str,
+    details_json: Option<&str>,
 ) -> Result<(), Error> {
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       INSERT INTO yt_alerts (
         tenant_id, channel_id, alert_key,
         kind, severity, message, details_json,
@@ -272,43 +707,43 @@ async fn upsert_alert(
         resolved_at = NULL,
         updated_at = CURRENT_TIMESTAMP(3);
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .bind(alert_key)
-  .bind(kind)
-  .bind(severity)
-  .bind(message)
-  .bind(details_json)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(tenant_id)
+    .bind(channel_id)
+    .bind(alert_key)
+    .bind(kind)
+    .bind(severity)
+    .bind(message)
+    .bind(details_json)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 async fn evaluate_running_experiments_for_channel(
-  pool: &sqlx::MySqlPool,
-  tenant_id: &str,
-  channel_id: &str,
-  access_token: &str,
-  run_for_dt: NaiveDate,
+    pool: &sqlx::MySqlPool,
+    tenant_id: &str,
+    channel_id: &str,
+    access_token: &str,
+    run_for_dt: NaiveDate,
 ) -> Result<(), Error> {
-  let last_complete_dt = run_for_dt - Duration::days(1);
+    let last_complete_dt = run_for_dt - Duration::days(1);
 
-  let rows = sqlx::query_as::<
-    _,
-    (
-      i64,
-      String,
-      String,
-      Option<f64>,
-      Option<i64>,
-      Option<DateTime<Utc>>,
-      Option<DateTime<Utc>>,
-    ),
-  >(
-    r#"
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            Option<f64>,
+            Option<i64>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+        ),
+    >(
+        r#"
       SELECT id, type, video_ids_json,
              stop_loss_pct, planned_duration_days,
              started_at, ended_at
@@ -319,144 +754,162 @@ async fn evaluate_running_experiments_for_channel(
       ORDER BY created_at DESC
       LIMIT 50;
     "#,
-  )
-  .bind(tenant_id)
-  .bind(channel_id)
-  .fetch_all(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
-
-  for (id, exp_type, video_ids_json, stop_loss_pct, planned_duration_days, started_at, ended_at) in rows {
-    let Some(started_at) = started_at else {
-      continue;
-    };
-
-    let video_ids = parse_video_ids_json(&video_ids_json);
-    if video_ids.len() != 1 {
-      continue;
-    }
-    let primary_video_id = video_ids[0].trim().to_string();
-
-    let start_dt = started_at.date_naive();
-    let baseline_start_dt = start_dt - Duration::days(7);
-    let baseline_end_dt = start_dt - Duration::days(1);
-    let ended_dt = ended_at.map(|dt| dt.date_naive());
-    let current_end_dt = ended_dt.unwrap_or(last_complete_dt).min(last_complete_dt);
-
-    let baseline = aggregate_metrics_for_videos(
-      pool,
-      tenant_id,
-      channel_id,
-      &video_ids,
-      baseline_start_dt,
-      baseline_end_dt,
     )
-    .await?;
-    let current =
-      aggregate_metrics_for_videos(pool, tenant_id, channel_id, &video_ids, start_dt, current_end_dt).await?;
+    .bind(tenant_id)
+    .bind(channel_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-    let (metric_name, baseline_metric, current_metric, sample_ok) = match exp_type.as_str() {
-      "publish_time" => {
-        let base = agg_rpm(baseline).unwrap_or(0.0);
-        let cur = agg_rpm(current).unwrap_or(0.0);
-        let ok = baseline.views >= 1000 && current.views >= 1000 && base > 0.0;
-        ("RPM", base, cur, ok)
-      }
-      _ => {
-        let base_opt = agg_ctr(baseline);
-        let cur_opt = agg_ctr(current);
-        let base = base_opt.unwrap_or(0.0);
-        let cur = cur_opt.unwrap_or(0.0);
-        let ok = baseline.impressions >= 5000
-          && current.impressions >= 5000
-          && baseline.ctr_denom > 0
-          && current.ctr_denom > 0
-          && base_opt.is_some()
-          && cur_opt.is_some()
-          && base > 0.0;
-        ("CTR", base, cur, ok)
-      }
-    };
+    for (
+        id,
+        exp_type,
+        video_ids_json,
+        stop_loss_pct,
+        planned_duration_days,
+        started_at,
+        ended_at,
+    ) in rows
+    {
+        let Some(started_at) = started_at else {
+            continue;
+        };
 
-    if !sample_ok {
-      continue;
-    }
+        let video_ids = parse_video_ids_json(&video_ids_json);
+        if video_ids.len() != 1 {
+            continue;
+        }
+        let primary_video_id = video_ids[0].trim().to_string();
 
-    let uplift = ((current_metric - baseline_metric) / baseline_metric).max(-1.0);
+        let start_dt = started_at.date_naive();
+        let baseline_start_dt = start_dt - Duration::days(7);
+        let baseline_end_dt = start_dt - Duration::days(1);
+        let ended_dt = ended_at.map(|dt| dt.date_naive());
+        let current_end_dt = ended_dt.unwrap_or(last_complete_dt).min(last_complete_dt);
 
-    let stop_loss_threshold = stop_loss_pct
-      .filter(|v| *v > 0.0)
-      .map(|v| -v / 100.0);
+        let baseline = aggregate_metrics_for_videos(
+            pool,
+            tenant_id,
+            channel_id,
+            &video_ids,
+            baseline_start_dt,
+            baseline_end_dt,
+        )
+        .await?;
+        let current = aggregate_metrics_for_videos(
+            pool,
+            tenant_id,
+            channel_id,
+            &video_ids,
+            start_dt,
+            current_end_dt,
+        )
+        .await?;
 
-    if stop_loss_threshold.is_some_and(|t| uplift <= t) {
-      let baseline_payload_json = sqlx::query_scalar::<_, String>(
-        r#"
+        let (metric_name, baseline_metric, current_metric, sample_ok) = match exp_type.as_str() {
+            "publish_time" => {
+                let base = agg_rpm(baseline).unwrap_or(0.0);
+                let cur = agg_rpm(current).unwrap_or(0.0);
+                let ok = baseline.views >= 1000 && current.views >= 1000 && base > 0.0;
+                ("RPM", base, cur, ok)
+            }
+            _ => {
+                let base_opt = agg_ctr(baseline);
+                let cur_opt = agg_ctr(current);
+                let base = base_opt.unwrap_or(0.0);
+                let cur = cur_opt.unwrap_or(0.0);
+                let ok = baseline.impressions >= 5000
+                    && current.impressions >= 5000
+                    && baseline.ctr_denom > 0
+                    && current.ctr_denom > 0
+                    && base_opt.is_some()
+                    && cur_opt.is_some()
+                    && base > 0.0;
+                ("CTR", base, cur, ok)
+            }
+        };
+
+        if !sample_ok {
+            continue;
+        }
+
+        let uplift = ((current_metric - baseline_metric) / baseline_metric).max(-1.0);
+
+        let stop_loss_threshold = stop_loss_pct.filter(|v| *v > 0.0).map(|v| -v / 100.0);
+
+        if stop_loss_threshold.is_some_and(|t| uplift <= t) {
+            let baseline_payload_json = sqlx::query_scalar::<_, String>(
+                r#"
           SELECT payload_json
           FROM yt_experiment_variants
           WHERE experiment_id = ?
             AND variant_id = 'A'
           LIMIT 1;
         "#,
-      )
-      .bind(id)
-      .fetch_optional(pool)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?;
-
-      let baseline_payload = baseline_payload_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .filter(|v| v.is_object())
-        .unwrap_or_else(|| serde_json::json!({}));
-
-      let rollback_err: Option<String> = match exp_type.as_str() {
-        "title" => match json_string_field(&baseline_payload, "title") {
-          None => Some("baseline variant A missing title".to_string()),
-          Some(title) => update_video_title(access_token, &primary_video_id, &title)
+            )
+            .bind(id)
+            .fetch_optional(pool)
             .await
-            .err()
-            .map(|e| e.to_string()),
-        },
-        "thumbnail" => match json_string_field(&baseline_payload, "thumbnail_url")
-          .or_else(|| json_string_field(&baseline_payload, "thumbnailUrl"))
-        {
-          None => Some("baseline variant A missing thumbnail_url".to_string()),
-          Some(url) => set_video_thumbnail_from_url(access_token, &primary_video_id, &url)
-            .await
-            .err()
-            .map(|e| e.to_string()),
-        },
-        "publish_time" => match json_string_field(&baseline_payload, "publish_at")
-          .or_else(|| json_string_field(&baseline_payload, "publishAt"))
-        {
-          None => Some("baseline variant A missing publish_at".to_string()),
-          Some(publish_at) => update_video_publish_at(access_token, &primary_video_id, &publish_at)
-            .await
-            .err()
-            .map(|e| e.to_string()),
-        },
-        _ => None,
-      };
+            .map_err(|e| -> Error { Box::new(e) })?;
 
-      let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
-      let updated = sqlx::query(
-        r#"
+            let baseline_payload = baseline_payload_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            let rollback_err: Option<String> = match exp_type.as_str() {
+                "title" => match json_string_field(&baseline_payload, "title") {
+                    None => Some("baseline variant A missing title".to_string()),
+                    Some(title) => update_video_title(access_token, &primary_video_id, &title)
+                        .await
+                        .err()
+                        .map(|e| e.to_string()),
+                },
+                "thumbnail" => match json_string_field(&baseline_payload, "thumbnail_url")
+                    .or_else(|| json_string_field(&baseline_payload, "thumbnailUrl"))
+                {
+                    None => Some("baseline variant A missing thumbnail_url".to_string()),
+                    Some(url) => {
+                        set_video_thumbnail_from_url(access_token, &primary_video_id, &url)
+                            .await
+                            .err()
+                            .map(|e| e.to_string())
+                    }
+                },
+                "publish_time" => match json_string_field(&baseline_payload, "publish_at")
+                    .or_else(|| json_string_field(&baseline_payload, "publishAt"))
+                {
+                    None => Some("baseline variant A missing publish_at".to_string()),
+                    Some(publish_at) => {
+                        update_video_publish_at(access_token, &primary_video_id, &publish_at)
+                            .await
+                            .err()
+                            .map(|e| e.to_string())
+                    }
+                },
+                _ => None,
+            };
+
+            let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
+            let updated = sqlx::query(
+                r#"
           UPDATE yt_experiments
           SET state = 'stopped',
               ended_at = CURRENT_TIMESTAMP(3),
               updated_at = CURRENT_TIMESTAMP(3)
           WHERE id = ? AND tenant_id = ? AND state = 'running';
         "#,
-      )
-      .bind(id)
-      .bind(tenant_id)
-      .execute(&mut *tx)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?;
+            )
+            .bind(id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?;
 
-      if updated.rows_affected() > 0 {
-        sqlx::query(
-          r#"
+            if updated.rows_affected() > 0 {
+                sqlx::query(
+                    r#"
             UPDATE yt_experiment_variants
             SET status = CASE
               WHEN variant_id = 'A' THEN 'won'
@@ -466,13 +919,13 @@ async fn evaluate_running_experiments_for_channel(
             updated_at = CURRENT_TIMESTAMP(3)
             WHERE experiment_id = ?;
           "#,
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| -> Error { Box::new(e) })?;
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| -> Error { Box::new(e) })?;
 
-        let mut msg = match metric_name {
+                let mut msg = match metric_name {
           "RPM" => format!(
             "Experiment exp_{id} stop-loss triggered: RPM {:+.0}% vs baseline (current ${:.2}, baseline ${:.2}; views {}/{}).",
             uplift * 100.0,
@@ -490,118 +943,130 @@ async fn evaluate_running_experiments_for_channel(
             baseline.impressions
           ),
         };
-        if let Some(err) = rollback_err.as_deref() {
-          msg.push_str(&format!(" Rollback failed: {err}"));
+                if let Some(err) = rollback_err.as_deref() {
+                    msg.push_str(&format!(" Rollback failed: {err}"));
+                }
+
+                tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
+
+                let severity = if rollback_err.is_some() {
+                    "error"
+                } else {
+                    "warning"
+                };
+                let _ = upsert_alert(
+                    pool,
+                    tenant_id,
+                    channel_id,
+                    &format!("exp_{id}_stoploss"),
+                    "Experiment stop-loss",
+                    severity,
+                    &msg,
+                    None,
+                )
+                .await;
+            } else {
+                tx.rollback().await.map_err(|e| -> Error { Box::new(e) })?;
+            }
+
+            continue;
         }
 
-        tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
+        if let Some(days) = planned_duration_days.filter(|v| *v > 0) {
+            let elapsed_days = if current_end_dt >= start_dt {
+                (current_end_dt - start_dt).num_days() + 1
+            } else {
+                0
+            };
 
-        let severity = if rollback_err.is_some() { "error" } else { "warning" };
-        let _ = upsert_alert(
-          pool,
-          tenant_id,
-          channel_id,
-          &format!("exp_{id}_stoploss"),
-          "Experiment stop-loss",
-          severity,
-          &msg,
-          None,
-        )
-        .await;
-      } else {
-        tx.rollback().await.map_err(|e| -> Error { Box::new(e) })?;
-      }
+            if elapsed_days >= days {
+                let (state, winner, loser) = if uplift >= 0.0 {
+                    ("won", "B", "A")
+                } else {
+                    ("lost", "A", "B")
+                };
 
-      continue;
-    }
-
-    if let Some(days) = planned_duration_days.filter(|v| *v > 0) {
-      let elapsed_days = if current_end_dt >= start_dt {
-        (current_end_dt - start_dt).num_days() + 1
-      } else {
-        0
-      };
-
-      if elapsed_days >= days {
-        let (state, winner, loser) = if uplift >= 0.0 {
-          ("won", "B", "A")
-        } else {
-          ("lost", "A", "B")
-        };
-
-        let baseline_payload_json = sqlx::query_scalar::<_, String>(
-          r#"
+                let baseline_payload_json = sqlx::query_scalar::<_, String>(
+                    r#"
             SELECT payload_json
             FROM yt_experiment_variants
             WHERE experiment_id = ?
               AND variant_id = 'A'
             LIMIT 1;
           "#,
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| -> Error { Box::new(e) })?;
-
-        let baseline_payload = baseline_payload_json
-          .as_deref()
-          .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-          .filter(|v| v.is_object())
-          .unwrap_or_else(|| serde_json::json!({}));
-
-        let rollback_err: Option<String> = if state == "lost" {
-          match exp_type.as_str() {
-            "title" => match json_string_field(&baseline_payload, "title") {
-              None => Some("baseline variant A missing title".to_string()),
-              Some(title) => update_video_title(access_token, &primary_video_id, &title)
+                )
+                .bind(id)
+                .fetch_optional(pool)
                 .await
-                .err()
-                .map(|e| e.to_string()),
-            },
-            "thumbnail" => match json_string_field(&baseline_payload, "thumbnail_url")
-              .or_else(|| json_string_field(&baseline_payload, "thumbnailUrl"))
-            {
-              None => Some("baseline variant A missing thumbnail_url".to_string()),
-              Some(url) => set_video_thumbnail_from_url(access_token, &primary_video_id, &url)
-                .await
-                .err()
-                .map(|e| e.to_string()),
-            },
-            "publish_time" => match json_string_field(&baseline_payload, "publish_at")
-              .or_else(|| json_string_field(&baseline_payload, "publishAt"))
-            {
-              None => Some("baseline variant A missing publish_at".to_string()),
-              Some(publish_at) => update_video_publish_at(access_token, &primary_video_id, &publish_at)
-                .await
-                .err()
-                .map(|e| e.to_string()),
-            },
-            _ => None,
-          }
-        } else {
-          None
-        };
+                .map_err(|e| -> Error { Box::new(e) })?;
 
-        let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
-        let updated = sqlx::query(
-          r#"
+                let baseline_payload = baseline_payload_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .filter(|v| v.is_object())
+                    .unwrap_or_else(|| serde_json::json!({}));
+
+                let rollback_err: Option<String> = if state == "lost" {
+                    match exp_type.as_str() {
+                        "title" => match json_string_field(&baseline_payload, "title") {
+                            None => Some("baseline variant A missing title".to_string()),
+                            Some(title) => {
+                                update_video_title(access_token, &primary_video_id, &title)
+                                    .await
+                                    .err()
+                                    .map(|e| e.to_string())
+                            }
+                        },
+                        "thumbnail" => match json_string_field(&baseline_payload, "thumbnail_url")
+                            .or_else(|| json_string_field(&baseline_payload, "thumbnailUrl"))
+                        {
+                            None => Some("baseline variant A missing thumbnail_url".to_string()),
+                            Some(url) => {
+                                set_video_thumbnail_from_url(access_token, &primary_video_id, &url)
+                                    .await
+                                    .err()
+                                    .map(|e| e.to_string())
+                            }
+                        },
+                        "publish_time" => match json_string_field(&baseline_payload, "publish_at")
+                            .or_else(|| json_string_field(&baseline_payload, "publishAt"))
+                        {
+                            None => Some("baseline variant A missing publish_at".to_string()),
+                            Some(publish_at) => update_video_publish_at(
+                                access_token,
+                                &primary_video_id,
+                                &publish_at,
+                            )
+                            .await
+                            .err()
+                            .map(|e| e.to_string()),
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
+                let updated = sqlx::query(
+                    r#"
             UPDATE yt_experiments
             SET state = ?,
                 ended_at = CURRENT_TIMESTAMP(3),
                 updated_at = CURRENT_TIMESTAMP(3)
             WHERE id = ? AND tenant_id = ? AND state = 'running';
           "#,
-        )
-        .bind(state)
-        .bind(id)
-        .bind(tenant_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| -> Error { Box::new(e) })?;
+                )
+                .bind(state)
+                .bind(id)
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| -> Error { Box::new(e) })?;
 
-        if updated.rows_affected() > 0 {
-          sqlx::query(
-            r#"
+                if updated.rows_affected() > 0 {
+                    sqlx::query(
+                        r#"
               UPDATE yt_experiment_variants
               SET status = CASE
                 WHEN variant_id = ? THEN 'won'
@@ -611,15 +1076,15 @@ async fn evaluate_running_experiments_for_channel(
               updated_at = CURRENT_TIMESTAMP(3)
               WHERE experiment_id = ?;
             "#,
-          )
-          .bind(winner)
-          .bind(loser)
-          .bind(id)
-          .execute(&mut *tx)
-          .await
-          .map_err(|e| -> Error { Box::new(e) })?;
+                    )
+                    .bind(winner)
+                    .bind(loser)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| -> Error { Box::new(e) })?;
 
-          let mut msg = match metric_name {
+                    let mut msg = match metric_name {
             "RPM" => format!(
               "Experiment exp_{id} finished: {winner} wins ({metric_name} {:+.0}% vs baseline; current ${:.2}, baseline ${:.2}).",
               uplift * 100.0,
@@ -633,92 +1098,96 @@ async fn evaluate_running_experiments_for_channel(
               baseline_metric * 100.0
             ),
           };
-          if let Some(err) = rollback_err.as_deref() {
-            msg.push_str(&format!(" Rollback failed: {err}"));
-          }
+                    if let Some(err) = rollback_err.as_deref() {
+                        msg.push_str(&format!(" Rollback failed: {err}"));
+                    }
 
-          tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
+                    tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
 
-          let severity = if rollback_err.is_some() { "error" } else { "info" };
-          let _ = upsert_alert(
-            pool,
-            tenant_id,
-            channel_id,
-            &format!("exp_{id}_result"),
-            "Experiment result",
-            severity,
-            &msg,
-            None,
-          )
-          .await;
-        } else {
-          tx.rollback().await.map_err(|e| -> Error { Box::new(e) })?;
+                    let severity = if rollback_err.is_some() {
+                        "error"
+                    } else {
+                        "info"
+                    };
+                    let _ = upsert_alert(
+                        pool,
+                        tenant_id,
+                        channel_id,
+                        &format!("exp_{id}_result"),
+                        "Experiment result",
+                        severity,
+                        &msg,
+                        None,
+                    )
+                    .await;
+                } else {
+                    tx.rollback().await.map_err(|e| -> Error { Box::new(e) })?;
+                }
+            }
         }
-      }
     }
-  }
 
-  Ok(())
+    Ok(())
 }
 
 fn youtube_reporting_created_after_rfc3339(
-  run_for_dt: chrono::NaiveDate,
-  backfill_days: i64,
+    run_for_dt: chrono::NaiveDate,
+    backfill_days: i64,
 ) -> String {
-  let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
-    run_for_dt.and_hms_opt(0, 0, 0).unwrap(),
-    Utc,
-  ) - chrono::Duration::days(backfill_days);
+    let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+        run_for_dt.and_hms_opt(0, 0, 0).unwrap(),
+        Utc,
+    ) - chrono::Duration::days(backfill_days);
 
-  dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 fn yt_reporting_wide_table_name(report_type_id: &str) -> String {
-  let base = globa_flux_rust::db::sanitize_sql_identifier(report_type_id);
-  let hash = sha2::Sha256::digest(report_type_id.as_bytes());
-  let suffix = format!("{:x}", hash);
-  let suffix8 = &suffix[..8];
+    let base = globa_flux_rust::db::sanitize_sql_identifier(report_type_id);
+    let hash = sha2::Sha256::digest(report_type_id.as_bytes());
+    let suffix = format!("{:x}", hash);
+    let suffix8 = &suffix[..8];
 
-  let mut name = format!("yt_rpt_{base}_{suffix8}");
-  if name.len() > 64 {
-    name.truncate(64);
-    while name.ends_with('_') {
-      name.pop();
+    let mut name = format!("yt_rpt_{base}_{suffix8}");
+    if name.len() > 64 {
+        name.truncate(64);
+        while name.ends_with('_') {
+            name.pop();
+        }
     }
-  }
-  name
+    name
 }
 
 fn maybe_gunzip_bytes(input: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-  use std::io::Read;
+    use std::io::Read;
 
-  let is_gzip = input.len() >= 2 && input[0] == 0x1f && input[1] == 0x8b;
-  if !is_gzip {
-    return Ok(input.to_vec());
-  }
+    let is_gzip = input.len() >= 2 && input[0] == 0x1f && input[1] == 0x8b;
+    if !is_gzip {
+        return Ok(input.to_vec());
+    }
 
-  let mut decoder = flate2::read::GzDecoder::new(input);
-  let mut out = Vec::new();
-  decoder.read_to_end(&mut out)?;
-  Ok(out)
+    let mut decoder = flate2::read::GzDecoder::new(input);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 fn parse_rfc3339_utc(value: Option<&str>) -> Option<chrono::DateTime<Utc>> {
-  let value = value?;
-  chrono::DateTime::parse_from_rfc3339(value)
-    .ok()
-    .map(|dt| dt.with_timezone(&Utc))
+    let value = value?;
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 async fn upsert_yt_reporting_wide_table_metadata(
-  pool: &sqlx::MySqlPool,
-  report_type_id: &str,
-  table_name: &str,
-  columns_json: &str,
-  parse_version: &str,
+    pool: &sqlx::MySqlPool,
+    report_type_id: &str,
+    table_name: &str,
+    columns_json: &str,
+    parse_version: &str,
 ) -> Result<(), Error> {
-  sqlx::query(
-    r#"
+    sqlx::query(
+        r#"
       INSERT INTO yt_reporting_wide_tables (report_type_id, table_name, columns_json, parse_version)
       VALUES (?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
@@ -727,26 +1196,26 @@ async fn upsert_yt_reporting_wide_table_metadata(
         parse_version = VALUES(parse_version),
         updated_at = CURRENT_TIMESTAMP(3);
     "#,
-  )
-  .bind(report_type_id)
-  .bind(table_name)
-  .bind(columns_json)
-  .bind(parse_version)
-  .execute(pool)
-  .await
-  .map_err(|e| -> Error { Box::new(e) })?;
+    )
+    .bind(report_type_id)
+    .bind(table_name)
+    .bind(columns_json)
+    .bind(parse_version)
+    .execute(pool)
+    .await
+    .map_err(|e| -> Error { Box::new(e) })?;
 
-  Ok(())
+    Ok(())
 }
 
 async fn ensure_yt_reporting_wide_table(
-  pool: &sqlx::MySqlPool,
-  table_name: &str,
-  columns: &[String],
+    pool: &sqlx::MySqlPool,
+    table_name: &str,
+    columns: &[String],
 ) -> Result<(), Error> {
-  let mut ddl = String::new();
-  ddl.push_str(&format!(
-    "CREATE TABLE IF NOT EXISTS `{table_name}` (\
+    let mut ddl = String::new();
+    ddl.push_str(&format!(
+        "CREATE TABLE IF NOT EXISTS `{table_name}` (\
       tenant_id VARCHAR(128) NOT NULL,\
       content_owner_id VARCHAR(128) NOT NULL,\
       report_type_id VARCHAR(256) NOT NULL,\
@@ -755,115 +1224,116 @@ async fn ensure_yt_reporting_wide_table(
       row_no BIGINT NOT NULL,\
       created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),\
       updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)"
-  ));
+    ));
 
-  for col in columns {
-    ddl.push_str(&format!(", `{}` LONGTEXT NULL", col));
-  }
+    for col in columns {
+        ddl.push_str(&format!(", `{}` LONGTEXT NULL", col));
+    }
 
-  ddl.push_str(
-    ", PRIMARY KEY (tenant_id, content_owner_id, report_id, row_no),\
+    ddl.push_str(
+        ", PRIMARY KEY (tenant_id, content_owner_id, report_id, row_no),\
        KEY idx_owner_type (tenant_id, content_owner_id, report_type_id)\
      );",
-  );
-
-  sqlx::query(&ddl)
-    .execute(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
-
-  for col in columns {
-    let alter = format!(
-      "ALTER TABLE `{table_name}` ADD COLUMN IF NOT EXISTS `{col}` LONGTEXT NULL;"
     );
-    sqlx::query(&alter)
-      .execute(pool)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?;
-  }
 
-  Ok(())
+    sqlx::query(&ddl)
+        .execute(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+
+    for col in columns {
+        let alter =
+            format!("ALTER TABLE `{table_name}` ADD COLUMN IF NOT EXISTS `{col}` LONGTEXT NULL;");
+        sqlx::query(&alter)
+            .execute(pool)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?;
+    }
+
+    Ok(())
 }
 
 async fn insert_yt_reporting_wide_rows_batch(
-  pool: &sqlx::MySqlPool,
-  table_name: &str,
-  columns: &[String],
-  tenant_id: &str,
-  content_owner_id: &str,
-  report_type_id: &str,
-  job_id: &str,
-  report_id: &str,
-  rows: &[(i64, Vec<Option<String>>)],
+    pool: &sqlx::MySqlPool,
+    table_name: &str,
+    columns: &[String],
+    tenant_id: &str,
+    content_owner_id: &str,
+    report_type_id: &str,
+    job_id: &str,
+    report_id: &str,
+    rows: &[(i64, Vec<Option<String>>)],
 ) -> Result<(), Error> {
-  if rows.is_empty() {
-    return Ok(());
-  }
-
-  let mut qb = sqlx::QueryBuilder::<sqlx::MySql>::new("INSERT INTO ");
-  qb.push(format!("`{table_name}`"));
-  qb.push(" (tenant_id, content_owner_id, report_type_id, job_id, report_id, row_no");
-  for col in columns {
-    qb.push(", `");
-    qb.push(col);
-    qb.push("`");
-  }
-  qb.push(") ");
-
-  qb.push_values(rows.iter(), |mut b, (row_no, values)| {
-    b.push_bind(tenant_id);
-    b.push_bind(content_owner_id);
-    b.push_bind(report_type_id);
-    b.push_bind(job_id);
-    b.push_bind(report_id);
-    b.push_bind(*row_no);
-    for idx in 0..columns.len() {
-      let v = values.get(idx).cloned().unwrap_or(None);
-      b.push_bind(v);
+    if rows.is_empty() {
+        return Ok(());
     }
-  });
 
-  qb.push(" ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP(3)");
-  qb.push(";");
+    let mut qb = sqlx::QueryBuilder::<sqlx::MySql>::new("INSERT INTO ");
+    qb.push(format!("`{table_name}`"));
+    qb.push(" (tenant_id, content_owner_id, report_type_id, job_id, report_id, row_no");
+    for col in columns {
+        qb.push(", `");
+        qb.push(col);
+        qb.push("`");
+    }
+    qb.push(") ");
 
-  qb.build()
-    .execute(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
+    qb.push_values(rows.iter(), |mut b, (row_no, values)| {
+        b.push_bind(tenant_id);
+        b.push_bind(content_owner_id);
+        b.push_bind(report_type_id);
+        b.push_bind(job_id);
+        b.push_bind(report_id);
+        b.push_bind(*row_no);
+        for idx in 0..columns.len() {
+            let v = values.get(idx).cloned().unwrap_or(None);
+            b.push_bind(v);
+        }
+    });
 
-  Ok(())
+    qb.push(" ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP(3)");
+    qb.push(";");
+
+    qb.build()
+        .execute(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DispatchSchedule {
-  Daily,
-  Weekly,
-  YoutubeReporting,
+    Daily,
+    Weekly,
+    YoutubeReporting,
 }
 
 impl DispatchSchedule {
-  fn from_query(query: Option<&str>) -> Self {
-    let value = query_value(query, "schedule").unwrap_or("");
-    match value {
-      "weekly" | "Weekly" | "WEEKLY" => DispatchSchedule::Weekly,
-      "youtube_reporting" | "youtubeReporting" | "YouTubeReporting" => DispatchSchedule::YoutubeReporting,
-      _ => DispatchSchedule::Daily,
+    fn from_query(query: Option<&str>) -> Self {
+        let value = query_value(query, "schedule").unwrap_or("");
+        match value {
+            "weekly" | "Weekly" | "WEEKLY" => DispatchSchedule::Weekly,
+            "youtube_reporting" | "youtubeReporting" | "YouTubeReporting" => {
+                DispatchSchedule::YoutubeReporting
+            }
+            _ => DispatchSchedule::Daily,
+        }
     }
-  }
 
-  fn job_type(&self) -> &'static str {
-    match self {
-      DispatchSchedule::Daily => "daily_channel",
-      DispatchSchedule::Weekly => "weekly_channel",
-      DispatchSchedule::YoutubeReporting => "youtube_reporting_owner",
+    fn job_type(&self) -> &'static str {
+        match self {
+            DispatchSchedule::Daily => "daily_channel",
+            DispatchSchedule::Weekly => "weekly_channel",
+            DispatchSchedule::YoutubeReporting => "youtube_reporting_owner",
+        }
     }
-  }
 }
 
 fn candidate_select_sql(schedule: DispatchSchedule, has_tenant_filter: bool) -> &'static str {
-  match (schedule, has_tenant_filter) {
-    (DispatchSchedule::YoutubeReporting, true) => {
-      r#"
+    match (schedule, has_tenant_filter) {
+        (DispatchSchedule::YoutubeReporting, true) => {
+            r#"
         SELECT DISTINCT tenant_id, content_owner_id
         FROM channel_connections
         WHERE tenant_id = ?
@@ -871,18 +1341,18 @@ fn candidate_select_sql(schedule: DispatchSchedule, has_tenant_filter: bool) -> 
           AND content_owner_id IS NOT NULL
           AND content_owner_id <> '';
       "#
-    }
-    (DispatchSchedule::YoutubeReporting, false) => {
-      r#"
+        }
+        (DispatchSchedule::YoutubeReporting, false) => {
+            r#"
         SELECT DISTINCT tenant_id, content_owner_id
         FROM channel_connections
         WHERE oauth_provider = 'youtube'
           AND content_owner_id IS NOT NULL
           AND content_owner_id <> '';
       "#
-    }
-    (_, true) => {
-      r#"
+        }
+        (_, true) => {
+            r#"
         SELECT tenant_id, channel_id
         FROM channel_connections
         WHERE tenant_id = ?
@@ -890,169 +1360,174 @@ fn candidate_select_sql(schedule: DispatchSchedule, has_tenant_filter: bool) -> 
           AND channel_id IS NOT NULL
           AND channel_id <> '';
       "#
-    }
-    (_, false) => {
-      r#"
+        }
+        (_, false) => {
+            r#"
         SELECT tenant_id, channel_id
         FROM channel_connections
         WHERE oauth_provider = 'youtube'
           AND channel_id IS NOT NULL
           AND channel_id <> '';
       "#
+        }
     }
-  }
 }
 
 #[derive(Deserialize)]
 struct DispatchRequest {
-  now_ms: i64,
-  #[serde(default)]
-  tenant_id: Option<String>,
-  #[serde(default)]
-  channel_id: Option<String>,
-  #[serde(default)]
-  run_for_dt: Option<String>,
-  #[serde(default)]
-  backfill_weeks: Option<i64>,
+    now_ms: i64,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    channel_id: Option<String>,
+    #[serde(default)]
+    run_for_dt: Option<String>,
+    #[serde(default)]
+    backfill_weeks: Option<i64>,
 }
 
 #[derive(Deserialize)]
 struct TickRequest {
-  now_ms: i64,
-  #[serde(default)]
-  limit: Option<i64>,
-  #[serde(default)]
-  tenant_id: Option<String>,
+    now_ms: i64,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct DecisionEngineConfigJson {
-  #[serde(default)]
-  min_days_with_data: Option<usize>,
-  #[serde(default)]
-  high_concentration_threshold: Option<f64>,
-  #[serde(default)]
-  trend_down_threshold_usd: Option<f64>,
-  #[serde(default)]
-  top_n_for_new_asset: Option<usize>,
+    #[serde(default)]
+    min_days_with_data: Option<usize>,
+    #[serde(default)]
+    high_concentration_threshold: Option<f64>,
+    #[serde(default)]
+    trend_down_threshold_usd: Option<f64>,
+    #[serde(default)]
+    top_n_for_new_asset: Option<usize>,
 }
 
 fn default_policy_params_json(cfg: &DecisionEngineConfig) -> String {
-  serde_json::json!({
-    "min_days_with_data": cfg.min_days_with_data,
-    "high_concentration_threshold": cfg.high_concentration_threshold,
-    "trend_down_threshold_usd": cfg.trend_down_threshold_usd,
-    "top_n_for_new_asset": cfg.top_n_for_new_asset,
-  })
-  .to_string()
+    serde_json::json!({
+      "min_days_with_data": cfg.min_days_with_data,
+      "high_concentration_threshold": cfg.high_concentration_threshold,
+      "trend_down_threshold_usd": cfg.trend_down_threshold_usd,
+      "top_n_for_new_asset": cfg.top_n_for_new_asset,
+    })
+    .to_string()
 }
 
 fn cfg_from_policy_params_json(raw: &str) -> Option<DecisionEngineConfig> {
-  let parsed: DecisionEngineConfigJson = serde_json::from_str(raw).ok()?;
-  let mut cfg = DecisionEngineConfig::default();
+    let parsed: DecisionEngineConfigJson = serde_json::from_str(raw).ok()?;
+    let mut cfg = DecisionEngineConfig::default();
 
-  if let Some(v) = parsed.min_days_with_data {
-    cfg.min_days_with_data = v;
-  }
-  if let Some(v) = parsed.high_concentration_threshold {
-    cfg.high_concentration_threshold = v;
-  }
-  if let Some(v) = parsed.trend_down_threshold_usd {
-    cfg.trend_down_threshold_usd = v;
-  }
-  if let Some(v) = parsed.top_n_for_new_asset {
-    cfg.top_n_for_new_asset = v;
-  }
+    if let Some(v) = parsed.min_days_with_data {
+        cfg.min_days_with_data = v;
+    }
+    if let Some(v) = parsed.high_concentration_threshold {
+        cfg.high_concentration_threshold = v;
+    }
+    if let Some(v) = parsed.trend_down_threshold_usd {
+        cfg.trend_down_threshold_usd = v;
+    }
+    if let Some(v) = parsed.top_n_for_new_asset {
+        cfg.top_n_for_new_asset = v;
+    }
 
-  Some(cfg)
+    Some(cfg)
 }
 
 async fn handle_dispatch(
-  schedule: DispatchSchedule,
-  force: bool,
-  method: &Method,
-  headers: &HeaderMap,
-  body: Bytes,
+    schedule: DispatchSchedule,
+    force: bool,
+    method: &Method,
+    headers: &HeaderMap,
+    body: Bytes,
 ) -> Result<Response<ResponseBody>, Error> {
-  if method != Method::POST {
-    return json_response(
-      StatusCode::METHOD_NOT_ALLOWED,
-      serde_json::json!({"ok": false, "error": "method_not_allowed"}),
-    );
-  }
-
-  let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
-  let provided = bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
-
-  if expected.is_empty() || provided != expected {
-    return json_response(
-      StatusCode::UNAUTHORIZED,
-      serde_json::json!({"ok": false, "error": "unauthorized"}),
-    );
-  }
-
-  if !has_tidb_url() {
-    return json_response(
-      StatusCode::NOT_IMPLEMENTED,
-      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
-    );
-  }
-
-  let parsed: DispatchRequest = match serde_json::from_slice(&body) {
-    Ok(v) => v,
-    Err(e) => {
-      return json_response(
-        StatusCode::BAD_REQUEST,
-        serde_json::json!({"ok": false, "error": "bad_request", "message": format!("invalid json body: {e}")}),
-      );
+    if method != Method::POST {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
     }
-  };
 
-  if parsed.now_ms <= 0 {
-    return json_response(
-      StatusCode::BAD_REQUEST,
-      serde_json::json!({"ok": false, "error": "bad_request", "message": "now_ms is required"}),
-    );
-  }
+    let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
 
-  let now = Utc
-    .timestamp_millis_opt(parsed.now_ms)
-    .single()
-    .unwrap_or_else(Utc::now);
-  let run_for_dt = parsed
-    .run_for_dt
-    .as_deref()
-    .map(str::trim)
-    .filter(|v| !v.is_empty())
-    .map(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d"))
-    .transpose()
-    .map_err(|e| -> Error { Box::new(std::io::Error::other(format!("invalid run_for_dt: {e}"))) })?
-    .unwrap_or_else(|| now.date_naive());
+    if expected.is_empty() || provided != expected {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"ok": false, "error": "unauthorized"}),
+        );
+    }
 
-  let pool = get_pool().await?;
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
 
-  let tenant_filter = parsed
-    .tenant_id
-    .as_deref()
-    .map(str::trim)
-    .filter(|v| !v.is_empty())
-    .map(str::to_string);
+    let parsed: DispatchRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"ok": false, "error": "bad_request", "message": format!("invalid json body: {e}")}),
+            );
+        }
+    };
 
-  let channel_filter = parsed
-    .channel_id
-    .as_deref()
-    .map(str::trim)
-    .filter(|v| !v.is_empty())
-    .map(str::to_string);
+    if parsed.now_ms <= 0 {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "now_ms is required"}),
+        );
+    }
 
-  let channels: Vec<(String, String)> = if let Some(channel_id) = channel_filter.as_deref() {
-    let tenant_id = tenant_filter.as_deref().ok_or_else(|| {
-      Box::new(std::io::Error::other("tenant_id is required when channel_id is provided")) as Error
-    })?;
+    let now = Utc
+        .timestamp_millis_opt(parsed.now_ms)
+        .single()
+        .unwrap_or_else(Utc::now);
+    let run_for_dt = parsed
+        .run_for_dt
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d"))
+        .transpose()
+        .map_err(|e| -> Error {
+            Box::new(std::io::Error::other(format!("invalid run_for_dt: {e}")))
+        })?
+        .unwrap_or_else(|| now.date_naive());
 
-    let exists: Option<i64> = if schedule == DispatchSchedule::YoutubeReporting {
-      sqlx::query_scalar(
-        r#"
+    let pool = get_pool().await?;
+
+    let tenant_filter = parsed
+        .tenant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+
+    let channel_filter = parsed
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+
+    let channels: Vec<(String, String)> = if let Some(channel_id) = channel_filter.as_deref() {
+        let tenant_id = tenant_filter.as_deref().ok_or_else(|| {
+            Box::new(std::io::Error::other(
+                "tenant_id is required when channel_id is provided",
+            )) as Error
+        })?;
+
+        let exists: Option<i64> = if schedule == DispatchSchedule::YoutubeReporting {
+            sqlx::query_scalar(
+                r#"
           SELECT 1
           FROM channel_connections
           WHERE tenant_id = ?
@@ -1060,15 +1535,15 @@ async fn handle_dispatch(
             AND content_owner_id = ?
           LIMIT 1;
         "#,
-      )
-      .bind(tenant_id)
-      .bind(channel_id)
-      .fetch_optional(pool)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?
-    } else {
-      sqlx::query_scalar(
-        r#"
+            )
+            .bind(tenant_id)
+            .bind(channel_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?
+        } else {
+            sqlx::query_scalar(
+                r#"
           SELECT 1
           FROM channel_connections
           WHERE tenant_id = ?
@@ -1076,82 +1551,79 @@ async fn handle_dispatch(
             AND channel_id = ?
           LIMIT 1;
         "#,
-      )
-      .bind(tenant_id)
-      .bind(channel_id)
-      .fetch_optional(pool)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?
+            )
+            .bind(tenant_id)
+            .bind(channel_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?
+        };
+
+        if exists.is_none() {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"ok": false, "error": "not_connected", "message": "No matching YouTube connection for tenant/channel"}),
+            );
+        }
+
+        vec![(tenant_id.to_string(), channel_id.to_string())]
+    } else if let Some(tenant_id) = tenant_filter.as_deref() {
+        sqlx::query_as(candidate_select_sql(schedule, true))
+            .bind(tenant_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?
+    } else {
+        sqlx::query_as(candidate_select_sql(schedule, false))
+            .fetch_all(pool)
+            .await
+            .map_err(|e| -> Error { Box::new(e) })?
     };
 
-    if exists.is_none() {
-      return json_response(
-        StatusCode::NOT_FOUND,
-        serde_json::json!({"ok": false, "error": "not_connected", "message": "No matching YouTube connection for tenant/channel"}),
-      );
-    }
+    let job_type = schedule.job_type();
+    let mut enqueued: usize = 0;
+    let backfill_weeks = parsed.backfill_weeks.unwrap_or(0).clamp(0, 52);
 
-    vec![(tenant_id.to_string(), channel_id.to_string())]
-  } else if let Some(tenant_id) = tenant_filter.as_deref() {
-    sqlx::query_as(candidate_select_sql(schedule, true))
-      .bind(tenant_id)
-      .fetch_all(pool)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?
-  } else {
-    sqlx::query_as(candidate_select_sql(schedule, false))
-      .fetch_all(pool)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?
-  };
+    for (tenant_id, channel_id) in channels.iter() {
+        let mut run_for_dts: Vec<chrono::NaiveDate> = vec![run_for_dt];
 
-  let job_type = schedule.job_type();
-  let mut enqueued: usize = 0;
-  let backfill_weeks = parsed
-    .backfill_weeks
-    .unwrap_or(0)
-    .clamp(0, 52);
-
-  for (tenant_id, channel_id) in channels.iter() {
-    let mut run_for_dts: Vec<chrono::NaiveDate> = vec![run_for_dt];
-
-    // First sync should backfill enough history for baseline comparisons + reports.
-    // Only do this when the channel has no metrics yet.
-    if schedule == DispatchSchedule::Daily {
-      if backfill_weeks > 1 {
-        // Insert newest first so the worker processes current data first (ORDER BY id ASC).
-        run_for_dts = (0..backfill_weeks)
-          .map(|i| run_for_dt - Duration::days((i * 7) as i64))
-          .collect();
-      } else {
-      let max_dt: Option<chrono::NaiveDate> = sqlx::query_scalar(
-        r#"
+        // First sync should backfill enough history for baseline comparisons + reports.
+        // Only do this when the channel has no metrics yet.
+        if schedule == DispatchSchedule::Daily {
+            if backfill_weeks > 1 {
+                // Insert newest first so the worker processes current data first (ORDER BY id ASC).
+                run_for_dts = (0..backfill_weeks)
+                    .map(|i| run_for_dt - Duration::days((i * 7) as i64))
+                    .collect();
+            } else {
+                let max_dt: Option<chrono::NaiveDate> = sqlx::query_scalar(
+                    r#"
           SELECT MAX(dt) AS max_dt
           FROM video_daily_metrics
           WHERE tenant_id = ? AND channel_id = ?;
         "#,
-      )
-      .bind(tenant_id)
-      .bind(channel_id)
-      .fetch_one(pool)
-      .await
-      .unwrap_or(None);
+                )
+                .bind(tenant_id)
+                .bind(channel_id)
+                .fetch_one(pool)
+                .await
+                .unwrap_or(None);
 
-      if max_dt.is_none() {
-        // Insert newest first so the worker processes current data first (ORDER BY id ASC).
-        run_for_dts = (0..4)
-          .map(|i| run_for_dt - Duration::days((i * 7) as i64))
-          .collect();
-      }
-      }
-    }
+                if max_dt.is_none() {
+                    // Insert newest first so the worker processes current data first (ORDER BY id ASC).
+                    run_for_dts = (0..4)
+                        .map(|i| run_for_dt - Duration::days((i * 7) as i64))
+                        .collect();
+                }
+            }
+        }
 
-    for run_for_dt in run_for_dts.into_iter() {
-      enqueued += 1;
-      let dedupe_key = format!("{tenant_id}:{job_type}:{channel_id}:{run_for_dt}");
+        for run_for_dt in run_for_dts.into_iter() {
+            enqueued += 1;
+            let dedupe_key = format!("{tenant_id}:{job_type}:{channel_id}:{run_for_dt}");
 
-      if force {
-        sqlx::query(
+            if force {
+                sqlx::query(
         r#"
           INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status, attempt, max_attempt, run_after)
           VALUES (?, ?, ?, ?, ?, 'pending', 0, 3, ?)
@@ -1197,8 +1669,8 @@ async fn handle_dispatch(
         .execute(pool)
         .await
         .map_err(|e| -> Error { Box::new(e) })?;
-      } else {
-        sqlx::query(
+            } else {
+                sqlx::query(
         r#"
           INSERT INTO job_tasks (tenant_id, job_type, channel_id, run_for_dt, dedupe_key, status, attempt, max_attempt, run_after)
           VALUES (?, ?, ?, ?, ?, 'pending', 0, 3, ?)
@@ -1244,89 +1716,94 @@ async fn handle_dispatch(
         .execute(pool)
         .await
         .map_err(|e| -> Error { Box::new(e) })?;
-      }
+            }
+        }
     }
-  }
 
-  json_response(
-    StatusCode::OK,
-    serde_json::json!({
-      "ok": true,
-      "tenant_id": tenant_filter,
-      "job_type": job_type,
-      "run_for_dt": run_for_dt.to_string(),
-      "force": force,
-      "candidates": channels.len(),
-      "enqueued": enqueued
-    }),
-  )
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+          "ok": true,
+          "tenant_id": tenant_filter,
+          "job_type": job_type,
+          "run_for_dt": run_for_dt.to_string(),
+          "force": force,
+          "candidates": channels.len(),
+          "enqueued": enqueued
+        }),
+    )
 }
 
-async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Result<Response<ResponseBody>, Error> {
-  if method != Method::POST {
-    return json_response(
-      StatusCode::METHOD_NOT_ALLOWED,
-      serde_json::json!({"ok": false, "error": "method_not_allowed"}),
-    );
-  }
-
-  let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
-  let provided = bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
-
-  if expected.is_empty() || provided != expected {
-    return json_response(
-      StatusCode::UNAUTHORIZED,
-      serde_json::json!({"ok": false, "error": "unauthorized"}),
-    );
-  }
-
-  if !has_tidb_url() {
-    return json_response(
-      StatusCode::NOT_IMPLEMENTED,
-      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
-    );
-  }
-
-  let parsed: TickRequest = match serde_json::from_slice(&body) {
-    Ok(v) => v,
-    Err(e) => {
-      return json_response(
-        StatusCode::BAD_REQUEST,
-        serde_json::json!({"ok": false, "error": "bad_request", "message": format!("invalid json body: {e}")}),
-      );
+async fn handle_tick(
+    method: &Method,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response<ResponseBody>, Error> {
+    if method != Method::POST {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
     }
-  };
 
-  if parsed.now_ms <= 0 {
-    return json_response(
-      StatusCode::BAD_REQUEST,
-      serde_json::json!({"ok": false, "error": "bad_request", "message": "now_ms is required"}),
-    );
-  }
+    let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
 
-  let limit = parsed.limit.unwrap_or(10).clamp(1, 50) as i64;
-  let tenant_filter = parsed
-    .tenant_id
-    .as_deref()
-    .map(str::trim)
-    .filter(|v| !v.is_empty());
+    if expected.is_empty() || provided != expected {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"ok": false, "error": "unauthorized"}),
+        );
+    }
 
-  let now = Utc
-    .timestamp_millis_opt(parsed.now_ms)
-    .single()
-    .unwrap_or_else(Utc::now);
-  let pool = get_pool().await?;
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
 
-  let lock_ttl_secs: i64 = std::env::var("JOB_TASK_LOCK_TTL_SECS")
-    .ok()
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(600)
-    .clamp(60, 3600);
-  let stale_before = now - Duration::seconds(lock_ttl_secs);
+    let parsed: TickRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"ok": false, "error": "bad_request", "message": format!("invalid json body: {e}")}),
+            );
+        }
+    };
 
-  let reclaimed = if let Some(tenant_id) = tenant_filter {
-    sqlx::query(
-      r#"
+    if parsed.now_ms <= 0 {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "now_ms is required"}),
+        );
+    }
+
+    let limit = parsed.limit.unwrap_or(10).clamp(1, 50) as i64;
+    let tenant_filter = parsed
+        .tenant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    let now = Utc
+        .timestamp_millis_opt(parsed.now_ms)
+        .single()
+        .unwrap_or_else(Utc::now);
+    let pool = get_pool().await?;
+
+    let lock_ttl_secs: i64 = std::env::var("JOB_TASK_LOCK_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600)
+        .clamp(60, 3600);
+    let stale_before = now - Duration::seconds(lock_ttl_secs);
+
+    let reclaimed = if let Some(tenant_id) = tenant_filter {
+        sqlx::query(
+            r#"
         UPDATE job_tasks
         SET status='retrying', run_after=?, locked_by=NULL, locked_at=NULL
         WHERE tenant_id = ?
@@ -1334,37 +1811,44 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
           AND locked_at IS NOT NULL
           AND locked_at < ?;
       "#,
-    )
-    .bind(now)
-    .bind(tenant_id)
-    .bind(stale_before)
-    .execute(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?
-    .rows_affected()
-  } else {
-    sqlx::query(
-      r#"
+        )
+        .bind(now)
+        .bind(tenant_id)
+        .bind(stale_before)
+        .execute(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?
+        .rows_affected()
+    } else {
+        sqlx::query(
+            r#"
         UPDATE job_tasks
         SET status='retrying', run_after=?, locked_by=NULL, locked_at=NULL
         WHERE status='running' AND locked_at IS NOT NULL AND locked_at < ?;
       "#,
-    )
-    .bind(now)
-    .bind(stale_before)
-    .execute(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?
-    .rows_affected()
-  };
+        )
+        .bind(now)
+        .bind(stale_before)
+        .execute(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?
+        .rows_affected()
+    };
 
-  let worker_id = worker_id();
+    let worker_id = worker_id();
 
-  let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
-  let claimed: Vec<(i64, String, String, String, Option<chrono::NaiveDate>, i32, i32)> =
-    if let Some(tenant_id) = tenant_filter {
-      sqlx::query_as(
-        r#"
+    let mut tx = pool.begin().await.map_err(|e| -> Error { Box::new(e) })?;
+    let claimed: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        Option<chrono::NaiveDate>,
+        i32,
+        i32,
+    )> = if let Some(tenant_id) = tenant_filter {
+        sqlx::query_as(
+            r#"
           SELECT id, tenant_id, job_type, channel_id, run_for_dt, attempt, max_attempt
           FROM job_tasks
           WHERE tenant_id = ?
@@ -1374,16 +1858,16 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
           LIMIT ?
           FOR UPDATE;
         "#,
-      )
-      .bind(tenant_id)
-      .bind(now)
-      .bind(limit)
-      .fetch_all(&mut *tx)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?
+        )
+        .bind(tenant_id)
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?
     } else {
-      sqlx::query_as(
-        r#"
+        sqlx::query_as(
+            r#"
           SELECT id, tenant_id, job_type, channel_id, run_for_dt, attempt, max_attempt
           FROM job_tasks
           WHERE status IN ('pending','retrying')
@@ -1392,206 +1876,206 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
           LIMIT ?
           FOR UPDATE;
         "#,
-      )
-      .bind(now)
-      .bind(limit)
-      .fetch_all(&mut *tx)
-      .await
-      .map_err(|e| -> Error { Box::new(e) })?
+        )
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?
     };
 
-  for (id, _tenant_id, _job_type, _channel_id, _run_for_dt, _attempt, _max_attempt) in claimed.iter() {
-    sqlx::query(
-      r#"
+    for (id, _tenant_id, _job_type, _channel_id, _run_for_dt, _attempt, _max_attempt) in
+        claimed.iter()
+    {
+        sqlx::query(
+            r#"
         UPDATE job_tasks
         SET status='running', attempt=attempt+1, locked_by=?, locked_at=?
         WHERE id=?;
       "#,
-    )
-    .bind(&worker_id)
-    .bind(now)
-    .bind(id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?;
-  }
+        )
+        .bind(&worker_id)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?;
+    }
 
-  tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
+    tx.commit().await.map_err(|e| -> Error { Box::new(e) })?;
 
-  let mut succeeded = 0usize;
-  let mut retried = 0usize;
-  let mut dead = 0usize;
-  let mut last_error: Option<String> = None;
+    let mut succeeded = 0usize;
+    let mut retried = 0usize;
+    let mut dead = 0usize;
+    let mut last_error: Option<String> = None;
 
-  for (id, tenant_id, job_type, channel_id, run_for_dt, attempt, max_attempt) in claimed.iter() {
-    let attempt_next = attempt.saturating_add(1);
+    for (id, tenant_id, job_type, channel_id, run_for_dt, attempt, max_attempt) in claimed.iter() {
+        let attempt_next = attempt.saturating_add(1);
 
-    let result: Result<(), Error> = match job_type.as_str() {
-      "geo_monitor_prompt" => {
-        (|| async {
-          let run_for_dt = run_for_dt.ok_or_else(|| {
-            Box::new(std::io::Error::other("geo_monitor_prompt task missing run_for_dt")) as Error
-          })?;
+        let result: Result<(), Error> = match job_type.as_str() {
+            "geo_monitor_prompt" => {
+                (|| async {
+                    let run_for_dt = run_for_dt.ok_or_else(|| {
+                        Box::new(std::io::Error::other(
+                            "geo_monitor_prompt task missing run_for_dt",
+                        )) as Error
+                    })?;
 
-          let mut parts = channel_id.split(':');
-          let project_id: i64 = parts
-            .next()
-            .unwrap_or("")
-            .parse()
-            .map_err(|_| Box::new(std::io::Error::other("geo_monitor_prompt invalid project_id")) as Error)?;
-          let prompt_id: i64 = parts
-            .next()
-            .unwrap_or("")
-            .parse()
-            .map_err(|_| Box::new(std::io::Error::other("geo_monitor_prompt invalid prompt_id")) as Error)?;
+                    let mut parts = channel_id.split(':');
+                    let project_id: i64 = parts.next().unwrap_or("").parse().map_err(|_| {
+                        Box::new(std::io::Error::other(
+                            "geo_monitor_prompt invalid project_id",
+                        )) as Error
+                    })?;
+                    let prompt_id: i64 = parts.next().unwrap_or("").parse().map_err(|_| {
+                        Box::new(std::io::Error::other(
+                            "geo_monitor_prompt invalid prompt_id",
+                        )) as Error
+                    })?;
 
-          let project = fetch_geo_monitor_project(pool, tenant_id, project_id)
-            .await?
-            .ok_or_else(|| Box::new(std::io::Error::other("missing geo monitor project")) as Error)?;
-          let prompt = fetch_geo_monitor_prompt(pool, tenant_id, project_id, prompt_id)
-            .await?
-            .ok_or_else(|| Box::new(std::io::Error::other("missing geo monitor prompt")) as Error)?;
+                    let project = fetch_geo_monitor_project(pool, tenant_id, project_id)
+                        .await?
+                        .ok_or_else(|| {
+                            Box::new(std::io::Error::other("missing geo monitor project")) as Error
+                        })?;
+                    let prompt = fetch_geo_monitor_prompt(pool, tenant_id, project_id, prompt_id)
+                        .await?
+                        .ok_or_else(|| {
+                            Box::new(std::io::Error::other("missing geo monitor prompt")) as Error
+                        })?;
 
-          let prompt_total: i32 = sqlx::query_scalar(
-            r#"
+                    let prompt_total: i32 = sqlx::query_scalar(
+                        r#"
               SELECT COUNT(*) FROM geo_monitor_prompts
               WHERE tenant_id = ? AND project_id = ? AND enabled = 1;
             "#,
-          )
-          .bind(tenant_id)
-          .bind(project_id)
-          .fetch_one(pool)
-          .await
-          .map_err(|e| -> Error { Box::new(e) })?;
+                    )
+                    .bind(tenant_id)
+                    .bind(project_id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| -> Error { Box::new(e) })?;
 
-          let mut gemini_cfg = GeminiConfig::from_env_optional()?
-            .ok_or_else(|| Box::new(std::io::Error::other("Missing GEMINI_API_KEY")) as Error)?;
+                    let resolved = resolve_ai_runtime(pool, tenant_id).await?;
+                    let provider = resolved.provider.clone();
+                    let model = resolved.model.clone();
 
-          let db_model = fetch_tenant_gemini_model(pool, GLOBAL_TENANT_ID).await?;
-          let model = db_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-              Box::new(std::io::Error::other("Missing gemini_model for tenant_id=global")) as Error
-            })?;
+                    let run = ensure_geo_monitor_run(
+                        pool,
+                        tenant_id,
+                        project_id,
+                        run_for_dt,
+                        &provider,
+                        &model,
+                        prompt_total,
+                    )
+                    .await?;
 
-          gemini_cfg.model = model.to_string();
+                    let aliases = parse_string_list_json(project.brand_aliases_json.as_deref());
+                    let needles = normalize_aliases(&project.name, aliases.as_slice());
 
-          let run = ensure_geo_monitor_run(
-            pool,
-            tenant_id,
-            project_id,
-            run_for_dt,
-            "gemini",
-            model,
-            prompt_total,
-          )
-          .await?;
+                    let system = "You are a helpful assistant.";
+                    let temperature = 0.2;
+                    let max_output_tokens: u32 = 1024;
 
-          let aliases = parse_string_list_json(project.brand_aliases_json.as_deref());
-          let needles = normalize_aliases(&project.name, aliases.as_slice());
+                    let idempotency_key = format!(
+                        "{tenant_id}:geo_monitor_prompt:{project_id}:{run_for_dt}:{prompt_id}"
+                    );
 
-          let system = "You are a helpful assistant.";
-          let temperature = 0.2;
-          let max_output_tokens: u32 = 1024;
+                    let pricing = pricing_for_resolved_runtime(&resolved);
 
-          let idempotency_key =
-            format!("{tenant_id}:geo_monitor_prompt:{project_id}:{run_for_dt}:{prompt_id}");
+                    match generate_text_for_runtime(
+                        &resolved,
+                        system,
+                        &prompt.prompt_text,
+                        temperature,
+                        max_output_tokens,
+                        Some(&idempotency_key),
+                    )
+                    .await
+                    {
+                        Ok((text, usage)) => {
+                            let presence = contains_any_case_insensitive(&text, needles.as_slice());
+                            let rank = extract_rank_from_markdown_list(&text, needles.as_slice());
 
-          let provider = "gemini";
-          let pricing = gemini_pricing_for_model(model);
+                            let cost_usd = pricing
+                                .map(|p| {
+                                    compute_cost_usd(
+                                        p,
+                                        usage.prompt_tokens as u32,
+                                        usage.completion_tokens as u32,
+                                    )
+                                })
+                                .unwrap_or(0.0);
 
-          match gemini_generate_text(
-            &gemini_cfg,
-            system,
-            &prompt.prompt_text,
-            temperature,
-            max_output_tokens,
-          )
-          .await
-          {
-            Ok((text, usage)) => {
-              let presence = contains_any_case_insensitive(&text, needles.as_slice());
-              let rank = extract_rank_from_markdown_list(&text, needles.as_slice());
+                            if let Err(err) = insert_usage_event(
+                                pool,
+                                tenant_id,
+                                "geo_monitor_prompt",
+                                &idempotency_key,
+                                &provider,
+                                &model,
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                                cost_usd,
+                            )
+                            .await
+                            {
+                                if err
+                                    .as_database_error()
+                                    .is_some_and(|e| e.is_unique_violation())
+                                {
+                                    // idempotent replay: ignore
+                                } else {
+                                    return Err(Box::new(err) as Error);
+                                }
+                            }
 
-              let (prompt_tokens, completion_tokens, cost_usd) = if let (Some(u), Some(p)) = (usage, pricing) {
-                let cost = compute_cost_usd(p, u.prompt_tokens as u32, u.completion_tokens as u32);
-                (u.prompt_tokens, u.completion_tokens, cost)
-              } else {
-                (0, 0, 0.0)
-              };
+                            let _ = insert_geo_monitor_run_result(
+                                pool,
+                                tenant_id,
+                                project_id,
+                                run_for_dt,
+                                run.id,
+                                prompt_id,
+                                &prompt.prompt_text,
+                                Some(&text),
+                                presence,
+                                rank,
+                                cost_usd,
+                                None,
+                            )
+                            .await?;
+                            let _ = finalize_geo_monitor_run_if_complete(pool, run.id).await?;
 
-              if prompt_tokens > 0 || completion_tokens > 0 {
-                if let Err(err) = insert_usage_event(
-                  pool,
-                  tenant_id,
-                  "geo_monitor_prompt",
-                  &idempotency_key,
-                  provider,
-                  model,
-                  prompt_tokens,
-                  completion_tokens,
-                  cost_usd,
-                )
+                            Ok(())
+                        }
+                        Err(err) => {
+                            let msg = truncate_string(&err.to_string(), 2000);
+                            let _ = insert_geo_monitor_run_result(
+                                pool,
+                                tenant_id,
+                                project_id,
+                                run_for_dt,
+                                run.id,
+                                prompt_id,
+                                &prompt.prompt_text,
+                                None,
+                                false,
+                                None,
+                                0.0,
+                                Some(&msg),
+                            )
+                            .await?;
+                            let _ = finalize_geo_monitor_run_if_complete(pool, run.id).await?;
+                            Ok(())
+                        }
+                    }
+                })()
                 .await
-                {
-                  if err
-                    .as_database_error()
-                    .is_some_and(|e| e.is_unique_violation())
-                  {
-                    // idempotent replay: ignore
-                  } else {
-                    return Err(Box::new(err) as Error);
-                  }
-                }
-              }
-
-              let _ = insert_geo_monitor_run_result(
-                pool,
-                tenant_id,
-                project_id,
-                run_for_dt,
-                run.id,
-                prompt_id,
-                &prompt.prompt_text,
-                Some(&text),
-                presence,
-                rank,
-                cost_usd,
-                None,
-              )
-              .await?;
-              let _ = finalize_geo_monitor_run_if_complete(pool, run.id).await?;
-
-              Ok(())
             }
-            Err(err) => {
-              let msg = truncate_string(&err.to_string(), 2000);
-              let _ = insert_geo_monitor_run_result(
-                pool,
-                tenant_id,
-                project_id,
-                run_for_dt,
-                run.id,
-                prompt_id,
-                &prompt.prompt_text,
-                None,
-                false,
-                None,
-                0.0,
-                Some(&msg),
-              )
-              .await?;
-              let _ = finalize_geo_monitor_run_if_complete(pool, run.id).await?;
-              Ok(())
-            }
-          }
-        })()
-        .await
-      }
-      "daily_channel" => {
-        (|| async {
+            "daily_channel" => {
+                (|| async {
           let run_for_dt = run_for_dt.ok_or_else(|| {
             Box::new(std::io::Error::other("daily_channel task missing run_for_dt")) as Error
           })?;
@@ -1946,37 +2430,63 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
           Ok(())
         })()
         .await
-      }
-      "weekly_channel" => {
-        (|| async {
-          let run_for_dt = run_for_dt.ok_or_else(|| {
-            Box::new(std::io::Error::other("weekly_channel task missing run_for_dt")) as Error
-          })?;
+            }
+            "weekly_channel" => {
+                (|| async {
+                    let run_for_dt = run_for_dt.ok_or_else(|| {
+                        Box::new(std::io::Error::other(
+                            "weekly_channel task missing run_for_dt",
+                        )) as Error
+                    })?;
 
-          let default_cfg = DecisionEngineConfig::default();
-          let params_json = default_policy_params_json(&default_cfg);
+                    let default_cfg = DecisionEngineConfig::default();
+                    let params_json = default_policy_params_json(&default_cfg);
 
-          upsert_policy_params(pool, tenant_id, channel_id, "active", &params_json, "system").await?;
+                    upsert_policy_params(
+                        pool,
+                        tenant_id,
+                        channel_id,
+                        "active",
+                        &params_json,
+                        "system",
+                    )
+                    .await?;
 
-          let candidate_version = format!("candidate-{run_for_dt}");
-          upsert_policy_params(pool, tenant_id, channel_id, &candidate_version, &params_json, "system").await?;
+                    let candidate_version = format!("candidate-{run_for_dt}");
+                    upsert_policy_params(
+                        pool,
+                        tenant_id,
+                        channel_id,
+                        &candidate_version,
+                        &params_json,
+                        "system",
+                    )
+                    .await?;
 
-          let replay_metrics_json = serde_json::json!({
-            "ok": true,
-            "note": "v1 scaffold: replay gate not implemented yet",
-            "candidate_version": candidate_version,
-            "run_for_dt": run_for_dt.to_string(),
-          })
-          .to_string();
+                    let replay_metrics_json = serde_json::json!({
+                      "ok": true,
+                      "note": "v1 scaffold: replay gate not implemented yet",
+                      "candidate_version": candidate_version,
+                      "run_for_dt": run_for_dt.to_string(),
+                    })
+                    .to_string();
 
-          upsert_policy_eval_report(pool, tenant_id, channel_id, &candidate_version, &replay_metrics_json, false).await?;
+                    upsert_policy_eval_report(
+                        pool,
+                        tenant_id,
+                        channel_id,
+                        &candidate_version,
+                        &replay_metrics_json,
+                        false,
+                    )
+                    .await?;
 
-          Ok(())
-        })()
-        .await
-      }
-      "youtube_reporting_owner" => {
-        (|| async {
+                    Ok(())
+                })()
+                .await
+            }
+            "youtube_reporting_owner" => {
+                (|| async {
           let run_for_dt = run_for_dt.ok_or_else(|| {
             Box::new(std::io::Error::other("youtube_reporting_owner task missing run_for_dt")) as Error
           })?;
@@ -2177,9 +2687,9 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
           Ok(())
         })()
         .await
-      }
-      "youtube_reporting_report" => {
-        (|| async {
+            }
+            "youtube_reporting_report" => {
+                (|| async {
           let (content_owner_id, report_id) = parse_youtube_reporting_report_task_key(channel_id)
             .ok_or_else(|| {
               Box::new(std::io::Error::other("youtube_reporting_report invalid channel_id")) as Error
@@ -2438,227 +2948,276 @@ async fn handle_tick(method: &Method, headers: &HeaderMap, body: Bytes) -> Resul
           }
         })()
         .await
-      }
-      other => Err(Box::new(std::io::Error::other(format!(
-        "unknown job_type: {other}"
-      ))) as Error),
-    };
+            }
+            other => {
+                Err(Box::new(std::io::Error::other(format!("unknown job_type: {other}"))) as Error)
+            }
+        };
 
-    match result {
-      Ok(()) => {
-        sqlx::query(
-          r#"
+        match result {
+            Ok(()) => {
+                sqlx::query(
+                    r#"
             UPDATE job_tasks
             SET status='succeeded', locked_by=NULL, locked_at=NULL, last_error=NULL
             WHERE id=?;
           "#,
-        )
-        .bind(id)
-        .execute(pool)
-        .await
-        .map_err(|e| -> Error { Box::new(e) })?;
+                )
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|e| -> Error { Box::new(e) })?;
 
-        succeeded += 1;
-      }
-      Err(err) => {
-        let message = truncate_string(&err.to_string(), 2000);
-        if last_error.is_none() {
-          last_error = Some(message.clone());
-        }
+                succeeded += 1;
+            }
+            Err(err) => {
+                let message = truncate_string(&err.to_string(), 2000);
+                if last_error.is_none() {
+                    last_error = Some(message.clone());
+                }
 
-        if attempt_next >= *max_attempt {
-          sqlx::query(
-            r#"
+                if attempt_next >= *max_attempt {
+                    sqlx::query(
+                        r#"
               UPDATE job_tasks
               SET status='dead', locked_by=NULL, locked_at=NULL, last_error=?
               WHERE id=?;
             "#,
-          )
-          .bind(message)
-          .bind(id)
-          .execute(pool)
-          .await
-          .map_err(|e| -> Error { Box::new(e) })?;
+                    )
+                    .bind(message)
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| -> Error { Box::new(e) })?;
 
-          dead += 1;
-        } else {
-          let backoff_seconds = (attempt_next as i64).saturating_mul(60);
-          let run_after = now + Duration::seconds(backoff_seconds);
-          sqlx::query(
-            r#"
+                    dead += 1;
+                } else {
+                    let backoff_seconds = (attempt_next as i64).saturating_mul(60);
+                    let run_after = now + Duration::seconds(backoff_seconds);
+                    sqlx::query(
+                        r#"
               UPDATE job_tasks
               SET status='retrying', run_after=?, locked_by=NULL, locked_at=NULL, last_error=?
               WHERE id=?;
             "#,
-          )
-          .bind(run_after)
-          .bind(message)
-          .bind(id)
-          .execute(pool)
-          .await
-          .map_err(|e| -> Error { Box::new(e) })?;
+                    )
+                    .bind(run_after)
+                    .bind(message)
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| -> Error { Box::new(e) })?;
 
-          retried += 1;
+                    retried += 1;
+                }
+            }
         }
-      }
     }
-  }
 
-  json_response(
-    StatusCode::OK,
-    serde_json::json!({
-      "ok": true,
-      "worker_id": worker_id,
-      "tenant_id": tenant_filter,
-      "reclaimed": reclaimed,
-      "claimed": claimed.len(),
-      "succeeded": succeeded,
-      "retried": retried,
-      "dead": dead,
-      "last_error": last_error,
-    }),
-  )
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+          "ok": true,
+          "worker_id": worker_id,
+          "tenant_id": tenant_filter,
+          "reclaimed": reclaimed,
+          "claimed": claimed.len(),
+          "succeeded": succeeded,
+          "retried": retried,
+          "dead": dead,
+          "last_error": last_error,
+        }),
+    )
 }
 
 async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
-  let action = query_value(req.uri().query(), "action").unwrap_or("tick");
-  let result = match action {
-    "dispatch" => {
-      let schedule = DispatchSchedule::from_query(req.uri().query());
-      let force = query_value(req.uri().query(), "force")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(false);
-      let method = req.method().clone();
-      let headers = req.headers().clone();
-      let bytes = req.into_body().collect().await?.to_bytes();
-      handle_dispatch(schedule, force, &method, &headers, bytes).await
-    }
-    "" | "tick" => {
-      let method = req.method().clone();
-      let headers = req.headers().clone();
-      let bytes = req.into_body().collect().await?.to_bytes();
-      handle_tick(&method, &headers, bytes).await
-    }
-    _ => json_response(
-      StatusCode::NOT_FOUND,
-      serde_json::json!({"ok": false, "error": "not_found"}),
-    ),
-  };
+    let action = query_value(req.uri().query(), "action").unwrap_or("tick");
+    let result = match action {
+        "dispatch" => {
+            let schedule = DispatchSchedule::from_query(req.uri().query());
+            let force = query_value(req.uri().query(), "force")
+                .map(|v| {
+                    v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+                })
+                .unwrap_or(false);
+            let method = req.method().clone();
+            let headers = req.headers().clone();
+            let bytes = req.into_body().collect().await?.to_bytes();
+            handle_dispatch(schedule, force, &method, &headers, bytes).await
+        }
+        "" | "tick" => {
+            let method = req.method().clone();
+            let headers = req.headers().clone();
+            let bytes = req.into_body().collect().await?.to_bytes();
+            handle_tick(&method, &headers, bytes).await
+        }
+        _ => json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"ok": false, "error": "not_found"}),
+        ),
+    };
 
-  match result {
-    Ok(resp) => Ok(resp),
-    Err(err) => {
-      let message = truncate_string(&err.to_string(), 2000);
-      json_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        serde_json::json!({"ok": false, "error": "internal_error", "message": message}),
-      )
+    match result {
+        Ok(resp) => Ok(resp),
+        Err(err) => {
+            let message = truncate_string(&err.to_string(), 2000);
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"ok": false, "error": "internal_error", "message": message}),
+            )
+        }
     }
-  }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-  run(service_fn(handler)).await
+    run(service_fn(handler)).await
 }
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+    use super::*;
 
-  #[test]
-  fn parses_youtube_reporting_report_task_key() {
-    assert_eq!(
-      parse_youtube_reporting_report_task_key("CMS123:rep_1"),
-      Some(("CMS123".to_string(), "rep_1".to_string()))
-    );
-    assert_eq!(parse_youtube_reporting_report_task_key("CMS123:"), None);
-    assert_eq!(parse_youtube_reporting_report_task_key(":rep_1"), None);
-    assert_eq!(parse_youtube_reporting_report_task_key("nope"), None);
-  }
+    #[test]
+    fn parses_youtube_reporting_report_task_key() {
+        assert_eq!(
+            parse_youtube_reporting_report_task_key("CMS123:rep_1"),
+            Some(("CMS123".to_string(), "rep_1".to_string()))
+        );
+        assert_eq!(parse_youtube_reporting_report_task_key("CMS123:"), None);
+        assert_eq!(parse_youtube_reporting_report_task_key(":rep_1"), None);
+        assert_eq!(parse_youtube_reporting_report_task_key("nope"), None);
+    }
 
-  #[test]
-  fn formats_created_after_for_backfill() {
-    let run_for_dt = chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
-    let expected = chrono::Utc
-      .with_ymd_and_hms(2026, 2, 1, 0, 0, 0)
-      .unwrap()
-      - chrono::Duration::days(90);
-    assert_eq!(
-      youtube_reporting_created_after_rfc3339(run_for_dt, 90),
-      expected.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    );
-  }
+    #[test]
+    fn formats_created_after_for_backfill() {
+        let run_for_dt = chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let expected =
+            chrono::Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap() - chrono::Duration::days(90);
+        assert_eq!(
+            youtube_reporting_created_after_rfc3339(run_for_dt, 90),
+            expected.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        );
+    }
 
-  #[test]
-  fn reporting_wide_table_name_is_mysql_safe() {
-    let name = yt_reporting_wide_table_name("channel_basic_a2");
-    assert!(name.starts_with("yt_rpt_"));
-    assert!(name.len() <= 64);
-    assert!(name
-      .chars()
-      .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'));
-  }
+    #[test]
+    fn reporting_wide_table_name_is_mysql_safe() {
+        let name = yt_reporting_wide_table_name("channel_basic_a2");
+        assert!(name.starts_with("yt_rpt_"));
+        assert!(name.len() <= 64);
+        assert!(name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'));
+    }
 
-  #[test]
-  fn gunzips_when_magic_header_present() {
-    use std::io::Write;
+    #[test]
+    fn gunzips_when_magic_header_present() {
+        use std::io::Write;
 
-    let plain = b"a,b\n1,2\n";
+        let plain = b"a,b\n1,2\n";
 
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(plain).unwrap();
-    let gz = enc.finish().unwrap();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(plain).unwrap();
+        let gz = enc.finish().unwrap();
 
-    assert_eq!(maybe_gunzip_bytes(&gz).unwrap(), plain);
-    assert_eq!(maybe_gunzip_bytes(plain).unwrap(), plain);
-  }
+        assert_eq!(maybe_gunzip_bytes(&gz).unwrap(), plain);
+        assert_eq!(maybe_gunzip_bytes(plain).unwrap(), plain);
+    }
 
-  #[test]
-  fn parses_rfc3339_timestamps_as_utc() {
-    let dt = parse_rfc3339_utc(Some("2026-01-01T00:00:00Z")).unwrap();
-    assert_eq!(
-      dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-      "2026-01-01T00:00:00Z"
-    );
-    assert_eq!(parse_rfc3339_utc(Some("nope")), None);
-    assert_eq!(parse_rfc3339_utc(None), None);
-  }
+    #[test]
+    fn parses_rfc3339_timestamps_as_utc() {
+        let dt = parse_rfc3339_utc(Some("2026-01-01T00:00:00Z")).unwrap();
+        assert_eq!(
+            dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "2026-01-01T00:00:00Z"
+        );
+        assert_eq!(parse_rfc3339_utc(Some("nope")), None);
+        assert_eq!(parse_rfc3339_utc(None), None);
+    }
 
-  #[tokio::test]
-  async fn dispatch_returns_unauthorized_when_missing_internal_token() {
-    std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+    #[test]
+    fn provider_v1_endpoint_handles_both_base_shapes() {
+        assert_eq!(
+            provider_v1_endpoint("https://api.openai.com", "responses"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            provider_v1_endpoint("https://api.openai.com/v1", "responses"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
 
-    let headers = HeaderMap::new();
-    let response = handle_dispatch(DispatchSchedule::Daily, false, &Method::POST, &headers, Bytes::new())
-      .await
-      .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-  }
+    #[test]
+    fn extracts_openai_text_and_usage() {
+        let json = serde_json::json!({
+          "output": [{
+            "content": [
+              {"type":"output_text","text":"Hello "},
+              {"type":"output_text","text":"world"}
+            ]
+          }],
+          "usage": {"input_tokens": 12, "output_tokens": 34}
+        });
 
-  #[tokio::test]
-  async fn returns_unauthorized_when_missing_internal_token() {
-    std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+        assert_eq!(openai_extract_text(&json), "Hello world");
+        let usage = openai_extract_usage(&json).expect("usage should parse");
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.completion_tokens, 34);
+    }
 
-    let headers = HeaderMap::new();
-    let response = handle_tick(&Method::POST, &headers, Bytes::new())
-      .await
-      .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-  }
+    #[test]
+    fn extracts_anthropic_text_and_usage() {
+        let json = serde_json::json!({
+          "content": [{"type":"text","text":"A"}, {"type":"text","text":"B"}],
+          "usage": {"input_tokens": 7, "output_tokens": 9}
+        });
 
-  #[tokio::test]
-  async fn returns_not_configured_when_tidb_env_missing_with_tenant_filter() {
-    std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
-    std::env::remove_var("TIDB_DATABASE_URL");
-    std::env::remove_var("DATABASE_URL");
+        assert_eq!(anthropic_extract_text(&json), "AB");
+        let usage = anthropic_extract_usage(&json).expect("usage should parse");
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(usage.completion_tokens, 9);
+    }
 
-    let mut headers = HeaderMap::new();
-    headers.insert("authorization", "Bearer secret".parse().unwrap());
-    headers.insert("content-type", "application/json".parse().unwrap());
+    #[tokio::test]
+    async fn dispatch_returns_unauthorized_when_missing_internal_token() {
+        std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
 
-    let body = Bytes::from(r#"{"now_ms":1700000000000,"tenant_id":"t1"}"#);
-    let response = handle_tick(&Method::POST, &headers, body).await.unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-  }
+        let headers = HeaderMap::new();
+        let response = handle_dispatch(
+            DispatchSchedule::Daily,
+            false,
+            &Method::POST,
+            &headers,
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn returns_unauthorized_when_missing_internal_token() {
+        std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+
+        let headers = HeaderMap::new();
+        let response = handle_tick(&Method::POST, &headers, Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn returns_not_configured_when_tidb_env_missing_with_tenant_filter() {
+        std::env::set_var("RUST_INTERNAL_TOKEN", "secret");
+        std::env::remove_var("TIDB_DATABASE_URL");
+        std::env::remove_var("DATABASE_URL");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let body = Bytes::from(r#"{"now_ms":1700000000000,"tenant_id":"t1"}"#);
+        let response = handle_tick(&Method::POST, &headers, body).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
 }

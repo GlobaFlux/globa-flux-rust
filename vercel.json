@@ -11,7 +11,7 @@
     },
     {
       "source": "/api/tenants/ensure_trial",
-      "destination": "/api/tenants/llm_settings?action=ensure_trial"
+      "destination": "/api/tenants/ai_settings?action=ensure_trial"
     },
     {
       "source": "/api/usage/chat_risk_check/consume",

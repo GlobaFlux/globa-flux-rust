@@ -3,560 +3,641 @@ use chrono::{TimeZone, Utc};
 use http_body_util::BodyExt;
 use hyper::{HeaderMap, Method, StatusCode};
 use serde::Deserialize;
+use sqlx::MySqlPool;
+use std::collections::HashMap;
 use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
 
 use globa_flux_rust::db::{
-  create_geo_monitor_project, enqueue_geo_monitor_prompt_tasks, fetch_geo_monitor_project,
-  fetch_geo_monitor_run_results, fetch_geo_monitor_run_summary, fetch_latest_geo_monitor_run,
-  fetch_tenant_gemini_model, get_pool, list_geo_monitor_projects, list_geo_monitor_prompts,
-  replace_geo_monitor_prompts, ensure_geo_monitor_run,
+    create_geo_monitor_project, enqueue_geo_monitor_prompt_tasks, ensure_geo_monitor_run,
+    fetch_geo_monitor_project, fetch_geo_monitor_run_results, fetch_geo_monitor_run_summary, fetch_latest_geo_monitor_run,
+    fetch_tenant_ai_provider_setting, fetch_tenant_ai_routing_policy, get_pool, list_geo_monitor_projects,
+    list_geo_monitor_prompts, replace_geo_monitor_prompts,
 };
 use globa_flux_rust::geo_monitor::parse_string_list_json;
 
-const GLOBAL_TENANT_ID: &str = "global";
-
 fn bearer_token(header_value: Option<&str>) -> Option<&str> {
-  let value = header_value?;
-  value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer "))
+    let value = header_value?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
 }
 
-fn json_response(status: StatusCode, value: serde_json::Value) -> Result<Response<ResponseBody>, Error> {
-  Ok(
-    Response::builder()
-      .status(status)
-      .header("content-type", "application/json; charset=utf-8")
-      .body(ResponseBody::from(value))?,
-  )
+fn json_response(
+    status: StatusCode,
+    value: serde_json::Value,
+) -> Result<Response<ResponseBody>, Error> {
+    Ok(Response::builder()
+        .status(status)
+        .header("content-type", "application/json; charset=utf-8")
+        .body(ResponseBody::from(value))?)
 }
 
 fn has_tidb_url() -> bool {
-  std::env::var("TIDB_DATABASE_URL")
-    .or_else(|_| std::env::var("DATABASE_URL"))
-    .map(|v| !v.is_empty())
-    .unwrap_or(false)
+    std::env::var("TIDB_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
-  let query = query?;
-  for part in query.split('&') {
-    let (k, v) = part.split_once('=')?;
-    if k == key {
-      return Some(v);
+    let query = query?;
+    for part in query.split('&') {
+        let (k, v) = part.split_once('=')?;
+        if k == key {
+            return Some(v);
+        }
     }
-  }
-  None
+    None
 }
 
 fn schedule_from_request(uri: &hyper::Uri) -> &'static str {
-  let value = query_value(uri.query(), "schedule").unwrap_or("");
-  match value {
-    "daily" | "Daily" | "DAILY" => "daily",
-    _ => "weekly",
-  }
+    let value = query_value(uri.query(), "schedule").unwrap_or("");
+    match value {
+        "daily" | "Daily" | "DAILY" => "daily",
+        _ => "weekly",
+    }
+}
+
+fn normalize_supported_provider(provider: &str) -> Option<String> {
+    let normalized = provider.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "gemini" | "openai" | "anthropic" => Some(normalized),
+        _ => None,
+    }
+}
+
+async fn resolve_geo_monitor_runtime(
+    pool: &MySqlPool,
+    tenant_id: &str,
+) -> Result<(String, String), Error> {
+    let default_provider = fetch_tenant_ai_routing_policy(pool, tenant_id)
+        .await?
+        .map(|p| p.default_provider)
+        .unwrap_or_else(|| "gemini".to_string());
+
+    let provider = normalize_supported_provider(&default_provider).ok_or_else(|| {
+        Box::new(std::io::Error::other(format!(
+            "unsupported default_provider: {default_provider}"
+        ))) as Error
+    })?;
+
+    let setting = fetch_tenant_ai_provider_setting(pool, tenant_id, &provider)
+        .await?
+        .ok_or_else(|| {
+            Box::new(std::io::Error::other(format!(
+                "missing active AI setting for provider={provider}"
+            ))) as Error
+        })?;
+
+    if !setting.status.eq_ignore_ascii_case("active") {
+        return Err(Box::new(std::io::Error::other(format!(
+            "provider setting not active: provider={provider} status={}",
+            setting.status
+        ))));
+    }
+
+    let model = setting.default_model.trim();
+    if model.is_empty() {
+        return Err(Box::new(std::io::Error::other(format!(
+            "default_model is required for provider={provider}"
+        ))));
+    }
+
+    Ok((provider, model.to_string()))
 }
 
 #[derive(Deserialize)]
 struct PromptInput {
-  #[serde(default)]
-  theme: Option<String>,
-  text: String,
+    #[serde(default)]
+    theme: Option<String>,
+    text: String,
 }
 
 #[derive(Deserialize)]
 struct GeoMonitorRpcRequest {
-  op: String,
-  #[serde(default)]
-  tenant_id: Option<String>,
-  #[serde(default)]
-  project_id: Option<i64>,
-  #[serde(default)]
-  name: Option<String>,
-  #[serde(default)]
-  website: Option<String>,
-  #[serde(default)]
-  brand_aliases: Option<Vec<String>>,
-  #[serde(default)]
-  competitors: Option<Vec<String>>,
-  #[serde(default)]
-  schedule: Option<String>,
-  #[serde(default)]
-  prompts: Option<Vec<PromptInput>>,
+    op: String,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    website: Option<String>,
+    #[serde(default)]
+    brand_aliases: Option<Vec<String>>,
+    #[serde(default)]
+    competitors: Option<Vec<String>>,
+    #[serde(default)]
+    schedule: Option<String>,
+    #[serde(default)]
+    prompts: Option<Vec<PromptInput>>,
 }
 
 #[derive(Deserialize)]
 struct DispatchRequest {
-  now_ms: i64,
-  #[serde(default)]
-  tenant_id: Option<String>,
+    now_ms: i64,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 fn required_string(input: Option<String>, field: &str) -> Result<String, Error> {
-  let value = input.unwrap_or_default().trim().to_string();
-  if value.is_empty() {
-    return Err(Box::new(std::io::Error::other(format!(
-      "{field} is required"
-    ))));
-  }
-  Ok(value)
+    let value = input.unwrap_or_default().trim().to_string();
+    if value.is_empty() {
+        return Err(Box::new(std::io::Error::other(format!(
+            "{field} is required"
+        ))));
+    }
+    Ok(value)
 }
 
 async fn handle_dispatch(
-  schedule: &str,
-  method: &Method,
-  headers: &HeaderMap,
-  body: Bytes,
+    schedule: &str,
+    method: &Method,
+    headers: &HeaderMap,
+    body: Bytes,
 ) -> Result<Response<ResponseBody>, Error> {
-  if method != Method::POST {
-    return json_response(
-      StatusCode::METHOD_NOT_ALLOWED,
-      serde_json::json!({"ok": false, "error": "method_not_allowed"}),
-    );
-  }
-
-  let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
-  let provided = bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
-
-  if expected.is_empty() || provided != expected {
-    return json_response(
-      StatusCode::UNAUTHORIZED,
-      serde_json::json!({"ok": false, "error": "unauthorized"}),
-    );
-  }
-
-  if !has_tidb_url() {
-    return json_response(
-      StatusCode::NOT_IMPLEMENTED,
-      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
-    );
-  }
-
-  let parsed: DispatchRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
-    Box::new(std::io::Error::other(format!("invalid json body: {e}")))
-  })?;
-
-  if parsed.now_ms <= 0 {
-    return json_response(
-      StatusCode::BAD_REQUEST,
-      serde_json::json!({"ok": false, "error": "bad_request", "message": "now_ms is required"}),
-    );
-  }
-
-  let now = Utc
-    .timestamp_millis_opt(parsed.now_ms)
-    .single()
-    .unwrap_or_else(Utc::now);
-  let run_for_dt = now.date_naive();
-
-  let tenant_filter = parsed
-    .tenant_id
-    .as_deref()
-    .map(str::trim)
-    .filter(|v| !v.is_empty())
-    .map(str::to_string);
-
-  let pool = get_pool().await?;
-
-  let db_model = fetch_tenant_gemini_model(pool, GLOBAL_TENANT_ID).await?;
-  let model = match db_model {
-    Some(v) if !v.trim().is_empty() => v,
-    _ => {
-      return json_response(
-        StatusCode::NOT_IMPLEMENTED,
-        serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing gemini_model for tenant_id=global"}),
-      )
+    if method != Method::POST {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
     }
-  };
 
-  let projects: Vec<(String, i64)> = if let Some(tid) = tenant_filter.as_deref() {
-    sqlx::query_as(
-      r#"
+    let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
+
+    if expected.is_empty() || provided != expected {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"ok": false, "error": "unauthorized"}),
+        );
+    }
+
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
+
+    let parsed: DispatchRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
+        Box::new(std::io::Error::other(format!("invalid json body: {e}")))
+    })?;
+
+    if parsed.now_ms <= 0 {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": "now_ms is required"}),
+        );
+    }
+
+    let now = Utc
+        .timestamp_millis_opt(parsed.now_ms)
+        .single()
+        .unwrap_or_else(Utc::now);
+    let run_for_dt = now.date_naive();
+
+    let tenant_filter = parsed
+        .tenant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+
+    let pool = get_pool().await?;
+
+    let projects: Vec<(String, i64)> = if let Some(tid) = tenant_filter.as_deref() {
+        sqlx::query_as(
+            r#"
         SELECT tenant_id, id
         FROM geo_monitor_projects
         WHERE tenant_id = ? AND enabled = 1 AND schedule = ?;
       "#,
-    )
-    .bind(tid)
-    .bind(schedule)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?
-  } else {
-    sqlx::query_as(
-      r#"
+        )
+        .bind(tid)
+        .bind(schedule)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?
+    } else {
+        sqlx::query_as(
+            r#"
         SELECT tenant_id, id
         FROM geo_monitor_projects
         WHERE enabled = 1 AND schedule = ?;
       "#,
-    )
-    .bind(schedule)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| -> Error { Box::new(e) })?
-  };
+        )
+        .bind(schedule)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| -> Error { Box::new(e) })?
+    };
 
-  let mut runs_ensured: i64 = 0;
-  let mut tasks_enqueued: u64 = 0;
+    let mut runs_ensured: i64 = 0;
+    let mut tasks_enqueued: u64 = 0;
+    let mut runtime_cache: HashMap<String, (String, String)> = HashMap::new();
+    let mut skipped_tenants: Vec<String> = Vec::new();
 
-  for (tenant_id, project_id) in projects.iter() {
-    let prompts = list_geo_monitor_prompts(pool, tenant_id, *project_id).await?;
-    let prompt_ids: Vec<i64> = prompts.iter().filter(|p| p.enabled).map(|p| p.id).collect();
-    let prompt_total = prompt_ids.len() as i32;
-    if prompt_total <= 0 {
-      continue;
+    for (tenant_id, project_id) in projects.iter() {
+        let runtime = if let Some(cached) = runtime_cache.get(tenant_id) {
+            cached.clone()
+        } else {
+            match resolve_geo_monitor_runtime(pool, tenant_id).await {
+                Ok(runtime) => {
+                    runtime_cache.insert(tenant_id.clone(), runtime.clone());
+                    runtime
+                }
+                Err(err) => {
+                    skipped_tenants.push(format!("{tenant_id}: {}", err));
+                    continue;
+                }
+            }
+        };
+        let (provider, model) = runtime;
+
+        let prompts = list_geo_monitor_prompts(pool, tenant_id, *project_id).await?;
+        let prompt_ids: Vec<i64> = prompts.iter().filter(|p| p.enabled).map(|p| p.id).collect();
+        let prompt_total = prompt_ids.len() as i32;
+        if prompt_total <= 0 {
+            continue;
+        }
+
+        let _run = ensure_geo_monitor_run(
+            pool,
+            tenant_id,
+            *project_id,
+            run_for_dt,
+            provider.as_str(),
+            model.as_str(),
+            prompt_total,
+        )
+        .await?;
+        runs_ensured += 1;
+
+        let enqueued =
+            enqueue_geo_monitor_prompt_tasks(pool, tenant_id, *project_id, run_for_dt, &prompt_ids)
+                .await?;
+        tasks_enqueued = tasks_enqueued.saturating_add(enqueued);
     }
 
-    let _run = ensure_geo_monitor_run(
-      pool,
-      tenant_id,
-      *project_id,
-      run_for_dt,
-      "gemini",
-      model.trim(),
-      prompt_total,
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+          "ok": true,
+          "tenant_id": tenant_filter,
+          "schedule": schedule,
+          "run_for_dt": run_for_dt.to_string(),
+          "projects": projects.len(),
+          "runs_ensured": runs_ensured,
+          "tasks_enqueued_rows": tasks_enqueued,
+          "tenants_skipped": skipped_tenants.len(),
+          "skipped_tenants": skipped_tenants
+        }),
     )
-    .await?;
-    runs_ensured += 1;
-
-    let enqueued = enqueue_geo_monitor_prompt_tasks(pool, tenant_id, *project_id, run_for_dt, &prompt_ids).await?;
-    tasks_enqueued = tasks_enqueued.saturating_add(enqueued);
-  }
-
-  json_response(
-    StatusCode::OK,
-    serde_json::json!({
-      "ok": true,
-      "tenant_id": tenant_filter,
-      "schedule": schedule,
-      "run_for_dt": run_for_dt.to_string(),
-      "projects": projects.len(),
-      "runs_ensured": runs_ensured,
-      "tasks_enqueued_rows": tasks_enqueued
-    }),
-  )
 }
 
 async fn handle_geo_monitor(
-  method: &Method,
-  headers: &HeaderMap,
-  uri: &hyper::Uri,
-  body: Bytes,
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &hyper::Uri,
+    body: Bytes,
 ) -> Result<Response<ResponseBody>, Error> {
-  let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
-  let provided = bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
+    let expected = std::env::var("RUST_INTERNAL_TOKEN").unwrap_or_default();
+    let provided =
+        bearer_token(headers.get("authorization").and_then(|v| v.to_str().ok())).unwrap_or("");
 
-  if expected.is_empty() || provided != expected {
-    return json_response(
-      StatusCode::UNAUTHORIZED,
-      serde_json::json!({"ok": false, "error": "unauthorized"}),
-    );
-  }
-
-  if method != Method::POST {
-    return json_response(
-      StatusCode::METHOD_NOT_ALLOWED,
-      serde_json::json!({"ok": false, "error": "method_not_allowed"}),
-    );
-  }
-
-  if !has_tidb_url() {
-    return json_response(
-      StatusCode::NOT_IMPLEMENTED,
-      serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
-    );
-  }
-
-  if query_value(uri.query(), "op") == Some("dispatch") {
-    let schedule = schedule_from_request(uri);
-    return handle_dispatch(schedule, method, headers, body).await;
-  }
-
-  let parsed: GeoMonitorRpcRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
-    Box::new(std::io::Error::other(format!("invalid json body: {e}")))
-  })?;
-
-  let tenant_id = match required_string(parsed.tenant_id, "tenant_id") {
-    Ok(v) => v,
-    Err(_) => {
-      return json_response(
-        StatusCode::BAD_REQUEST,
-        serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
-      )
-    }
-  };
-
-  let pool = get_pool().await?;
-
-  match parsed.op.as_str() {
-    "list_projects" => {
-      let projects = list_geo_monitor_projects(pool, &tenant_id).await?;
-      let payload = projects
-        .into_iter()
-        .map(|p| {
-          serde_json::json!({
-            "id": p.id,
-            "name": p.name,
-            "website": p.website,
-            "schedule": p.schedule,
-            "enabled": p.enabled,
-            "brand_aliases": parse_string_list_json(p.brand_aliases_json.as_deref()),
-            "competitors": parse_string_list_json(p.competitor_names_json.as_deref()),
-          })
-        })
-        .collect::<Vec<_>>();
-
-      json_response(StatusCode::OK, serde_json::json!({"ok": true, "projects": payload}))
+    if expected.is_empty() || provided != expected {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"ok": false, "error": "unauthorized"}),
+        );
     }
 
-    "create_project" => {
-      let name = match required_string(parsed.name, "name") {
+    if method != Method::POST {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            serde_json::json!({"ok": false, "error": "method_not_allowed"}),
+        );
+    }
+
+    if !has_tidb_url() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing TIDB_DATABASE_URL (or DATABASE_URL)"}),
+        );
+    }
+
+    if query_value(uri.query(), "op") == Some("dispatch") {
+        let schedule = schedule_from_request(uri);
+        return handle_dispatch(schedule, method, headers, body).await;
+    }
+
+    let parsed: GeoMonitorRpcRequest = serde_json::from_slice(&body).map_err(|e| -> Error {
+        Box::new(std::io::Error::other(format!("invalid json body: {e}")))
+    })?;
+
+    let tenant_id = match required_string(parsed.tenant_id, "tenant_id") {
         Ok(v) => v,
         Err(_) => {
-          return json_response(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({"ok": false, "error": "bad_request", "message": "name is required"}),
-          )
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"ok": false, "error": "bad_request", "message": "tenant_id is required"}),
+            )
         }
-      };
+    };
 
-      let website = parsed.website.as_deref().map(str::trim).filter(|v| !v.is_empty());
-      let schedule = parsed.schedule.unwrap_or_else(|| "weekly".to_string());
+    let pool = get_pool().await?;
 
-      let brand_aliases_json = serde_json::to_string(&parsed.brand_aliases.unwrap_or_default())
-        .ok()
-        .filter(|s| s != "[]");
-      let competitors_json = serde_json::to_string(&parsed.competitors.unwrap_or_default())
-        .ok()
-        .filter(|s| s != "[]");
+    match parsed.op.as_str() {
+        "list_projects" => {
+            let projects = list_geo_monitor_projects(pool, &tenant_id).await?;
+            let payload = projects
+                .into_iter()
+                .map(|p| {
+                    serde_json::json!({
+                      "id": p.id,
+                      "name": p.name,
+                      "website": p.website,
+                      "schedule": p.schedule,
+                      "enabled": p.enabled,
+                      "brand_aliases": parse_string_list_json(p.brand_aliases_json.as_deref()),
+                      "competitors": parse_string_list_json(p.competitor_names_json.as_deref()),
+                    })
+                })
+                .collect::<Vec<_>>();
 
-      let id = create_geo_monitor_project(
-        pool,
-        &tenant_id,
-        &name,
-        website,
-        brand_aliases_json.as_deref(),
-        competitors_json.as_deref(),
-        &schedule,
-      )
-      .await?;
-
-      json_response(StatusCode::OK, serde_json::json!({"ok": true, "project_id": id}))
-    }
-
-    "get_project" => {
-      let project_id = parsed.project_id.unwrap_or(0);
-      if project_id <= 0 {
-        return json_response(
-          StatusCode::BAD_REQUEST,
-          serde_json::json!({"ok": false, "error": "bad_request", "message": "project_id is required"}),
-        );
-      }
-
-      let project = fetch_geo_monitor_project(pool, &tenant_id, project_id).await?;
-      let project = match project {
-        Some(v) => v,
-        None => {
-          return json_response(
-            StatusCode::NOT_FOUND,
-            serde_json::json!({"ok": false, "error": "not_found"}),
-          )
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "projects": payload}),
+            )
         }
-      };
 
-      let prompts = list_geo_monitor_prompts(pool, &tenant_id, project_id).await?;
-      let prompts_json = prompts
+        "create_project" => {
+            let name = match required_string(parsed.name, "name") {
+                Ok(v) => v,
+                Err(_) => {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": "bad_request", "message": "name is required"}),
+                    )
+                }
+            };
+
+            let website = parsed
+                .website
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            let schedule = parsed.schedule.unwrap_or_else(|| "weekly".to_string());
+
+            let brand_aliases_json =
+                serde_json::to_string(&parsed.brand_aliases.unwrap_or_default())
+                    .ok()
+                    .filter(|s| s != "[]");
+            let competitors_json = serde_json::to_string(&parsed.competitors.unwrap_or_default())
+                .ok()
+                .filter(|s| s != "[]");
+
+            let id = create_geo_monitor_project(
+                pool,
+                &tenant_id,
+                &name,
+                website,
+                brand_aliases_json.as_deref(),
+                competitors_json.as_deref(),
+                &schedule,
+            )
+            .await?;
+
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "project_id": id}),
+            )
+        }
+
+        "get_project" => {
+            let project_id = parsed.project_id.unwrap_or(0);
+            if project_id <= 0 {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": "bad_request", "message": "project_id is required"}),
+                );
+            }
+
+            let project = fetch_geo_monitor_project(pool, &tenant_id, project_id).await?;
+            let project = match project {
+                Some(v) => v,
+                None => {
+                    return json_response(
+                        StatusCode::NOT_FOUND,
+                        serde_json::json!({"ok": false, "error": "not_found"}),
+                    )
+                }
+            };
+
+            let prompts = list_geo_monitor_prompts(pool, &tenant_id, project_id).await?;
+            let prompts_json = prompts
         .iter()
         .map(|p| serde_json::json!({"id": p.id, "theme": p.theme, "text": p.prompt_text, "enabled": p.enabled, "sort_order": p.sort_order}))
         .collect::<Vec<_>>();
 
-      let latest_run = fetch_latest_geo_monitor_run(pool, &tenant_id, project_id).await?;
-      let run_json = if let Some(run) = latest_run {
-        let summary = fetch_geo_monitor_run_summary(pool, run.id).await?;
-        let results = fetch_geo_monitor_run_results(pool, run.id, 200).await?;
-        serde_json::json!({
-          "id": run.id,
-          "run_for_dt": run.run_for_dt.to_string(),
-          "status": run.status,
-          "provider": run.provider,
-          "model": run.model,
-          "prompt_total": run.prompt_total,
-          "started_at": run.started_at.to_rfc3339(),
-          "finished_at": run.finished_at.map(|t| t.to_rfc3339()),
-          "summary": {
-            "results_total": summary.results_total,
-            "presence_count": summary.presence_count,
-            "top3_count": summary.top3_count,
-            "top5_count": summary.top5_count,
-            "error_count": summary.error_count,
-            "cost_usd": summary.cost_usd
-          },
-          "results": results.into_iter().map(|(prompt_id, id, prompt_text, output_text, presence, rank_int, cost_usd, error)| {
-            serde_json::json!({
-              "id": id,
-              "prompt_id": prompt_id,
-              "prompt_text": prompt_text,
-              "output_text": output_text,
-              "presence": presence,
-              "rank_int": rank_int,
-              "cost_usd": cost_usd,
-              "error": error
-            })
-          }).collect::<Vec<_>>()
-        })
-      } else {
-        serde_json::Value::Null
-      };
-
-      json_response(
-        StatusCode::OK,
-        serde_json::json!({
-          "ok": true,
-          "project": {
-            "id": project.id,
-            "name": project.name,
-            "website": project.website,
-            "schedule": project.schedule,
-            "enabled": project.enabled,
-            "brand_aliases": parse_string_list_json(project.brand_aliases_json.as_deref()),
-            "competitors": parse_string_list_json(project.competitor_names_json.as_deref()),
-          },
-          "prompts": prompts_json,
-          "latest_run": run_json
-        }),
-      )
-    }
-
-    "set_prompts" => {
-      let project_id = parsed.project_id.unwrap_or(0);
-      if project_id <= 0 {
-        return json_response(
-          StatusCode::BAD_REQUEST,
-          serde_json::json!({"ok": false, "error": "bad_request", "message": "project_id is required"}),
-        );
-      }
-
-      let latest_run = fetch_latest_geo_monitor_run(pool, &tenant_id, project_id).await?;
-      if let Some(run) = latest_run {
-        if run.finished_at.is_none() && run.status == "running" {
-          return json_response(
-            StatusCode::CONFLICT,
-            serde_json::json!({"ok": false, "error": "conflict", "message": "cannot modify prompts while a run is in progress"}),
-          );
-        }
-      }
-
-      let prompts = parsed.prompts.unwrap_or_default();
-      let mut cleaned: Vec<(Option<String>, String)> = Vec::new();
-      for p in prompts.into_iter() {
-        let text = p.text.trim().to_string();
-        if text.is_empty() {
-          continue;
-        }
-        cleaned.push((
-          p.theme.and_then(|t| {
-            let t = t.trim().to_string();
-            if t.is_empty() {
-              None
+            let latest_run = fetch_latest_geo_monitor_run(pool, &tenant_id, project_id).await?;
+            let run_json = if let Some(run) = latest_run {
+                let summary = fetch_geo_monitor_run_summary(pool, run.id).await?;
+                let results = fetch_geo_monitor_run_results(pool, run.id, 200).await?;
+                serde_json::json!({
+                  "id": run.id,
+                  "run_for_dt": run.run_for_dt.to_string(),
+                  "status": run.status,
+                  "provider": run.provider,
+                  "model": run.model,
+                  "prompt_total": run.prompt_total,
+                  "started_at": run.started_at.to_rfc3339(),
+                  "finished_at": run.finished_at.map(|t| t.to_rfc3339()),
+                  "summary": {
+                    "results_total": summary.results_total,
+                    "presence_count": summary.presence_count,
+                    "top3_count": summary.top3_count,
+                    "top5_count": summary.top5_count,
+                    "error_count": summary.error_count,
+                    "cost_usd": summary.cost_usd
+                  },
+                  "results": results.into_iter().map(|(prompt_id, id, prompt_text, output_text, presence, rank_int, cost_usd, error)| {
+                    serde_json::json!({
+                      "id": id,
+                      "prompt_id": prompt_id,
+                      "prompt_text": prompt_text,
+                      "output_text": output_text,
+                      "presence": presence,
+                      "rank_int": rank_int,
+                      "cost_usd": cost_usd,
+                      "error": error
+                    })
+                  }).collect::<Vec<_>>()
+                })
             } else {
-              Some(t)
-            }
-          }),
-          text,
-        ));
-      }
+                serde_json::Value::Null
+            };
 
-      replace_geo_monitor_prompts(pool, &tenant_id, project_id, cleaned.as_slice()).await?;
-      json_response(StatusCode::OK, serde_json::json!({"ok": true}))
-    }
-
-    "start_run" => {
-      let project_id = parsed.project_id.unwrap_or(0);
-      if project_id <= 0 {
-        return json_response(
-          StatusCode::BAD_REQUEST,
-          serde_json::json!({"ok": false, "error": "bad_request", "message": "project_id is required"}),
-        );
-      }
-
-      let project = fetch_geo_monitor_project(pool, &tenant_id, project_id).await?;
-      if project.is_none() {
-        return json_response(
-          StatusCode::NOT_FOUND,
-          serde_json::json!({"ok": false, "error": "not_found"}),
-        );
-      }
-
-      let prompts = list_geo_monitor_prompts(pool, &tenant_id, project_id).await?;
-      let prompt_ids: Vec<i64> = prompts.iter().filter(|p| p.enabled).map(|p| p.id).collect();
-      let prompt_total = prompt_ids.len() as i32;
-      if prompt_total <= 0 {
-        return json_response(
-          StatusCode::BAD_REQUEST,
-          serde_json::json!({"ok": false, "error": "bad_request", "message": "no prompts configured"}),
-        );
-      }
-
-      let db_model = fetch_tenant_gemini_model(pool, GLOBAL_TENANT_ID).await?;
-      let model = match db_model {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => {
-          return json_response(
-            StatusCode::NOT_IMPLEMENTED,
-            serde_json::json!({"ok": false, "error": "not_configured", "message": "Missing gemini_model for tenant_id=global"}),
-          )
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                  "ok": true,
+                  "project": {
+                    "id": project.id,
+                    "name": project.name,
+                    "website": project.website,
+                    "schedule": project.schedule,
+                    "enabled": project.enabled,
+                    "brand_aliases": parse_string_list_json(project.brand_aliases_json.as_deref()),
+                    "competitors": parse_string_list_json(project.competitor_names_json.as_deref()),
+                  },
+                  "prompts": prompts_json,
+                  "latest_run": run_json
+                }),
+            )
         }
-      };
 
-      let now = chrono::Utc::now();
-      let run_for_dt = now.date_naive();
+        "set_prompts" => {
+            let project_id = parsed.project_id.unwrap_or(0);
+            if project_id <= 0 {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": "bad_request", "message": "project_id is required"}),
+                );
+            }
 
-      let run = ensure_geo_monitor_run(
-        pool,
-        &tenant_id,
-        project_id,
-        run_for_dt,
-        "gemini",
-        model.trim(),
-        prompt_total,
-      )
-      .await?;
+            let latest_run = fetch_latest_geo_monitor_run(pool, &tenant_id, project_id).await?;
+            if let Some(run) = latest_run {
+                if run.finished_at.is_none() && run.status == "running" {
+                    return json_response(
+                        StatusCode::CONFLICT,
+                        serde_json::json!({"ok": false, "error": "conflict", "message": "cannot modify prompts while a run is in progress"}),
+                    );
+                }
+            }
 
-      let enqueued = enqueue_geo_monitor_prompt_tasks(pool, &tenant_id, project_id, run_for_dt, &prompt_ids).await?;
+            let prompts = parsed.prompts.unwrap_or_default();
+            let mut cleaned: Vec<(Option<String>, String)> = Vec::new();
+            for p in prompts.into_iter() {
+                let text = p.text.trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                cleaned.push((
+                    p.theme.and_then(|t| {
+                        let t = t.trim().to_string();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t)
+                        }
+                    }),
+                    text,
+                ));
+            }
 
-      json_response(
-        StatusCode::OK,
-        serde_json::json!({
-          "ok": true,
-          "run": {
-            "id": run.id,
-            "run_for_dt": run.run_for_dt.to_string(),
-            "status": run.status,
-            "provider": run.provider,
-            "model": run.model,
-            "prompt_total": run.prompt_total,
-            "started_at": run.started_at.to_rfc3339(),
-            "finished_at": run.finished_at.map(|t| t.to_rfc3339())
-          },
-          "enqueued_rows": enqueued
-        }),
-      )
+            replace_geo_monitor_prompts(pool, &tenant_id, project_id, cleaned.as_slice()).await?;
+            json_response(StatusCode::OK, serde_json::json!({"ok": true}))
+        }
+
+        "start_run" => {
+            let project_id = parsed.project_id.unwrap_or(0);
+            if project_id <= 0 {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": "bad_request", "message": "project_id is required"}),
+                );
+            }
+
+            let project = fetch_geo_monitor_project(pool, &tenant_id, project_id).await?;
+            if project.is_none() {
+                return json_response(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({"ok": false, "error": "not_found"}),
+                );
+            }
+
+            let prompts = list_geo_monitor_prompts(pool, &tenant_id, project_id).await?;
+            let prompt_ids: Vec<i64> = prompts.iter().filter(|p| p.enabled).map(|p| p.id).collect();
+            let prompt_total = prompt_ids.len() as i32;
+            if prompt_total <= 0 {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": "bad_request", "message": "no prompts configured"}),
+                );
+            }
+
+            let (provider, model) = match resolve_geo_monitor_runtime(pool, &tenant_id).await {
+                Ok(v) => v,
+                Err(err) => {
+                    return json_response(
+                        StatusCode::NOT_IMPLEMENTED,
+                        serde_json::json!({"ok": false, "error": "not_configured", "message": err.to_string()}),
+                    )
+                }
+            };
+
+            let now = chrono::Utc::now();
+            let run_for_dt = now.date_naive();
+
+            let run = ensure_geo_monitor_run(
+                pool,
+                &tenant_id,
+                project_id,
+                run_for_dt,
+                provider.as_str(),
+                model.as_str(),
+                prompt_total,
+            )
+            .await?;
+
+            let enqueued = enqueue_geo_monitor_prompt_tasks(
+                pool,
+                &tenant_id,
+                project_id,
+                run_for_dt,
+                &prompt_ids,
+            )
+            .await?;
+
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                  "ok": true,
+                  "run": {
+                    "id": run.id,
+                    "run_for_dt": run.run_for_dt.to_string(),
+                    "status": run.status,
+                    "provider": run.provider,
+                    "model": run.model,
+                    "prompt_total": run.prompt_total,
+                    "started_at": run.started_at.to_rfc3339(),
+                    "finished_at": run.finished_at.map(|t| t.to_rfc3339())
+                  },
+                  "enqueued_rows": enqueued
+                }),
+            )
+        }
+
+        other => json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "bad_request", "message": format!("unknown op: {other}")}),
+        ),
     }
-
-    other => json_response(
-      StatusCode::BAD_REQUEST,
-      serde_json::json!({"ok": false, "error": "bad_request", "message": format!("unknown op: {other}")}),
-    ),
-  }
 }
 
 async fn handler(req: Request) -> Result<Response<ResponseBody>, Error> {
-  let method = req.method().clone();
-  let headers = req.headers().clone();
-  let uri = req.uri().clone();
-  let bytes = req.into_body().collect().await?.to_bytes();
-  handle_geo_monitor(&method, &headers, &uri, bytes).await
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    let uri = req.uri().clone();
+    let bytes = req.into_body().collect().await?.to_bytes();
+    handle_geo_monitor(&method, &headers, &uri, bytes).await
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-  run(service_fn(handler)).await
+    run(service_fn(handler)).await
 }

@@ -62,8 +62,10 @@ Run: `cargo test`
 
 This repo currently contains a stub handler that matches the contract and returns SSE/JSON. Provider streaming + TiDB persistence are the next steps.
 
-## Admin-controlled Gemini model (DB-backed)
+## Legacy Gemini model settings (Deprecated)
 
-- Table: `tenant_llm_settings` (`tenant_id` → `gemini_model`)
-- Global-only model: use `tenant_id="global"` (no env default / no allowlist)
-- Endpoint (internal auth): `GET/PUT /api/tenants/llm_settings?tenant_id=global`
+- `tenant_llm_settings` is legacy-only and no longer used by runtime routing.
+- `GET/PUT /api/tenants/llm_settings` now returns `410 Gone`.
+- Use tenant BYOK control plane instead:
+  - `GET/PUT /api/tenants/ai_settings`
+  - `PUT /api/tenants/ai_settings?action=routing_policy`

@@ -60,7 +60,9 @@ async fn ensure_fresh_youtube_access_token(
 ) -> Result<String, Error> {
     let mut tokens = fetch_youtube_connection_tokens(pool, tenant_id, channel_id)
         .await?
-        .ok_or_else(|| Box::new(std::io::Error::other("missing youtube channel connection")) as Error)?;
+        .ok_or_else(|| {
+            Box::new(std::io::Error::other("missing youtube channel connection")) as Error
+        })?;
 
     let needs_refresh = tokens
         .expires_at
@@ -71,7 +73,9 @@ async fn ensure_fresh_youtube_access_token(
         if let Some(refresh) = tokens.refresh_token.clone() {
             let app = fetch_or_seed_youtube_oauth_app_config(pool, tenant_id).await?;
             let Some(app) = app else {
-                return Err(Box::new(std::io::Error::other("missing youtube oauth app config")) as Error);
+                return Err(
+                    Box::new(std::io::Error::other("missing youtube oauth app config")) as Error,
+                );
             };
 
             let Some(client_secret) = app
@@ -81,7 +85,7 @@ async fn ensure_fresh_youtube_access_token(
                 .filter(|v| !v.is_empty())
             else {
                 return Err(
-                    Box::new(std::io::Error::other("missing youtube oauth client_secret")) as Error
+                    Box::new(std::io::Error::other("missing youtube oauth client_secret")) as Error,
                 );
             };
 
@@ -157,13 +161,9 @@ fn percent_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for b in input.bytes() {
         match b {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'.'
-            | b'_'
-            | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -285,12 +285,10 @@ async fn handle_youtube_report_share_put(
         );
     }
 
-    let start_dt = parse_dt(&parsed.start_dt).ok_or_else(|| {
-        Box::new(std::io::Error::other("start_dt must be YYYY-MM-DD")) as Error
-    })?;
-    let end_dt = parse_dt(&parsed.end_dt).ok_or_else(|| {
-        Box::new(std::io::Error::other("end_dt must be YYYY-MM-DD")) as Error
-    })?;
+    let start_dt = parse_dt(&parsed.start_dt)
+        .ok_or_else(|| Box::new(std::io::Error::other("start_dt must be YYYY-MM-DD")) as Error)?;
+    let end_dt = parse_dt(&parsed.end_dt)
+        .ok_or_else(|| Box::new(std::io::Error::other("end_dt must be YYYY-MM-DD")) as Error)?;
     if start_dt > end_dt {
         return json_response(
             StatusCode::BAD_REQUEST,
@@ -326,10 +324,7 @@ async fn handle_youtube_report_share_put(
     }
 
     let token = gen_share_token()?;
-    let expires_at = parsed
-        .expires_in_days
-        .unwrap_or(30)
-        .clamp(1, 365);
+    let expires_at = parsed.expires_in_days.unwrap_or(30).clamp(1, 365);
     let expires_dt = Utc::now() + Duration::days(expires_at);
 
     sqlx::query(
@@ -345,7 +340,13 @@ async fn handle_youtube_report_share_put(
     .bind(channel_id.trim())
     .bind(start_dt)
     .bind(end_dt)
-    .bind(parsed.filename.as_deref().map(str::trim).filter(|v| !v.is_empty()))
+    .bind(
+        parsed
+            .filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
     .bind(parsed.html)
     .bind(expires_dt)
     .execute(pool)
@@ -414,7 +415,7 @@ async fn handle_youtube_report_share_get(
     }
 
     let pool = get_pool().await?;
-    let row = sqlx::query_as::<_, (String, Option<String>, Option<DateTime<Utc>>,)>(
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<DateTime<Utc>>)>(
         r#"
           SELECT html, filename, expires_at
           FROM yt_report_shares
@@ -505,12 +506,10 @@ async fn handle_youtube_report_share_latest(
 
     let start_dt_raw = get_query_param(uri, "start_dt").unwrap_or_default();
     let end_dt_raw = get_query_param(uri, "end_dt").unwrap_or_default();
-    let start_dt = parse_dt(&start_dt_raw).ok_or_else(|| {
-        Box::new(std::io::Error::other("start_dt must be YYYY-MM-DD")) as Error
-    })?;
-    let end_dt = parse_dt(&end_dt_raw).ok_or_else(|| {
-        Box::new(std::io::Error::other("end_dt must be YYYY-MM-DD")) as Error
-    })?;
+    let start_dt = parse_dt(&start_dt_raw)
+        .ok_or_else(|| Box::new(std::io::Error::other("start_dt must be YYYY-MM-DD")) as Error)?;
+    let end_dt = parse_dt(&end_dt_raw)
+        .ok_or_else(|| Box::new(std::io::Error::other("end_dt must be YYYY-MM-DD")) as Error)?;
     if start_dt > end_dt {
         return json_response(
             StatusCode::BAD_REQUEST,
@@ -1585,7 +1584,9 @@ async fn handle_youtube_metrics_daily(
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
-    let rows: Vec<(NaiveDate, f64, i64, i64, f64, i64)> = if let Some(video_id) = video_id_filter.as_deref() {
+    let rows: Vec<(NaiveDate, f64, i64, i64, f64, i64)> = if let Some(video_id) =
+        video_id_filter.as_deref()
+    {
         sqlx::query_as::<_, (NaiveDate, f64, i64, i64, f64, i64)>(
             r#"
         SELECT dt,
@@ -1682,28 +1683,30 @@ async fn handle_youtube_metrics_daily(
     let video_id_out = video_id_filter.unwrap_or_else(|| "channel_total".to_string());
     let items: Vec<MetricDailyItem> = rows
         .into_iter()
-        .map(|(dt, revenue_usd, impressions, views, ctr_num, ctr_denom)| {
-            let ctr = if ctr_denom > 0 {
-                Some(ctr_num / (ctr_denom as f64))
-            } else {
-                None
-            };
-            let rpm = if views > 0 {
-                (revenue_usd / (views as f64)) * 1000.0
-            } else {
-                0.0
-            };
-            MetricDailyItem {
-                date: dt.to_string(),
-                video_id: video_id_out.clone(),
-                impressions,
-                views,
-                revenue_usd: round2(revenue_usd),
-                ctr: ctr.map(|v| (v * 10000.0).round() / 10000.0),
-                rpm: round2(rpm),
-                source: "tidb".to_string(),
-            }
-        })
+        .map(
+            |(dt, revenue_usd, impressions, views, ctr_num, ctr_denom)| {
+                let ctr = if ctr_denom > 0 {
+                    Some(ctr_num / (ctr_denom as f64))
+                } else {
+                    None
+                };
+                let rpm = if views > 0 {
+                    (revenue_usd / (views as f64)) * 1000.0
+                } else {
+                    0.0
+                };
+                MetricDailyItem {
+                    date: dt.to_string(),
+                    video_id: video_id_out.clone(),
+                    impressions,
+                    views,
+                    revenue_usd: round2(revenue_usd),
+                    ctr: ctr.map(|v| (v * 10000.0).round() / 10000.0),
+                    rpm: round2(rpm),
+                    source: "tidb".to_string(),
+                }
+            },
+        )
         .collect();
 
     json_response(
@@ -1817,9 +1820,21 @@ async fn handle_youtube_sponsor_quote_defaults(
         // channel-total rows. Use YouTube Analytics `dimensions=video` as a best-effort source.
         match ensure_fresh_youtube_access_token(pool, tenant_id.trim(), channel_id.trim()).await {
             Ok(access_token) => {
-                match fetch_top_videos_by_views_for_channel(&access_token, channel_id.trim(), start_dt, end_dt, 10).await {
+                match fetch_top_videos_by_views_for_channel(
+                    &access_token,
+                    channel_id.trim(),
+                    start_dt,
+                    end_dt,
+                    10,
+                )
+                .await
+                {
                     Ok(api_rows) => {
-                        views = api_rows.iter().map(|r| r.views).filter(|v| *v > 0).collect();
+                        views = api_rows
+                            .iter()
+                            .map(|r| r.views)
+                            .filter(|v| *v > 0)
+                            .collect();
                         long_source = "youtube_analytics_top10_video_views_28d_median".to_string();
                         long_n = api_rows.len() as i64;
                     }
@@ -2326,30 +2341,38 @@ async fn handle_youtube_top_videos(
 
     let mut items: Vec<TopVideoItem> = rows
         .into_iter()
-        .map(|(video_id, revenue_usd, views, impressions, ctr_num, ctr_denom)| {
-            let ctr = if ctr_denom > 0 {
-                Some(((ctr_num / (ctr_denom as f64)) * 10000.0).round() / 10000.0)
-            } else {
-                None
-            };
-            let rpm = if views > 0 {
-                (revenue_usd / (views as f64)) * 1000.0
-            } else {
-                0.0
-            };
-            TopVideoItem {
-                video_id,
-                views,
-                impressions,
-                revenue_usd: round2(revenue_usd),
-                ctr,
-                rpm: round2(rpm),
-            }
-        })
+        .map(
+            |(video_id, revenue_usd, views, impressions, ctr_num, ctr_denom)| {
+                let ctr = if ctr_denom > 0 {
+                    Some(((ctr_num / (ctr_denom as f64)) * 10000.0).round() / 10000.0)
+                } else {
+                    None
+                };
+                let rpm = if views > 0 {
+                    (revenue_usd / (views as f64)) * 1000.0
+                } else {
+                    0.0
+                };
+                TopVideoItem {
+                    video_id,
+                    views,
+                    impressions,
+                    revenue_usd: round2(revenue_usd),
+                    ctr,
+                    rpm: round2(rpm),
+                }
+            },
+        )
         .collect();
 
     if items.is_empty() {
-        let access_token = match ensure_fresh_youtube_access_token(pool, tenant_id.trim(), channel_id.trim()).await {
+        let access_token = match ensure_fresh_youtube_access_token(
+            pool,
+            tenant_id.trim(),
+            channel_id.trim(),
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 let msg = err.to_string();
@@ -2474,8 +2497,7 @@ async fn aggregate_data_health_period(
     start_dt: NaiveDate,
     end_dt: NaiveDate,
 ) -> Result<DataHealthPeriod, Error> {
-    let row =
-        sqlx::query_as::<_, (i64, Option<NaiveDate>, Option<DateTime<Utc>>, f64, i64, i64)>(
+    let row = sqlx::query_as::<_, (i64, Option<NaiveDate>, Option<DateTime<Utc>>, f64, i64, i64)>(
         r#"
       SELECT COUNT(DISTINCT dt) AS days_with_data,
              MAX(dt) AS last_dt,
@@ -2520,8 +2542,7 @@ async fn aggregate_data_health_period(
         });
     }
 
-    let row =
-        sqlx::query_as::<_, (i64, Option<NaiveDate>, Option<DateTime<Utc>>, f64, i64, i64)>(
+    let row = sqlx::query_as::<_, (i64, Option<NaiveDate>, Option<DateTime<Utc>>, f64, i64, i64)>(
         r#"
       SELECT COUNT(DISTINCT dt) AS days_with_data,
              MAX(dt) AS last_dt,
@@ -2737,7 +2758,14 @@ async fn fetch_outcome_latest(
     .map_err(|e| -> Error { Box::new(e) })?;
 
     Ok(row.map(
-        |(decision_dt, outcome_dt, revenue_change_pct_7d, catastrophic_flag, new_top_asset_flag, notes)| {
+        |(
+            decision_dt,
+            outcome_dt,
+            revenue_change_pct_7d,
+            catastrophic_flag,
+            new_top_asset_flag,
+            notes,
+        )| {
             let notes_json = notes.as_deref().and_then(|raw| {
                 let trimmed = raw.trim();
                 if trimmed.is_empty() {
@@ -2962,11 +2990,15 @@ async fn handle_youtube_dashboard_bundle(
                     );
                 }
                 if stale {
-                    notes.push("Latest metric date is behind the requested end_dt (sync may be stale).".to_string());
+                    notes.push(
+                        "Latest metric date is behind the requested end_dt (sync may be stale)."
+                            .to_string(),
+                    );
                 }
                 if coverage < 0.8 {
                     notes.push(
-                        "Low coverage: fewer days with data than expected in the window.".to_string(),
+                        "Low coverage: fewer days with data than expected in the window."
+                            .to_string(),
                     );
                 }
 
@@ -3107,11 +3139,19 @@ async fn handle_youtube_dashboard_bundle(
         }
     };
 
-	      let alerts: Vec<AlertItem> = match sqlx::query_as::<
-	        _,
-	        (i64, String, String, String, DateTime<Utc>, Option<DateTime<Utc>>, Option<String>),
-	      >(
-	        r#"
+    let alerts: Vec<AlertItem> = match sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+        ),
+    >(
+        r#"
 	          SELECT id, kind, severity, message,
 	                 CAST(detected_at AS DATETIME) AS detected_at,
 	                 CAST(resolved_at AS DATETIME) AS resolved_at,
@@ -3129,17 +3169,19 @@ async fn handle_youtube_dashboard_bundle(
     {
         Ok(rows) => rows
             .into_iter()
-            .map(|(id, kind, severity, message, detected_at, resolved_at, details_json)| AlertItem {
-                id: format!("alert_{id}"),
-                kind,
-                severity,
-                message,
-                details: details_json
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-                detected_at: datetime_to_rfc3339_utc(detected_at),
-                resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
-            })
+            .map(
+                |(id, kind, severity, message, detected_at, resolved_at, details_json)| AlertItem {
+                    id: format!("alert_{id}"),
+                    kind,
+                    severity,
+                    message,
+                    details: details_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
+                    detected_at: datetime_to_rfc3339_utc(detected_at),
+                    resolved_at: resolved_at.map(datetime_to_rfc3339_utc),
+                },
+            )
             .collect(),
         Err(err) => {
             errors.insert(
@@ -3390,7 +3432,8 @@ async fn handle_youtube_sync_bundle(
                 }
                 if coverage < 0.8 {
                     notes.push(
-                        "Low coverage: fewer days with data than expected in the window.".to_string(),
+                        "Low coverage: fewer days with data than expected in the window."
+                            .to_string(),
                     );
                 }
 
@@ -3467,7 +3510,8 @@ async fn handle_youtube_sync_bundle(
             .await
             .unwrap_or_default();
 
-            let mut jobs_by_type: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut jobs_by_type: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             for (report_type_id, job_id, _created_at, _updated_at) in jobs_rows.into_iter() {
                 jobs_by_type.entry(report_type_id).or_insert(job_id);
             }
@@ -3502,9 +3546,8 @@ async fn handle_youtube_sync_bundle(
             .await
             .unwrap_or_default();
 
-            let error_rows =
-                sqlx::query_as::<_, (String, String, DateTime<Utc>)>(
-                    r#"
+            let error_rows = sqlx::query_as::<_, (String, String, DateTime<Utc>)>(
+                r#"
             SELECT report_type_id, parse_error, updated_at
             FROM yt_reporting_report_files
             WHERE tenant_id = ?
@@ -3514,12 +3557,12 @@ async fn handle_youtube_sync_bundle(
             ORDER BY updated_at DESC
             LIMIT 50;
           "#,
-                )
-                .bind(tenant_id.trim())
-                .bind(owner_id)
-                .fetch_all(pool)
-                .await
-                .unwrap_or_default();
+            )
+            .bind(tenant_id.trim())
+            .bind(owner_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
 
             let mut last_error_by_type: std::collections::HashMap<String, (String, String)> =
                 std::collections::HashMap::new();
@@ -3538,23 +3581,26 @@ async fn handle_youtube_sync_bundle(
 
             let report_types: Vec<serde_json::Value> = stats_rows
                 .into_iter()
-                .map(|(report_type_id, total, downloaded, parsed, last_create, last_parsed)| {
-                    let job_id = jobs_by_type.get(&report_type_id).cloned();
-                    let last_error = last_error_by_type.get(&report_type_id).map(|v| v.0.clone());
-                    let last_error_at =
-                        last_error_by_type.get(&report_type_id).map(|v| v.1.clone());
-                    serde_json::json!({
-                      "report_type_id": report_type_id,
-                      "job_id": job_id,
-                      "reports_total": total,
-                      "reports_downloaded": downloaded,
-                      "reports_parsed": parsed,
-                      "last_create_time": last_create.map(datetime_to_rfc3339_utc),
-                      "last_parsed_at": last_parsed.map(datetime_to_rfc3339_utc),
-                      "last_error": last_error,
-                      "last_error_at": last_error_at,
-                    })
-                })
+                .map(
+                    |(report_type_id, total, downloaded, parsed, last_create, last_parsed)| {
+                        let job_id = jobs_by_type.get(&report_type_id).cloned();
+                        let last_error =
+                            last_error_by_type.get(&report_type_id).map(|v| v.0.clone());
+                        let last_error_at =
+                            last_error_by_type.get(&report_type_id).map(|v| v.1.clone());
+                        serde_json::json!({
+                          "report_type_id": report_type_id,
+                          "job_id": job_id,
+                          "reports_total": total,
+                          "reports_downloaded": downloaded,
+                          "reports_parsed": parsed,
+                          "last_create_time": last_create.map(datetime_to_rfc3339_utc),
+                          "last_parsed_at": last_parsed.map(datetime_to_rfc3339_utc),
+                          "last_error": last_error,
+                          "last_error_at": last_error_at,
+                        })
+                    },
+                )
                 .collect();
 
             Some(serde_json::json!({
@@ -3575,19 +3621,19 @@ async fn handle_youtube_sync_bundle(
         }
     };
 
-	    let alerts: Vec<AlertItem> = match sqlx::query_as::<
-	        _,
-	        (
-	            i64,
-	            String,
-	            String,
-	            String,
-	            DateTime<Utc>,
-	            Option<DateTime<Utc>>,
-	            Option<String>,
-	        ),
-	    >(
-	        r#"
+    let alerts: Vec<AlertItem> = match sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+        ),
+    >(
+        r#"
 	          SELECT id, kind, severity, message,
 	                 CAST(detected_at AS DATETIME) AS detected_at,
 	                 CAST(resolved_at AS DATETIME) AS resolved_at,
@@ -3628,8 +3674,9 @@ async fn handle_youtube_sync_bundle(
         }
     };
 
-    let share_latest = match sqlx::query_as::<_, (String, Option<DateTime<Utc>>, i64, Option<DateTime<Utc>>,)>(
-        r#"
+    let share_latest =
+        match sqlx::query_as::<_, (String, Option<DateTime<Utc>>, i64, Option<DateTime<Utc>>)>(
+            r#"
           SELECT token,
                  CAST(expires_at AS DATETIME) AS expires_at,
                  CAST(hits AS SIGNED) AS hits,
@@ -3643,30 +3690,30 @@ async fn handle_youtube_sync_bundle(
           ORDER BY created_at DESC
           LIMIT 1;
         "#,
-    )
-    .bind(tenant_id.trim())
-    .bind(channel_id.trim())
-    .bind(start_dt)
-    .bind(end_dt)
-    .bind(Utc::now())
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some((token, expires_at, hits, last_opened_at))) => Some(serde_json::json!({
-          "token": token,
-          "expires_at": expires_at.map(datetime_to_rfc3339_utc),
-          "hits": hits,
-          "last_opened_at": last_opened_at.map(datetime_to_rfc3339_utc),
-        })),
-        Ok(None) => None,
-        Err(err) => {
-            errors.insert(
-                "share_latest".to_string(),
-                serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
-            );
-            None
-        }
-    };
+        )
+        .bind(tenant_id.trim())
+        .bind(channel_id.trim())
+        .bind(start_dt)
+        .bind(end_dt)
+        .bind(Utc::now())
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(Some((token, expires_at, hits, last_opened_at))) => Some(serde_json::json!({
+              "token": token,
+              "expires_at": expires_at.map(datetime_to_rfc3339_utc),
+              "hits": hits,
+              "last_opened_at": last_opened_at.map(datetime_to_rfc3339_utc),
+            })),
+            Ok(None) => None,
+            Err(err) => {
+                errors.insert(
+                    "share_latest".to_string(),
+                    serde_json::Value::String(truncate_string(&err.to_string(), 2000)),
+                );
+                None
+            }
+        };
 
     json_response(
         StatusCode::OK,
@@ -3760,7 +3807,8 @@ async fn handle_youtube_reporting_status(
     .await
     .unwrap_or_default();
 
-    let mut jobs_by_type: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut jobs_by_type: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (report_type_id, job_id, _created_at, _updated_at) in jobs_rows.into_iter() {
         jobs_by_type.entry(report_type_id).or_insert(job_id);
     }
@@ -3795,9 +3843,8 @@ async fn handle_youtube_reporting_status(
     .await
     .unwrap_or_default();
 
-    let error_rows =
-        sqlx::query_as::<_, (String, String, DateTime<Utc>)>(
-            r#"
+    let error_rows = sqlx::query_as::<_, (String, String, DateTime<Utc>)>(
+        r#"
         SELECT report_type_id, parse_error, updated_at
         FROM yt_reporting_report_files
         WHERE tenant_id = ?
@@ -3807,12 +3854,12 @@ async fn handle_youtube_reporting_status(
         ORDER BY updated_at DESC
         LIMIT 50;
       "#,
-        )
-        .bind(tenant_id.trim())
-        .bind(owner_id.trim())
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+    )
+    .bind(tenant_id.trim())
+    .bind(owner_id.trim())
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
 
     let mut last_error_by_type: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
@@ -3831,22 +3878,24 @@ async fn handle_youtube_reporting_status(
 
     let report_types: Vec<serde_json::Value> = stats_rows
         .into_iter()
-        .map(|(report_type_id, total, downloaded, parsed, last_create, last_parsed)| {
-            let job_id = jobs_by_type.get(&report_type_id).cloned();
-            let last_error = last_error_by_type.get(&report_type_id).map(|v| v.0.clone());
-            let last_error_at = last_error_by_type.get(&report_type_id).map(|v| v.1.clone());
-            serde_json::json!({
-              "report_type_id": report_type_id,
-              "job_id": job_id,
-              "reports_total": total,
-              "reports_downloaded": downloaded,
-              "reports_parsed": parsed,
-              "last_create_time": last_create.map(datetime_to_rfc3339_utc),
-              "last_parsed_at": last_parsed.map(datetime_to_rfc3339_utc),
-              "last_error": last_error,
-              "last_error_at": last_error_at,
-            })
-        })
+        .map(
+            |(report_type_id, total, downloaded, parsed, last_create, last_parsed)| {
+                let job_id = jobs_by_type.get(&report_type_id).cloned();
+                let last_error = last_error_by_type.get(&report_type_id).map(|v| v.0.clone());
+                let last_error_at = last_error_by_type.get(&report_type_id).map(|v| v.1.clone());
+                serde_json::json!({
+                  "report_type_id": report_type_id,
+                  "job_id": job_id,
+                  "reports_total": total,
+                  "reports_downloaded": downloaded,
+                  "reports_parsed": parsed,
+                  "last_create_time": last_create.map(datetime_to_rfc3339_utc),
+                  "last_parsed_at": last_parsed.map(datetime_to_rfc3339_utc),
+                  "last_error": last_error,
+                  "last_error_at": last_error_at,
+                })
+            },
+        )
         .collect();
 
     json_response(
@@ -4076,12 +4125,12 @@ fn parse_csv_metrics(csv_text: &str) -> Result<Vec<CsvMetricRow>, String> {
 
         let views_from_field = views_idx.and_then(|i| rec.get(i)).and_then(parse_i64_field);
 
-        let impressions_ctr = ctr_idx
-            .and_then(|i| rec.get(i))
-            .and_then(parse_ctr_field);
+        let impressions_ctr = ctr_idx.and_then(|i| rec.get(i)).and_then(parse_ctr_field);
 
         let views_from_ctr = match (ctr_idx, impressions) {
-            (Some(_i), impr) if impr > 0 => impressions_ctr.map(|ctr| ((impr as f64) * ctr).round() as i64),
+            (Some(_i), impr) if impr > 0 => {
+                impressions_ctr.map(|ctr| ((impr as f64) * ctr).round() as i64)
+            }
             _ => None,
         };
 
@@ -4439,19 +4488,19 @@ async fn handle_youtube_alerts(
         // Alerts are evaluated by the daily sync job; reads should stay fast.
         let eval_error: Option<String> = None;
 
-	        let rows = match sqlx::query_as::<
-	            _,
-	            (
-	                i64,
-	                String,
-	                String,
-	                String,
-	                DateTime<Utc>,
-	                Option<DateTime<Utc>>,
-	                Option<String>,
-	            ),
-	        >(
-	            r#"
+        let rows = match sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                String,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+                Option<String>,
+            ),
+        >(
+            r#"
 	          SELECT id, kind, severity, message,
 	                 CAST(detected_at AS DATETIME) AS detected_at,
 	                 CAST(resolved_at AS DATETIME) AS resolved_at,
@@ -4586,9 +4635,15 @@ async fn handle_youtube_alerts(
 
             if let Some(obj) = details_val.as_object_mut() {
                 let mut handled = serde_json::Map::new();
-                handled.insert("at".to_string(), serde_json::Value::String(handled_at.clone()));
+                handled.insert(
+                    "at".to_string(),
+                    serde_json::Value::String(handled_at.clone()),
+                );
                 if let Some(a) = action.as_deref() {
-                    handled.insert("action".to_string(), serde_json::Value::String(a.to_string()));
+                    handled.insert(
+                        "action".to_string(),
+                        serde_json::Value::String(a.to_string()),
+                    );
                 }
                 if let Some(n) = note.as_deref() {
                     handled.insert("note".to_string(), serde_json::Value::String(n.to_string()));
@@ -6094,7 +6149,12 @@ mod tests {
 
     #[test]
     fn csv_upload_row_created_at_is_datetime_utc() {
-        let row: CsvUploadRow = (1, "file.csv".to_string(), "received".to_string(), Utc::now());
+        let row: CsvUploadRow = (
+            1,
+            "file.csv".to_string(),
+            "received".to_string(),
+            Utc::now(),
+        );
         let _dt: DateTime<Utc> = row.3;
     }
 }

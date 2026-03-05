@@ -43,6 +43,10 @@ name = "tenants_llm_settings"
 path = "api/tenants/llm_settings.rs"
 
 [[bin]]
+name = "tenants_ai_settings"
+path = "api/tenants/ai_settings.rs"
+
+[[bin]]
 name = "usage_chat_risk_check"
 path = "api/usage/chat_risk_check.rs"
 
